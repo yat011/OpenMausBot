@@ -18,6 +18,7 @@ import { HermesAgentDriver } from "./acp/hermes.ts";
 import { OpenAICompatDriver } from "./openai-compat.ts";
 import { PiDriver } from "./pi.ts";
 import { MinimaxDriver } from "./minimax.ts";
+import { MuseDriver } from "./muse.ts";
 
 export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   GrokDriver,
@@ -37,4 +38,5 @@ export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   AntigravityDriver,
   BoxAgentDriver,
   MinimaxDriver,
+  MuseDriver,
 ];

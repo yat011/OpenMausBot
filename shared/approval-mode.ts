@@ -14,7 +14,7 @@ export function supportsApprovalMode(driverKind: string | undefined, mode: Appro
   if (mode === "custom") return driverKind === "codex";
   if (mode === "edits") return ["claudeAgent", "grokAgent", "antigravityAgent"].includes(driverKind ?? "");
   if (mode !== "full") return true;
-  return ["codex", "claudeAgent", "antigravityAgent", "cursorAgent", "grokAgent", "opencodeGo"].includes(driverKind ?? "");
+  return ["codex", "claudeAgent", "antigravityAgent", "cursorAgent", "grokAgent", "opencodeGo", "museAgent"].includes(driverKind ?? "");
 }
 
 export function hasNativeAutoReview(driverKind: string | undefined): boolean {

@@ -14,7 +14,7 @@ const providers: Record<string, string> = {
   claudeAgent: "Anthropic", codex: "OpenAI", grok: "xAI", grokAgent: "xAI",
   kimiAgent: "Moonshot AI", droidAgent: "Factory", cursorAgent: "Cursor",
   antigravityAgent: "Google", opencodeGo: "OpenCode", qwenAgent: "Qwen",
-  hermesAgent: "Nous Research", piAgent: "pi.dev",
+  hermesAgent: "Nous Research", piAgent: "pi.dev", museAgent: "Meta",
 };
 
 /** One disclosure, not a second settings dialog. Keep its children mounted so

@@ -447,6 +447,11 @@ describe("default fleet", () => {
     expect(map.cursor).toEqual({ driver: "cursorAgent", environment: {} });
   });
 
+  it("ships Muse as a default-fleet subscription engine", () => {
+    const map = instanceConfigs({});
+    expect(map.muse).toEqual({ driver: "museAgent", environment: {} });
+  });
+
   it("carries the saved OpenAI-compatible URL into the live default instance", () => {
     const map = instanceConfigs({
       openaiCompat: { key: "secret", url: "https://models.example.test/v1" },
@@ -524,6 +529,7 @@ describe("default fleet", () => {
     expect(map.qwen?.driver).toBe("qwenAgent");
     expect(map.hermes?.driver).toBe("hermesAgent");
     expect(map.cursor?.driver).toBe("cursorAgent");
+    expect(map.muse?.driver).toBe("museAgent");
     expect(map.openaiCompat?.driver).toBe("openai-compat");
   });
 

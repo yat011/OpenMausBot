@@ -70,7 +70,7 @@ packages built from different commits under one version.
 | Path | What lives there |
 |---|---|
 | `server/contracts.ts` | The driver SPI and canonical runtime event types. The whole architecture in one file — read it first. |
-| `server/drivers/` | One file per provider (Claude, Codex, Grok, cloud computer). Adding a provider = one file + one registration line in `builtIn.ts`. |
+| `server/drivers/` | One file per provider (Claude, Codex, Grok, Muse Code, cloud computer). Adding a provider = one file + one registration line in `builtIn.ts`. |
 | `server/harness/` | Registry (configs → live instances, unknown → shadow) and the fan-in event bus. |
 | `server/index.ts` | The HTTP + SSE API the app talks to. |
 | `server/testing/` | Test fakes: an in-memory driver, plus scripted fake `claude` / `codex` CLIs. |

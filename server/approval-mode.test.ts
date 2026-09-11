@@ -11,7 +11,7 @@ import {
 
 describe("approval modes", () => {
   it("only exposes implemented provider capabilities", () => {
-    for (const driver of ["codex", "claudeAgent", "antigravityAgent", "cursorAgent", "grokAgent", "opencodeGo"]) {
+    for (const driver of ["codex", "claudeAgent", "antigravityAgent", "cursorAgent", "grokAgent", "opencodeGo", "museAgent"]) {
       expect(supportsApprovalMode(driver, "full")).toBe(true);
       expect(supportsApprovalMode(driver, "custom")).toBe(driver === "codex");
       expect(hasNativeAutoReview(driver)).toBe(["codex", "claudeAgent", "cursorAgent", "grokAgent"].includes(driver));

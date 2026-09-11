@@ -61,7 +61,7 @@ it keeps the idea (AI as a *messaging app*: a roster of bots you chat with, each
 memory of its thread, model, computer, and apps) and rebuilds it open, local-first, and on the agents you
 already have:
 
-- **Bring your own agents.** Bots run on the `claude`, `codex`, and `grok` CLIs installed on your own machine
+- **Bring your own agents.** Bots run on the `claude`, `codex`, `grok`, and `muse` CLIs installed on your own machine
   — your existing logins and subscriptions, no new accounts, no proxy in the middle. Point any engine at a
   custom CLI binary (a versioned build or wrapper) in **Settings → Engines**.
 - **Local first.** One small harness server on `127.0.0.1` owns every agent process. Transcripts, keys, and
@@ -248,7 +248,7 @@ pnpm dev:desktop   # Electron shell; keep the two commands above running
 ```
 
 Requirements: **macOS, Windows, or Ubuntu 24.04 x64**, **Node 24+**, **pnpm**, and at least one agent CLI — [`claude`](https://claude.com/claude-code),
-[`codex`](https://github.com/openai/codex), or [`grok`](https://x.ai/cli) — installed and logged in. They appear
+[`codex`](https://github.com/openai/codex), [`grok`](https://x.ai/cli), or `muse` (Muse Code) — installed and logged in. They appear
 in the model picker automatically.
 
 Package the desktop application:
