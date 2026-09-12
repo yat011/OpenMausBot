@@ -13,7 +13,7 @@ import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { buildMuseExecArgs, MuseDriver, parseMuseLine, type MuseConfig } from "./muse.ts";
+import { buildMuseExecArgs, loadMuseCatalog, MuseDriver, parseMuseLine, type MuseConfig } from "./muse.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-muse-cli.ts");
 
@@ -215,7 +215,7 @@ describe("MuseDriver turns (fake CLI)", () => {
 
   it("decodes config with muse defaults", () => {
     expect(MuseDriver.decodeConfig({})).toEqual({ cli: "muse", provider: "meta", model: "", baseUrl: "" });
-    expect(MuseDriver.models.default).toBe("muse-spark-1.3-contributor");
+    expect(MuseDriver.models.default).toBe("muse-spark-1.2");
   });
 });
 
@@ -262,5 +262,27 @@ describe("muse protocol helpers", () => {
       "--prompt-file",
       "/tmp/prompt.md",
     ]);
+  });
+
+  it("reads the CLI catalog cache and ignores models the account does not list", async () => {
+    const dataHome = mkdtempSync(join(tmpdir(), "omb-muse-catalog-"));
+    mkdirSync(join(dataHome, "muse", "model-catalog"), { recursive: true });
+    writeFileSync(
+      join(dataHome, "muse", "model-catalog", "meta.json"),
+      JSON.stringify({
+        schema_version: 1,
+        rows: [
+          { model_id: "muse-spark-1.2", display_label: "muse-spark-1.2", visibility: "visible", is_default: false, context_limit: 1007997 },
+          { model_id: "muse-spark-1.2-contributor", display_label: "muse-spark-1.2-contributor", visibility: "visible", is_default: true, context_limit: 1007997 },
+        ],
+      }),
+    );
+    try {
+      const catalog = loadMuseCatalog({ XDG_DATA_HOME: dataHome });
+      expect(catalog?.default).toBe("muse-spark-1.2-contributor");
+      expect(catalog?.options.map((option) => option.id)).toEqual(["muse-spark-1.2", "muse-spark-1.2-contributor"]);
+    } finally {
+      await removeTempDir(dataHome);
+    }
   });
 });

@@ -14,7 +14,7 @@
 // flip a subscription login to pay-as-you-go billing (the same reason the
 // Grok ACP driver deletes XAI_API_KEY).
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,18 +36,80 @@ import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "museAgent";
 
-// Model catalog transcribed from the CLI's own provider catalog cache
-// (<data-home>/muse/model-catalog/<sha>_tbh.json, profile tbh): default and
-// currency flags are the CLI's, context limits are verbatim.
-const MODELS: ModelCatalog = {
-  default: "muse-spark-1.3-contributor",
+// Fallback when the CLI has not yet written its catalog cache. Prefer 1.2:
+// 1.3-contributor is not on every account and the API then fails the turn
+// with "does not exist or you lack access".
+const FALLBACK_MODELS: ModelCatalog = {
+  default: "muse-spark-1.2",
   options: [
-    { id: "muse-spark-1.3-contributor", label: "Muse Spark 1.3 Contributor", contextWindow: 1_007_997 },
-    { id: "muse-spark-1.3", label: "Muse Spark 1.3", contextWindow: 1_007_997 },
-    { id: "muse-spark-1.2-contributor", label: "Muse Spark 1.2 Contributor", contextWindow: 1_007_997 },
     { id: "muse-spark-1.2", label: "Muse Spark 1.2", contextWindow: 1_007_997 },
+    { id: "muse-spark-1.2-contributor", label: "Muse Spark 1.2 Contributor", contextWindow: 1_007_997 },
+    { id: "muse-spark-1.3", label: "Muse Spark 1.3", contextWindow: 1_007_997 },
+    { id: "muse-spark-1.3-contributor", label: "Muse Spark 1.3 Contributor", contextWindow: 1_007_997 },
   ],
 };
+
+export function museDataHome(env: Record<string, string | undefined> = process.env): string {
+  if (env.MUSE_DATA_HOME?.trim()) return env.MUSE_DATA_HOME.trim();
+  const dataHome = env.XDG_DATA_HOME?.trim() || join(env.HOME || env.USERPROFILE || homedir(), ".local", "share");
+  return join(dataHome, "muse");
+}
+
+/** Live rows from `<data-home>/muse/model-catalog/*.json`. Null when the CLI
+ * has not cached a catalog yet. */
+export function loadMuseCatalog(env: Record<string, string | undefined> = process.env): ModelCatalog | null {
+  const dir = join(museDataHome(env), "model-catalog");
+  if (!existsSync(dir)) return null;
+  const byId = new Map<string, { id: string; label: string; contextWindow: number; isDefault: boolean }>();
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const doc = JSON.parse(readFileSync(join(dir, name), "utf8")) as {
+        rows?: Array<{
+          model_id?: unknown;
+          display_label?: unknown;
+          context_limit?: unknown;
+          is_default?: unknown;
+          visibility?: unknown;
+        }>;
+      };
+      for (const row of doc.rows ?? []) {
+        if (typeof row.model_id !== "string" || !row.model_id.trim()) continue;
+        if (typeof row.visibility === "string" && row.visibility !== "visible") continue;
+        const id = row.model_id.trim();
+        byId.set(id, {
+          id,
+          label: typeof row.display_label === "string" && row.display_label.trim() ? row.display_label.trim() : id,
+          contextWindow: typeof row.context_limit === "number" ? row.context_limit : 1_007_997,
+          isDefault: row.is_default === true,
+        });
+      }
+    } catch {
+      /* skip a corrupt cache file */
+    }
+  }
+  if (byId.size === 0) return null;
+  const options = [...byId.values()];
+  return {
+    default: options.find((row) => row.isDefault)?.id ?? options[0]!.id,
+    options: options.map(({ id, label, contextWindow }) => ({ id, label, contextWindow })),
+  };
+}
+
+export function resolveMuseModels(env: Record<string, string | undefined> = process.env): ModelCatalog {
+  return loadMuseCatalog(env) ?? FALLBACK_MODELS;
+}
+
+function applyCatalog(target: ModelCatalog, source: ModelCatalog): void {
+  target.default = source.default;
+  target.options = source.options;
+}
+
+function museModelOrDefault(requested: string | undefined, catalog: ModelCatalog): string | undefined {
+  if (!requested) return catalog.default;
+  if (requested === catalog.default || catalog.options.some((option) => option.id === requested)) return requested;
+  return catalog.default;
+}
 
 // Every member of the harness EffortLevel union is a --reasoning-effort the
 // CLI accepts (none|minimal|low|medium|high|xhigh|max|ultra per `muse exec
@@ -189,7 +251,7 @@ function museVersion(cli: string, env: NodeJS.ProcessEnv): Promise<string | null
 export const MuseDriver: ProviderDriver<MuseConfig> = {
   driverKind: DRIVER_KIND,
   metadata: { displayName: "Muse Code", supportsMultipleInstances: true },
-  models: MODELS,
+  models: FALLBACK_MODELS,
   decodeConfig: decodeMuseConfig,
   defaultConfig: () => decodeMuseConfig({}),
 
@@ -220,8 +282,13 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
       return env;
     };
 
+    const models: ModelCatalog = { default: "", options: [] };
+    const syncModels = () => applyCatalog(models, resolveMuseModels(childEnv()));
+    syncModels();
+
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const env = childEnv();
+      syncModels();
       const version = await museVersion(config.cli, env);
       if (!version) {
         return {
@@ -258,7 +325,7 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
             /* best effort */
           }
         };
-        const model = turn.model || config.model || undefined;
+        const model = museModelOrDefault(turn.model || config.model || undefined, resolveMuseModels(childEnv()));
         const args = buildMuseExecArgs({
           provider: config.provider,
           approval: museApprovalFlag(turn.approvalMode),
@@ -291,7 +358,7 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
           ...base(threadId, turnId),
           type: "session.started",
           sessionId,
-          model: turn.model || config.model || MODELS.default,
+          model: museModelOrDefault(turn.model || config.model || undefined, models),
         });
 
         let streamed = "";
@@ -428,7 +495,10 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
-      models: MODELS,
+      models,
+      refreshModels: async () => {
+        syncModels();
+      },
       snapshot,
       adapter: {
         provider: DRIVER_KIND,

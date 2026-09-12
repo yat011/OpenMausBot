@@ -110,6 +110,42 @@ describe("EffortRow", () => {
   it("renames xhigh, the one level that does not capitalize cleanly", () => {
     expect(renderEffort([engine(["xhigh"])])).toContain(">X-High<");
   });
+
+  it("shows the viewed engine's levels, so Muse xhigh is visible before the bot leaves Grok", () => {
+    const grok: InstanceInfo = {
+      instanceId: "grok",
+      driverKind: "grokAgent",
+      displayName: "Grok",
+      snapshot: { state: "available", version: "1" },
+      models: { default: "grok-4.6", options: [{ id: "grok-4.6", label: "Grok 4.6" }] },
+      capabilities: { effortLevels: ["low", "medium", "high"] },
+    };
+    const muse: InstanceInfo = {
+      instanceId: "muse",
+      driverKind: "museAgent",
+      displayName: "Muse Code",
+      snapshot: { state: "available", version: "1.1.1" },
+      models: { default: "muse-spark-1.3", options: [{ id: "muse-spark-1.3", label: "Muse Spark 1.3" }] },
+      capabilities: { effortLevels: ["low", "medium", "high", "xhigh", "max"] },
+    };
+    fixture.instances = [grok, muse];
+    const grokBot: Bot = { ...bot(), modelSelection: { instanceId: "grok", model: "grok-4.6", effort: "high" } };
+    const markup = renderToStaticMarkup(createElement(EffortRow, { bot: grokBot, instanceId: "muse" }));
+    expect(levelButtons(markup).map((button) => button.label)).toEqual([
+      "Default", "Low", "Medium", "High", "X-High", "Max",
+    ]);
+    expect(levelButtons(markup).find((button) => button.pressed)?.label).toBe("Default");
+
+    const row = EffortRow({ bot: grokBot, instanceId: "muse" })!;
+    const levels = Children.toArray(row.props.children).at(-1) as ReactElement<{ children: ReactNode }>;
+    const xhigh = Children.toArray(levels.props.children)[4] as ReactElement<{ onClick: () => void }>;
+    xhigh.props.onClick();
+    expect(fixture.dispatch).toHaveBeenLastCalledWith({
+      type: "setModel",
+      botId: "atlas",
+      selection: { instanceId: "muse", model: "muse-spark-1.3", effort: "xhigh" },
+    });
+  });
 });
 
 describe("ModelPicker trigger", () => {

@@ -52,18 +52,36 @@ export function EffortRow({
   threadId,
   className,
   label,
+  instanceId,
 }: {
   bot: Bot;
   threadId?: string;
   className?: string;
   label?: ReactNode;
+  /** Engine whose levels to show. The picker passes the rail being viewed so
+   * Muse's X-High appears when you open Muse, not only after the bot has
+   * already switched off Grok (which has no xhigh). */
+  instanceId?: string;
 }) {
   const { state, dispatch } = useStore();
   const selection = bot.modelSelection;
-  const levels = state.instances.find((instance) => instance.instanceId === selection.instanceId)?.capabilities
-    ?.effortLevels;
+  const targetId = instanceId ?? selection.instanceId;
+  const instance = state.instances.find((candidate) => candidate.instanceId === targetId);
+  const levels = instance?.capabilities?.effortLevels;
   // An engine with no levels gets no control at all, not an empty one.
-  if (!levels?.length) return null;
+  if (!instance || !levels?.length) return null;
+
+  const onThisEngine = selection.instanceId === targetId;
+  const activeEffort = onThisEngine ? selection.effort : undefined;
+
+  const apply = (level: EffortLevel | undefined) => {
+    const next: ModelSelection = {
+      instanceId: targetId,
+      model: onThisEngine ? selection.model : instance.models.default,
+    };
+    if (level !== undefined) next.effort = level;
+    dispatch({ type: "setModel", botId: bot.id, threadId, selection: next });
+  };
 
   return (
     <div className={className}>
@@ -75,16 +93,16 @@ export function EffortRow({
           <button
             key={level ?? "default"}
             type="button"
-            aria-pressed={selection.effort === level}
+            aria-pressed={activeEffort === level}
             title={
               level === undefined
                 ? "Send no effort level and let the engine decide"
                 : `Ask for ${effortLabel(level)} reasoning effort`
             }
-            onClick={() => dispatch({ type: "setModel", botId: bot.id, threadId, selection: { ...selection, effort: level } })}
+            onClick={() => apply(level)}
             className={cn(
               "rounded-full border px-2.5 py-1 text-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70",
-              selection.effort === level
+              activeEffort === level
                 ? "border-accent/60 bg-control text-ink"
                 : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink",
             )}
@@ -663,6 +681,7 @@ export function ModelPicker({
                   <EffortRow
                     bot={bot}
                     threadId={threadId}
+                    instanceId={railInstance.instanceId}
                     className="shrink-0 border-t border-hairline/40 px-4 py-3"
                     label={<span className="text-[12.5px] font-medium text-ink">Effort</span>}
                   />
