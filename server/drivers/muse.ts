@@ -6,6 +6,12 @@
 // to the prompt — the same codex-style prepend the Grok ACP driver uses for
 // flags its CLI accepts but never delivers.
 //
+// Built-in browser and workspace custom MCP (e.g. wanderlog) are a per-turn
+// overlay: a temp XDG_CONFIG_HOME/muse/settings.json with mcpServers.*,
+// auth.json copied in so login survives the overlay. The person's
+// ~/.config/muse is not written. Muse's own web tools stay on
+// (no --disable-web-tools).
+//
 // Auth is the CLI's own: `muse login` (Meta account, stored at
 // $XDG_CONFIG_HOME/muse/auth.json as {providers:{meta:{mechanism:"oauth",
 // access_token}}}) or META_API_KEY, which always takes priority over the
@@ -14,7 +20,7 @@
 // flip a subscription login to pay-as-you-go billing (the same reason the
 // Grok ACP driver deletes XAI_API_KEY).
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -157,6 +163,114 @@ export function museHasLogin(env: Record<string, string | undefined> = process.e
 
 export function museApiKey(input: { environment: Record<string, string> }): string {
   return input.environment.META_API_KEY ?? process.env.META_API_KEY ?? "";
+}
+
+export function museConfigHome(env: Record<string, string | undefined> = process.env): string {
+  return env.XDG_CONFIG_HOME?.trim() || join(env.HOME || env.USERPROFILE || homedir(), ".config");
+}
+
+export function museUserSettingsPath(env: Record<string, string | undefined> = process.env): string {
+  return join(museConfigHome(env), "muse", "settings.json");
+}
+
+export interface MuseStdioMcpSpec {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+function asPlainObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function readJsonObject(path: string): Record<string, unknown> | null {
+  try {
+    return asPlainObject(JSON.parse(readFileSync(path, "utf8")));
+  } catch {
+    return null;
+  }
+}
+
+/** Muse settings.json stdio MCP entry. `mode` is optional so a browser-proxy
+ * glitch still leaves Muse's own web tools on the turn. */
+export function museStdioMcpServer(spec: MuseStdioMcpSpec): Record<string, unknown> {
+  return {
+    transport: "stdio",
+    command: spec.command,
+    args: spec.args,
+    env: spec.env,
+    enabled: true,
+    mode: "optional",
+  };
+}
+
+export interface MuseMcpMounts {
+  browser?: MuseStdioMcpSpec;
+  custom?: Record<string, MuseStdioMcpSpec>;
+}
+
+export function museMcpMountsFromTurn(turn: {
+  integrations?: { browser?: MuseStdioMcpSpec; custom?: Record<string, MuseStdioMcpSpec> };
+}): MuseMcpMounts | null {
+  const browser = turn.integrations?.browser;
+  const custom = turn.integrations?.custom;
+  const customEntries = custom && Object.keys(custom).length ? custom : undefined;
+  if (!browser && !customEntries) return null;
+  return { ...(browser ? { browser } : {}), ...(customEntries ? { custom: customEntries } : {}) };
+}
+
+/** Merge harness MCP servers into a copy of the person's Muse settings.
+ * CamelCase `mcpServers` is canonical; a legacy `mcp_servers` key is folded
+ * in and dropped so Muse does not see both. Built-in `browser` wins over a
+ * custom server of the same name. */
+export function buildMuseSettingsWithMcp(
+  base: Record<string, unknown> | null,
+  mounts: MuseMcpMounts,
+): Record<string, unknown> {
+  const settings: Record<string, unknown> = { ...(base ?? {}) };
+  settings.schema_version = 1;
+  const fromCamel = asPlainObject(settings.mcpServers) ?? {};
+  const fromSnake = asPlainObject(settings.mcp_servers) ?? {};
+  delete settings.mcp_servers;
+  const servers: Record<string, unknown> = { ...fromSnake, ...fromCamel };
+  if (mounts.custom) {
+    for (const [name, spec] of Object.entries(mounts.custom)) {
+      servers[name] = museStdioMcpServer(spec);
+    }
+  }
+  if (mounts.browser) servers.browser = museStdioMcpServer(mounts.browser);
+  settings.mcpServers = servers;
+  return settings;
+}
+
+/** @deprecated use buildMuseSettingsWithMcp */
+export function buildMuseSettingsWithBrowser(
+  base: Record<string, unknown> | null,
+  browser: MuseStdioMcpSpec,
+): Record<string, unknown> {
+  return buildMuseSettingsWithMcp(base, { browser });
+}
+
+/** Per-turn config dir: settings.json with harness MCP, auth.json copied from
+ * the real Muse login so overlaying XDG_CONFIG_HOME does not sign the child out. */
+export function writeMuseMcpOverlay(
+  dir: string,
+  env: NodeJS.ProcessEnv,
+  mounts: MuseMcpMounts,
+): { xdgConfigHome: string; settingsPath: string } {
+  const xdgConfigHome = join(dir, "config");
+  const museDir = join(xdgConfigHome, "muse");
+  mkdirSync(museDir, { recursive: true });
+  const settings = buildMuseSettingsWithMcp(readJsonObject(museUserSettingsPath(env)), mounts);
+  const settingsPath = join(museDir, "settings.json");
+  writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o600 });
+  const authSrc = museAuthPath(env);
+  const authDest = join(museDir, "auth.json");
+  if (existsSync(authSrc)) {
+    copyFileSync(authSrc, authDest);
+    chmodSync(authDest, 0o600);
+  }
+  return { xdgConfigHome, settingsPath };
 }
 
 /** OpenMausBot ask|auto|full|custom onto `muse exec --approval-mode`
@@ -325,7 +439,19 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
             /* best effort */
           }
         };
-        const model = museModelOrDefault(turn.model || config.model || undefined, resolveMuseModels(childEnv()));
+        const env = childEnv();
+        const model = museModelOrDefault(turn.model || config.model || undefined, resolveMuseModels(env));
+        const mounts = museMcpMountsFromTurn(turn);
+        if (mounts) {
+          try {
+            const overlay = writeMuseMcpOverlay(dir, env, mounts);
+            env.XDG_CONFIG_HOME = overlay.xdgConfigHome;
+          } catch (error) {
+            cleanup();
+            resolve({ ok: false, stopReason: (error as Error).message, sessionError: false, cancelled: false, reported: false });
+            return;
+          }
+        }
         const args = buildMuseExecArgs({
           provider: config.provider,
           approval: museApprovalFlag(turn.approvalMode),
@@ -340,7 +466,7 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
         appendNative(threadId, { dir: "out", source: "muse.exec", msg: { argv: [config.cli, ...args], model } });
         let child;
         try {
-          child = spawnCli(config.cli, args, { env: childEnv(), cwd: turn.cwd ?? process.cwd() });
+          child = spawnCli(config.cli, args, { env, cwd: turn.cwd ?? process.cwd() });
         } catch (error) {
           cleanup();
           resolve({ ok: false, stopReason: (error as Error).message, sessionError: false, cancelled: false, reported: false });
@@ -507,6 +633,8 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
           images: true,
           nativeImageInput: true,
           effortLevels: EFFORT_LEVELS,
+          browserMcp: true,
+          customMcp: true,
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.kill(),

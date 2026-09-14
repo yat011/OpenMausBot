@@ -42,6 +42,12 @@ describe("openmausbot command line", () => {
     expect(parseArgs(["serve", "--port", "70000"], {})).toEqual({ error: "--port must be 1-65535" });
     expect(parseArgs(["pair", "--public-url", "mini.example"], {})).toEqual({ error: "--public-url must start with http:// or https://" });
     expect(parseArgs(["serve", "--bogus"], {})).toEqual({ error: 'unknown argument "--bogus"' });
+    expect(parseArgs(["serve", "--yolo"], {})).toMatchObject({ command: "serve", yolo: true });
+    expect(parseArgs(["serve", "--always-approve"], {})).toMatchObject({ yolo: true });
+    expect(parseArgs(["--yolo"], {})).toMatchObject({ command: "start", yolo: true });
+    expect(parseArgs(["start", "--always-approve"], {})).toMatchObject({ command: "start", yolo: true });
+    expect(parseArgs(["serve"], { OMB_YOLO: "1" })).toMatchObject({ yolo: true });
+    expect(parseArgs(["serve"], {})).toMatchObject({ yolo: false });
     expect(parseArgs(["serve", "--tunnel"], {})).toMatchObject({ command: "serve", tunnel: true });
     expect(parseArgs(["setup", "--data-dir", "/tmp/cli-setup"], {})).toMatchObject({ command: "setup", dataDir: resolve("/tmp/cli-setup") });
     expect(parseArgs(["start", "--port", "8125", "--no-pair"], {})).toMatchObject({ command: "start", port: 8125, pair: false });

@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { z } from "zod";
 
 import { parseJson, type JsonValue } from "./schema.ts";
-import type { WebhookManager } from "./webhooks.ts";
+import { webhookThreadKey, webhookThreadTitle, type WebhookManager } from "./webhooks.ts";
 
 export const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
 const statusErrorSchema = z.object({ status: z.number().int().optional() });
@@ -121,6 +121,8 @@ export function createWebhookIngressHandler(manager: WebhookManager, claimReques
         eventName: eventName(req),
         userAgent: header(req, "user-agent"),
         deliveryId: deliveryId(req),
+        threadTitle: webhookThreadTitle(header(req, "x-omb-thread-title")),
+        threadKey: webhookThreadKey(header(req, "x-omb-thread-key")),
       });
       return json(res, 202, { accepted: true, ...result });
     } catch (error) {

@@ -8,7 +8,16 @@
 // person's explicit, separately confirmed grant to answer every prompt.
 // Questions never come through here: a bot's question always reaches a human.
 
-import { type ApprovalMode } from "../shared/approval-mode.ts";
+import { supportsApprovalMode, type ApprovalMode } from "../shared/approval-mode.ts";
+
+/** Process-level CLI YOLO (`openmausbot --yolo` / `OMB_YOLO=1`). Does not
+ * persist Full access, and does not open the HTTP elevation path. */
+export function cliYoloFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.OMB_YOLO ?? env.OMB_ALWAYS_APPROVE;
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
 
 /** Full access is the person's explicit grant to this receiving bot, including
  * delegated work. It never inherits the sender's mode or elevates another bot.
@@ -17,6 +26,19 @@ import { type ApprovalMode } from "../shared/approval-mode.ts";
  * are checked by the caller. */
 export function approvalModeForOrigin(mode: ApprovalMode, origin: { peerInitiated: boolean }): ApprovalMode {
   if (mode === "custom" && origin.peerInitiated) return "auto";
+  return mode;
+}
+
+/** Stored bot level, then CLI YOLO: when the process was started with
+ * `--yolo`, every provider that has Full access runs that mode for the turn. */
+export function effectiveApprovalMode(
+  stored: ApprovalMode,
+  driverKind: string | undefined,
+  origin: { peerInitiated: boolean; yolo?: boolean },
+): ApprovalMode {
+  const mode = approvalModeForOrigin(stored, origin);
+  if (origin.yolo && supportsApprovalMode(driverKind, "full")) return "full";
+  if (!supportsApprovalMode(driverKind, mode)) return "ask";
   return mode;
 }
 

@@ -290,6 +290,9 @@ export interface RoutineRequestServiceOptions {
    * bot is deleted or moved to another section). Returns the sentence to
    * refuse with, or null to allow. Checked at propose AND confirm time. */
   validateTarget?: (proposerBotId: string, target: { botId: string; name: string }) => string | null;
+  /** When true, confirm the card immediately after it is appended. Read live
+   * so a config PATCH can toggle without reconstructing the service. */
+  autoConfirm?: () => boolean;
 }
 
 export interface ProposeRoutineRequestArgs {
@@ -314,6 +317,10 @@ export interface RoutineProposalResult {
   detail: string;
   nextRunAt: number | null;
   timeZone: string;
+  /** True when autoConfirm resolved the card in the same propose() call. */
+  applied?: boolean;
+  resultId?: string;
+  action?: RoutineRequestOperation["action"];
 }
 
 interface RoutineCardCopy {
@@ -994,6 +1001,7 @@ export class RoutineRequestService {
   private readonly cloudReady?: () => Promise<{ ready: boolean; reason?: string }>;
   private readonly canPersist?: RoutineRequestServiceOptions["canPersist"];
   private readonly validateTarget?: RoutineRequestServiceOptions["validateTarget"];
+  private readonly autoConfirm?: () => boolean;
 
   constructor(options: RoutineRequestServiceOptions) {
     this.store = options.store;
@@ -1003,6 +1011,7 @@ export class RoutineRequestService {
     this.cloudReady = options.cloudReady;
     this.canPersist = options.canPersist;
     this.validateTarget = options.validateTarget;
+    this.autoConfirm = options.autoConfirm;
   }
 
   async propose(args: ProposeRoutineRequestArgs): Promise<RoutineProposalResult> {
@@ -1059,7 +1068,7 @@ export class RoutineRequestService {
       throw new RoutineRequestError("The requesting turn ended before this proposal could be saved", 401);
     }
     const message = this.store.appendMessage(threadId, messageInput);
-    return {
+    const result: RoutineProposalResult = {
       requestId,
       messageId: message.id,
       title: copy.title,
@@ -1068,6 +1077,20 @@ export class RoutineRequestService {
       nextRunAt: copy.nextRunAt,
       timeZone,
     };
+    if (this.autoConfirm?.()) {
+      const resolved = this.resolve({
+        botId,
+        threadId,
+        requestId,
+        behavior: "allow",
+      });
+      if (resolved.claimed && resolved.state === "applied") {
+        result.applied = true;
+        result.resultId = resolved.resultId;
+        result.action = resolved.action;
+      }
+    }
+    return result;
   }
 
   private async requireCloudReadiness(operation: RoutineRequestOperation): Promise<void> {

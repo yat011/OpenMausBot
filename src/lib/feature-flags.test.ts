@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { builtInBrowserEnabled, showToolCallsEnabled, skillAuthoringEnabled } from "./feature-flags";
+import { autoConfirmRoutineProposalsEnabled, builtInBrowserEnabled, showToolCallsEnabled, skillAuthoringEnabled } from "./feature-flags";
 
 describe("experimental feature flags", () => {
   it("keeps skill authoring on by default, before and after the config arrives", () => {
@@ -29,5 +29,12 @@ describe("experimental feature flags", () => {
 
   it("shows tool-call chips only after explicit opt-in", () => {
     expect(showToolCallsEnabled({ features: { showToolCalls: true } })).toBe(true);
+  });
+
+  it("keeps routine auto-confirm off until explicitly enabled", () => {
+    expect(autoConfirmRoutineProposalsEnabled(null)).toBe(false);
+    expect(autoConfirmRoutineProposalsEnabled({})).toBe(false);
+    expect(autoConfirmRoutineProposalsEnabled({ features: { autoConfirmRoutineProposals: false } })).toBe(false);
+    expect(autoConfirmRoutineProposalsEnabled({ features: { autoConfirmRoutineProposals: true } })).toBe(true);
   });
 });

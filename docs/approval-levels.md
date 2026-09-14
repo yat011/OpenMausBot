@@ -26,6 +26,11 @@ A turn a webhook, a routine, or another bot started runs in the bot's level
 like any other turn. The decision log records that nobody was at the keyboard
 when such a turn asked.
 
+The terminal CLI can start the whole process in YOLO: `openmausbot serve --yolo`
+(or `OMB_YOLO=1`). That maps every supported engine's turns to Full access for
+that process only. It does not persist Full on the bot, and HTTP still cannot
+elevate a bot to Full.
+
 ## Answering a request
 
 Approve or deny requests in the conversation to let the bot continue. **Allow

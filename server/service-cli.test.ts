@@ -21,6 +21,7 @@ describe("openmausbot service", () => {
   it("repeats the serve options, one access mode at a time", () => {
     expect(serviceServeArgs({ port: 8799, dataDir: "/d", domain: "a.example.com", tunnel: true, label: "x" })).toEqual(["--port", "8799", "--data-dir", "/d", "--no-pair", "--domain", "a.example.com", "--label", "x"]);
     expect(serviceServeArgs({ port: 1, dataDir: "/d", tailscale: true })).toEqual(["--port", "1", "--data-dir", "/d", "--no-pair", "--tailscale"]);
+    expect(serviceServeArgs({ port: 1, dataDir: "/d", tailscale: true, yolo: true })).toEqual(["--port", "1", "--data-dir", "/d", "--no-pair", "--tailscale", "--yolo"]);
   });
 
   it("writes the unit next to the data and prints how to install it; refuses an npx cache", () => {

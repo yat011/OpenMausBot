@@ -55,6 +55,7 @@ let routinesResponse: unknown = {
   ],
 };
 let lastRoutineRequestBody: any = null;
+let routineRequestResponse: unknown = { requestId: "routine-request-1", summary: "Weekdays at 09:00 (Asia/Kolkata)" };
 let lastProfileRequestBody: any = null;
 let profileRequestResponse: unknown = { requestId: "profile-request-1", summary: "Name → Kiwi" };
 let lastSessionSearchUrl = "";
@@ -228,7 +229,7 @@ beforeAll(async () => {
       req.on("end", () => {
         lastRoutineRequestBody = JSON.parse(data);
         res.writeHead(201, { "content-type": "application/json" });
-        res.end(JSON.stringify({ requestId: "routine-request-1", summary: "Weekdays at 09:00 (Asia/Kolkata)" }));
+        res.end(JSON.stringify(routineRequestResponse));
       });
       return;
     }
@@ -1041,6 +1042,31 @@ describe("agents-proxy MCP surface", () => {
     expect(res.result.content[0].text).toContain("has not been applied");
     expect(res.result.content[0].text).toContain("do not claim");
     expect(res.result.isError).toBeFalsy();
+  });
+
+  it("tells the model a routine proposal was applied when the harness auto-confirmed", async () => {
+    lastRoutineRequestBody = null;
+    routineRequestResponse = {
+      requestId: "routine-request-applied",
+      summary: "Weekdays at 09:00 (Asia/Kolkata)",
+      applied: true,
+      nextRunAt: Date.parse("2026-08-31T03:30:00.000Z"),
+      timeZone: "Asia/Kolkata",
+    };
+    try {
+      const res = await callTool("propose_routine", {
+        name: "Morning brief",
+        instructions: "Summarize today's priorities.",
+        schedule: { type: "weekly", time: "09:00", weekdays: ["monday"] },
+      });
+      expect(res.result.content[0].text).toContain("was applied");
+      expect(res.result.content[0].text).toContain("in effect now");
+      expect(res.result.content[0].text).toContain("Morning brief");
+      expect(res.result.content[0].text).not.toContain("has not been applied");
+      expect(res.result.isError).toBeFalsy();
+    } finally {
+      routineRequestResponse = { requestId: "routine-request-1", summary: "Weekdays at 09:00 (Asia/Kolkata)" };
+    }
   });
 
   it("forwards for_bot_id when the routine is for another bot", async () => {

@@ -307,6 +307,10 @@ export interface TaskRecord {
   projectId?: string;
   /** Detached routine execution, reachable through its visible results card. */
   routineRunId?: string;
+  /** Stable webhook inbox identity. Later deliveries with the same key
+   * reuse this conversation instead of opening a new row. Not a TASK_PATCH
+   * field: HTTP cannot retarget another chat's inbox. */
+  webhookKey?: string;
   /** Set when a bot, not a person, opened this thread. Persisted with the
    * task so the sidebar and a backup keep the attribution. */
   openedBy?: TaskOpenedBy;
@@ -2010,6 +2014,34 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+  /** Reuse a visible inbox by webhookKey (or exact title), otherwise create.
+   * Webhook chats stay one conversation per key instead of one per event. */
+  ensureTask(botId: string, title?: string, activate = true, webhookKey?: string): TaskRecord | null {
+    const bot = this.bot(botId);
+    if (!bot) return null;
+    const key = webhookKey?.trim().slice(0, 200) ?? "";
+    const normalizedTitle = title?.trim().slice(0, 80) || "";
+    const existing = (bot.tasks ?? []).find((task) => {
+      if (task.routineRunId) return false;
+      if (key) return task.webhookKey === key;
+      return Boolean(normalizedTitle) && normalizedTitle !== UNTITLED_THREAD && task.title === normalizedTitle;
+    });
+    if (existing) {
+      bot.tasks = [existing, ...(bot.tasks ?? []).filter((task) => task.threadId !== existing.threadId)];
+      if (key && !existing.webhookKey) existing.webhookKey = key;
+      if (activate) this.mirrorActiveTask(bot, existing);
+      this.saveBots();
+      this.emit({ type: "bot", botId });
+      return existing;
+    }
+    const created = this.createTask(botId, title, activate);
+    if (created && key) {
+      created.webhookKey = key;
+      this.saveBots();
+    }
+    return created;
   }
 
   /** Attach (or complete) the opener record after the thread exists — the

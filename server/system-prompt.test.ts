@@ -16,9 +16,12 @@ import {
   LEARN_PROMPT,
   PROFILE_PROMPT,
   ROUTINE_PROMPT,
+  routinePrompt,
   ROUTINE_EXECUTION_PROMPT,
   WEBHOOK_PROMPT,
   SIGN_IN_PROMPT,
+  MUSE_WEB_THEN_BROWSER_PROMPT,
+  browserTurnPrompt,
 } from "./system-prompt.ts";
 
 describe("buildSystemPrompt", () => {
@@ -124,10 +127,16 @@ describe("computerPrompt", () => {
 
 describe("shared sentences", () => {
   it("each begins with one space so they concatenate onto the persona line", () => {
-    for (const sentence of [COMPOSIO_PROMPT, CREDENTIAL_PROMPT, ROUTINE_PROMPT, ROUTINE_EXECUTION_PROMPT, LEARN_PROMPT, WEBHOOK_PROMPT, PROFILE_PROMPT, SIGN_IN_PROMPT]) {
+    for (const sentence of [COMPOSIO_PROMPT, CREDENTIAL_PROMPT, ROUTINE_PROMPT, routinePrompt(true), ROUTINE_EXECUTION_PROMPT, LEARN_PROMPT, WEBHOOK_PROMPT, PROFILE_PROMPT, SIGN_IN_PROMPT, MUSE_WEB_THEN_BROWSER_PROMPT]) {
       expect(sentence.startsWith(" ")).toBe(true);
       expect(sentence.startsWith("  ")).toBe(false);
     }
+  });
+
+  it("browserTurnPrompt adds Muse's search-then-screenshot rule only for Muse", () => {
+    expect(browserTurnPrompt(" You have a browser.", "cursorAgent", true)).toBe(" You have a browser.");
+    expect(browserTurnPrompt(" You have a browser.", "museAgent", true)).toBe(` You have a browser.${MUSE_WEB_THEN_BROWSER_PROMPT}`);
+    expect(browserTurnPrompt(" You have a browser.", "museAgent", false)).toBe("");
   });
 
   it("customMcpPrompt names the mounted servers and is empty for none", () => {
@@ -149,5 +158,15 @@ describe("shared sentences", () => {
   it("PROFILE_PROMPT names the tool and the confirmation rule", () => {
     expect(PROFILE_PROMPT).toContain("propose_profile");
     expect(PROFILE_PROMPT).toContain("nothing changes until the user confirms");
+  });
+
+  it("routinePrompt keeps the card rule by default and names auto-apply when on", () => {
+    expect(ROUTINE_PROMPT).toContain("propose_routine");
+    expect(ROUTINE_PROMPT).toContain("A proposal is not applied until the user confirms");
+    const auto = routinePrompt(true);
+    expect(auto.startsWith(" ")).toBe(true);
+    expect(auto).toContain("auto-applies");
+    expect(auto).toContain("gatekeeper");
+    expect(auto).not.toContain("in-app card");
   });
 });

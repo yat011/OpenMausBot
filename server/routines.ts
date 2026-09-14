@@ -131,6 +131,10 @@ export interface RoutineRun {
   triggerSource?: RoutineRunTrigger;
   webhookId?: string;
   deliveryId?: string;
+  /** Display title for a reusable webhook inbox. Absent = always-new task. */
+  threadTitle?: string;
+  /** Stable webhook inbox key (e.g. a chat JID). Reuses the same task. */
+  threadKey?: string;
   /** Snapshot the routine's reporting destination. Execution remains on the
    * separate `threadId` so recurring work never contaminates chat context. */
   sourceThreadId?: string;
@@ -238,6 +242,12 @@ export interface RoutineManagerOptions {
   botState: (botId: string) => "ready" | "busy" | "missing";
   goalState?: (groupId: string, coordinatorBotId: string) => "ready" | "busy" | "missing";
   createTask: (botId: string, title: string, activate?: boolean) => { threadId: string } | null;
+  ensureTask?: (
+    botId: string,
+    title: string,
+    activate?: boolean,
+    webhookKey?: string,
+  ) => { threadId: string } | null;
   createGoalTask?: (groupId: string, title: string) => { threadId: string } | null;
   isResultsThread?: (botId: string, threadId: string) => boolean;
   /** Reuse routine.resultsThreadId, keep a trusted chat source, or allocate a new ID. */
@@ -1149,6 +1159,8 @@ export class RoutineManager {
     runOn: RoutineRunOn;
     deliveryId: string;
     receivedAt: number;
+    threadTitle?: string;
+    threadKey?: string;
   }): { id: string } {
     const existing = this.webhookRunReceipt(input.webhookId, input.deliveryId);
     if (existing) return existing;
@@ -1169,6 +1181,8 @@ export class RoutineManager {
       triggerSource: "webhook",
       webhookId: input.webhookId,
       deliveryId: input.deliveryId,
+      ...(input.threadTitle ? { threadTitle: input.threadTitle } : {}),
+      ...(input.threadKey ? { threadKey: input.threadKey } : {}),
       attachments: [],
       createdAt: this.now(),
     };
@@ -1194,6 +1208,16 @@ export class RoutineManager {
     this.emitRun(run);
     queueMicrotask(() => void this.tick());
     return cloneRun(run);
+  }
+
+  /** Webhooks that name an inbox reuse it; everything else still gets a fresh task. */
+  private allocateBotTask(run: RoutineRun): { threadId: string } | null {
+    const activate = run.triggerSource === "webhook";
+    const title = run.threadTitle?.trim() || run.routineName;
+    if ((run.threadTitle || run.threadKey) && this.options.ensureTask) {
+      return this.options.ensureTask(run.botId, title, activate, run.threadKey);
+    }
+    return this.options.createTask(run.botId, title, activate);
   }
 
   /** The most recent completed report for a continuity routine, or `null` when
@@ -1415,7 +1439,7 @@ export class RoutineManager {
           ? run.groupId
             ? this.options.createGoalTask?.(run.groupId, run.routineName) ?? null
             : null
-          : this.options.createTask(run.botId, run.routineName, run.triggerSource === "webhook");
+          : this.allocateBotTask(run);
         if (!task) {
           this.failRun(run, run.target === "room-goal"
             ? "Could not create a room task for this goal"

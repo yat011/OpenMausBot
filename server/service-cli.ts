@@ -14,6 +14,7 @@ export interface ServiceInstallInput {
   tunnel?: boolean;
   tailscale?: boolean;
   label?: string;
+  yolo?: boolean;
   /** This CLI's own entry, as node saw it (process.argv[1]) and node itself (process.execPath). */
   script: string;
   node: string;
@@ -28,12 +29,13 @@ export interface ServiceIo {
 }
 
 /** The `serve` arguments the service repeats, from the options given to `service install`. */
-export function serviceServeArgs(input: Pick<ServiceInstallInput, "port" | "dataDir" | "domain" | "tunnel" | "tailscale" | "label">): string[] {
+export function serviceServeArgs(input: Pick<ServiceInstallInput, "port" | "dataDir" | "domain" | "tunnel" | "tailscale" | "label" | "yolo">): string[] {
   const args = ["--port", String(input.port), "--data-dir", input.dataDir, "--no-pair"];
   if (input.domain) args.push("--domain", input.domain);
   else if (input.tunnel) args.push("--tunnel");
   else if (input.tailscale) args.push("--tailscale");
   if (input.label) args.push("--label", input.label);
+  if (input.yolo) args.push("--yolo");
   return args;
 }
 

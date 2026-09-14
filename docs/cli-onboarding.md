@@ -60,10 +60,11 @@ The examples below assume a global install; prefix them with `npx` otherwise.
 | `openmausbot setup` | Revisit AI and optional phone setup, save, and exit without starting. This is not a reset. |
 | `openmausbot --no-open` | Start without opening a browser. |
 | `openmausbot --local` | Ignore saved remote access for this launch; keep the saved choice for next time. |
+| `openmausbot --yolo` | Full access for every CLI engine this process starts (alias `--always-approve`). Does not persist the bot setting. |
 | `openmausbot --no-pair` | Suppress phone setup prompts and pairing invitations. This does **not** turn off saved remote access; use `--local` for that. |
 | `openmausbot pair` | Create another phone invitation while the configured workspace and HTTPS connection are running. |
 | `openmausbot sessions` | List paired devices; `openmausbot sessions revoke ID` signs one out. |
-| `openmausbot serve` | Start without onboarding prompts or automatic browser opening; specify remote-access flags explicitly for a service. |
+| `openmausbot serve` | Start without onboarding prompts or automatic browser opening; specify remote-access flags explicitly for a service. `serve` also accepts `--yolo`. |
 | `openmausbot login` | Sign in to an OpenMausBot account for `--tunnel`; this does not sign in to an AI provider or start the tunnel. |
 
 `start` accepts the same server options as `serve`, including `--port`, `--data-dir`, `--tailscale`, `--tunnel`, and `--public-url`. Keep using your custom data directory and port when starting or pairing:

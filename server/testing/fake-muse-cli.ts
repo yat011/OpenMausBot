@@ -44,9 +44,27 @@ if (promptFile) {
 
 if (process.env.FAKE_MUSE_DUMP) {
   try {
+    const settingsPath = process.env.XDG_CONFIG_HOME
+      ? `${process.env.XDG_CONFIG_HOME.replace(/\/$/, "")}/muse/settings.json`
+      : null;
+    let settings = null;
+    if (settingsPath) {
+      try {
+        settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+      } catch {
+        settings = null;
+      }
+    }
     appendFileSync(
       process.env.FAKE_MUSE_DUMP,
-      JSON.stringify({ argv, prompt, sessionId, metaKey: process.env.META_API_KEY ?? null }) + "\n",
+      JSON.stringify({
+        argv,
+        prompt,
+        sessionId,
+        metaKey: process.env.META_API_KEY ?? null,
+        xdgConfigHome: process.env.XDG_CONFIG_HOME ?? null,
+        settings,
+      }) + "\n",
     );
   } catch {
     /* never let dumping break a run */

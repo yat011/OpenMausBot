@@ -82,6 +82,26 @@ describe("webhook-only ingress", () => {
     expect(queued[0]?.prompt).toContain("Event: push");
   });
 
+  it("forwards inbox routing headers onto the queued run", async () => {
+    const credential = webhookCredential(ingress.baseUrl, endpointId, secret);
+    const before = queued.length;
+    const response = await fetch(credential.url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-omb-thread-title": "WA: inbox",
+        "x-omb-thread-key": "wa:15555550100@s.whatsapp.net",
+      },
+      body: JSON.stringify({ Chat: "15555550100@s.whatsapp.net" }),
+    });
+    expect(response.status).toBe(202);
+    expect(queued).toHaveLength(before + 1);
+    expect(queued.at(-1)).toMatchObject({
+      threadTitle: "WA: inbox",
+      threadKey: "wa:15555550100@s.whatsapp.net",
+    });
+  });
+
   it("also accepts a bearer secret without putting it in the URL", async () => {
     const response = await fetch(`${ingress.baseUrl}/hooks/${endpointId}`, {
       method: "POST",

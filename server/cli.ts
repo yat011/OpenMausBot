@@ -33,6 +33,7 @@ import qrcode from "qrcode-terminal";
 import { parseAllowList } from "./account-signin.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { ensureCaddy, normalizeDomainOption, startCaddy, type RunningCaddy } from "./caddy.ts";
+import { cliYoloFromEnv } from "./auto-approve.ts";
 import { runServiceCommand } from "./service-cli.ts";
 import { runFleetCommand, type FleetInput } from "./fleet-cli.ts";
 import { startFleetAgent } from "./fleet-agent.ts";
@@ -107,6 +108,8 @@ export interface CliOptions {
   /** Internal guided-start presentation; serve remains script-friendly. */
   guided?: boolean;
   phone?: "ios" | "android";
+  /** Process-level Full access for every CLI engine this serve starts. */
+  yolo?: boolean;
 }
 
 const COMMANDS = ["setup", "start", "serve", "pair", "sessions", "status", "login", "logout", "access", "service", "browser", "fleet", "help", "--help", "-h"];
@@ -128,6 +131,7 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
     withDeps: false,
     json: false,
     chatOnly: false,
+    yolo: cliYoloFromEnv(env),
   };
   for (let i = 0; i < rest.length; i += 1) {
     const arg = rest[i];
@@ -153,6 +157,7 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
       else if (arg === "--no-pair") options.pair = false;
       else if (arg === "--no-open") options.open = false;
       else if (arg === "--local") options.local = true;
+      else if (arg === "--yolo" || arg === "--always-approve") options.yolo = true;
       else if (arg === "--json") options.json = true;
       else if (arg === "--email") options.email = value();
       else if (options.command === "sessions" && arg === "revoke") options.revoke = value();
@@ -210,13 +215,14 @@ export const USAGE = `openmausbot — your team of AI bots, ready in a few steps
   openmausbot start [the same options as serve]
   openmausbot serve [--port 8799] [--data-dir DIR] [--label NAME]
                     [--public-url https://host] [--tailscale | --tunnel | --domain HOST] [--no-pair]
+                    [--yolo]
   openmausbot pair  [--label NAME] [--client] [--public-url https://host]
   openmausbot sessions [revoke ID]
   openmausbot status
   openmausbot login [--email you@example.com]
   openmausbot logout
   openmausbot access list | add EMAIL [--chat-only] | remove EMAIL
-  openmausbot service install [--domain HOST | --tunnel | --tailscale] [--port N] [--data-dir DIR] | uninstall
+  openmausbot service install [--domain HOST | --tunnel | --tailscale] [--port N] [--data-dir DIR] [--yolo] | uninstall
   openmausbot browser install [--with-deps] | status
   openmausbot fleet init --domain HOST [--operator USER] | create NAME --admin EMAIL [--member EMAIL] [--brand FILE]
                     [--anthropic-key-file FILE] [--cap USD] [--license-key KEY] [--memory 1G]
@@ -268,6 +274,8 @@ fleet   many client workspaces on one Linux server, each its own account,
 --no-open   do not open a browser window
 --no-pair   skip phone setup and do not print a pairing code
 --local     start locally this time, ignoring saved remote-access settings
+--yolo      Full access for every CLI engine this process starts (alias: --always-approve).
+            Does not persist the bot setting; HTTP still cannot elevate to Full.
 
 Install once with \`npm install -g openmausbot\`, then type \`openmausbot\`.
 Or run without a global install: \`npx openmausbot\`. Node 24+ is required.
@@ -805,6 +813,7 @@ export async function runServe(options: CliOptions, log: (line: string) => void 
     OMB_PORT: String(options.port),
     OMB_WEBHOOK_PORT: process.env.OMB_WEBHOOK_PORT || String(options.port + 1),
   };
+  if (options.yolo) env.OMB_YOLO = "1";
   if (options.local) delete env.OMB_PUBLIC_URL;
   if (entry.staticDir) env.OMB_STATIC_DIR = entry.staticDir;
   if (entry.skillsDir && !process.env.OMB_SKILLS_DIR) env.OMB_SKILLS_DIR = entry.skillsDir;
@@ -1063,6 +1072,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         tunnel: options.tunnel,
         tailscale: options.tailscale,
         label: options.label,
+        yolo: options.yolo,
         script: process.argv[1] ?? "",
         node: process.execPath,
       }, { log: (line) => console.log(line), error: (line) => console.error(line) });

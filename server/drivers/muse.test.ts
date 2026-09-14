@@ -13,7 +13,7 @@ import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { buildMuseExecArgs, loadMuseCatalog, MuseDriver, parseMuseLine, type MuseConfig } from "./muse.ts";
+import { buildMuseExecArgs, buildMuseSettingsWithMcp, loadMuseCatalog, MuseDriver, parseMuseLine, type MuseConfig } from "./muse.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-muse-cli.ts");
 
@@ -22,6 +22,11 @@ interface DumpLine {
   prompt: string;
   sessionId?: string;
   metaKey: string | null;
+  xdgConfigHome?: string | null;
+  settings?: {
+    schema_version?: number;
+    mcpServers?: Record<string, { transport?: string; command?: string; args?: string[]; env?: Record<string, string>; mode?: string }>;
+  } | null;
 }
 
 function readDump(path: string): DumpLine[] {
@@ -213,6 +218,92 @@ describe("MuseDriver turns (fake CLI)", () => {
     }
   });
 
+  it("advertises browser MCP and mounts it through a per-turn settings overlay", async () => {
+    const configHome = mkdtempSync(join(tmpdir(), "omb-muse-user-config-"));
+    mkdirSync(join(configHome, "muse"), { recursive: true });
+    writeFileSync(
+      join(configHome, "muse", "auth.json"),
+      JSON.stringify({ providers: { meta: { mechanism: "oauth", access_token: "tok" } } }),
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      join(configHome, "muse", "settings.json"),
+      JSON.stringify({ schema_version: 1, mcp_servers: { notes: { transport: "stdio", command: "notes" } } }),
+    );
+    await create(undefined, { XDG_CONFIG_HOME: configHome });
+    expect(instance.adapter.capabilities.browserMcp).toBe(true);
+    expect(instance.adapter.capabilities.customMcp).toBe(true);
+
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-browser",
+      text: "look",
+      integrations: {
+        browser: { command: "/usr/bin/node", args: ["browser-proxy.ts"], env: { OMB_BROWSER_TOKEN: "tok" } },
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+
+    const launch = readDump(dump)[0]!;
+    expect(launch.argv).not.toContain("--disable-web-tools");
+    expect(launch.xdgConfigHome).toBeTruthy();
+    expect(launch.xdgConfigHome).not.toBe(configHome);
+    expect(launch.settings).toMatchObject({
+      schema_version: 1,
+      mcpServers: {
+        notes: { transport: "stdio", command: "notes" },
+        browser: {
+          transport: "stdio",
+          command: "/usr/bin/node",
+          args: ["browser-proxy.ts"],
+          env: { OMB_BROWSER_TOKEN: "tok" },
+          mode: "optional",
+        },
+      },
+    });
+    expect(launch.settings).not.toHaveProperty("mcp_servers");
+    expect(JSON.parse(readFileSync(join(configHome, "muse", "settings.json"), "utf8"))).toEqual({
+      schema_version: 1,
+      mcp_servers: { notes: { transport: "stdio", command: "notes" } },
+    });
+    await removeTempDir(configHome);
+  });
+
+  it("does not overlay Muse settings when the turn has no MCP", async () => {
+    await create();
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-no-browser", text: "go" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const launch = readDump(dump)[0]!;
+    expect(launch.xdgConfigHome).toBeNull();
+    expect(launch.settings).toBeNull();
+  });
+
+  it("mounts custom MCP servers through the same per-turn overlay", async () => {
+    await create();
+    expect(instance.adapter.capabilities.customMcp).toBe(true);
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-custom",
+      text: "trips",
+      integrations: {
+        custom: { wanderlog: { command: "wanderlog-mcp", args: [], env: {} } },
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const launch = readDump(dump)[0]!;
+    expect(launch.xdgConfigHome).toBeTruthy();
+    expect(launch.settings).toMatchObject({
+      schema_version: 1,
+      mcpServers: {
+        wanderlog: {
+          transport: "stdio",
+          command: "wanderlog-mcp",
+          args: [],
+          env: {},
+          mode: "optional",
+        },
+      },
+    });
+  });
+
   it("decodes config with muse defaults", () => {
     expect(MuseDriver.decodeConfig({})).toEqual({ cli: "muse", provider: "meta", model: "", baseUrl: "" });
     expect(MuseDriver.models.default).toBe("muse-spark-1.2");
@@ -220,6 +311,28 @@ describe("MuseDriver turns (fake CLI)", () => {
 });
 
 describe("muse protocol helpers", () => {
+  it("folds custom servers then lets the built-in browser win the browser name", () => {
+    expect(
+      buildMuseSettingsWithMcp(
+        { schema_version: 1, mcp_servers: { notes: { command: "notes" } } },
+        {
+          custom: {
+            wanderlog: { command: "wanderlog-mcp", args: [], env: {} },
+            browser: { command: "evil", args: [], env: {} },
+          },
+          browser: { command: "node", args: ["proxy"], env: { TOKEN: "t" } },
+        },
+      ),
+    ).toMatchObject({
+      schema_version: 1,
+      mcpServers: {
+        notes: { command: "notes" },
+        wanderlog: { command: "wanderlog-mcp", transport: "stdio", mode: "optional" },
+        browser: { command: "node", args: ["proxy"], env: { TOKEN: "t" } },
+      },
+    });
+  });
+
   it("parses deltas, completions, failures, and noise", () => {
     expect(parseMuseLine(JSON.stringify({ payload_type: "run.output.delta", payload: { text: "hi" } }))).toEqual({
       kind: "delta",

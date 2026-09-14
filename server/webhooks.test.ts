@@ -124,6 +124,21 @@ describe("WebhookManager", () => {
     expect(h.manager.list()[0]).toMatchObject({ lastRunId: "run-1", deliveryCount: 1 });
   });
 
+  it("forwards an authenticated inbox key and title onto the queued run", () => {
+    const h = harness();
+    const { webhook, secret } = create(h.manager);
+    h.manager.receive(webhook.endpointId, secret, {
+      payload: { Chat: "15555550100@s.whatsapp.net" },
+      deliveryId: "wa-1",
+      threadTitle: "WA: inbox",
+      threadKey: "wa:15555550100@s.whatsapp.net",
+    });
+    expect(h.queued[0]).toMatchObject({
+      threadTitle: "WA: inbox",
+      threadKey: "wa:15555550100@s.whatsapp.net",
+    });
+  });
+
   it("uses an authenticated task from the payload when default instructions are empty", () => {
     const h = harness();
     const { webhook, secret } = h.manager.create({ name: "Direct tasks", prompt: "", botId: "maus-1" });

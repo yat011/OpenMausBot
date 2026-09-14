@@ -41,6 +41,10 @@ export interface WebhookEvent {
   eventName?: string;
   userAgent?: string;
   deliveryId?: string;
+  /** Display title for a reusable inbox thread. */
+  threadTitle?: string;
+  /** Stable inbox key so later deliveries continue the same conversation. */
+  threadKey?: string;
 }
 
 export interface WebhookReceiveResult {
@@ -64,6 +68,8 @@ export interface WebhookManagerOptions {
     runOn: RoutineRunOn;
     deliveryId: string;
     receivedAt: number;
+    threadTitle?: string;
+    threadKey?: string;
   }) => { id: string };
   cancelQueued?: (webhookId: string, message: string) => void;
   pendingRuns?: (webhookId: string) => number;
@@ -240,6 +246,16 @@ function taskFromPayload(payload: JsonValue): string {
   if (!parsed.success) return "";
   const task = parsed.data.task ?? parsed.data.message ?? "";
   return task.trim().slice(0, 20_000);
+}
+
+export function webhookThreadTitle(value: string | undefined): string | undefined {
+  const title = (value ?? "").replace(/[\u0000-\u001F\u007F]+/g, " ").trim().slice(0, 80);
+  return title || undefined;
+}
+
+export function webhookThreadKey(value: string | undefined): string | undefined {
+  const key = (value ?? "").replace(/[\u0000-\u001F\u007F]+/g, "").trim().slice(0, 200);
+  return key || undefined;
 }
 
 function eventPrompt(trigger: StoredWebhookTrigger, event: WebhookEvent, receivedAt: number, deliveryId: string): string {
@@ -475,6 +491,8 @@ export class WebhookManager {
     this.rate.set(trigger.endpointId, recent);
 
     const deliveryId = requestedDeliveryId || randomUUID();
+    const threadTitle = webhookThreadTitle(event.threadTitle);
+    const threadKey = webhookThreadKey(event.threadKey);
     const run = this.options.enqueue({
       webhookId: trigger.id,
       webhookName: trigger.name,
@@ -483,6 +501,8 @@ export class WebhookManager {
       runOn: trigger.runOn,
       deliveryId,
       receivedAt: now,
+      ...(threadTitle ? { threadTitle } : {}),
+      ...(threadKey ? { threadKey } : {}),
     });
     this.deliveries.push({ key: `${trigger.endpointId}:${deliveryId}`, runId: run.id, at: now });
     if (this.deliveries.length > MAX_DELIVERIES) {

@@ -133,4 +133,28 @@ describe("tasks", () => {
     // and it is named from the conversation rather than left blank
     expect(migrated[0]!.title).not.toBe(UNTITLED_TASK);
   });
+
+  it("reuses a webhook inbox by key and does not open a second row", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const first = store.ensureTask(bot.id, "WA: inbox", true, "wa:inbox")!;
+    const second = store.ensureTask(bot.id, "WA: inbox", true, "wa:inbox")!;
+    const other = store.ensureTask(bot.id, "WA: group", true, "wa:group")!;
+
+    expect(second.threadId).toBe(first.threadId);
+    expect(other.threadId).not.toBe(first.threadId);
+    expect(store.taskByThread(bot.id, first.threadId)?.webhookKey).toBe("wa:inbox");
+    expect(store.bot(bot.id)!.threadId).toBe(other.threadId);
+    expect(store.tasks(bot.id).filter((task) => task.webhookKey === "wa:inbox")).toHaveLength(1);
+  });
+
+  it("does not reuse a detached routine task as a webhook inbox", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const hidden = store.createTask(bot.id, "WA: inbox", false)!;
+    store.patchTask(bot.id, hidden.threadId, { routineRunId: "run-1" });
+    const inbox = store.ensureTask(bot.id, "WA: inbox", true, "wa:inbox")!;
+    expect(inbox.threadId).not.toBe(hidden.threadId);
+    expect(inbox.webhookKey).toBe("wa:inbox");
+  });
 });

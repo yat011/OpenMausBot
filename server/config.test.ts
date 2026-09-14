@@ -22,6 +22,7 @@ import { customMcpServers,
   showToolCallsEnabled,
   saveConfig,
   skillAuthoringEnabled,
+  autoConfirmRoutineProposalsEnabled,
   builtInBrowserEnabled,
   browserProfilePartitionId,
   browserProfilePartitionTarget,
@@ -399,6 +400,16 @@ describe("configuration boundaries", () => {
       features: { showToolCalls: true },
     });
     expect(showToolCallsEnabled({ features: { showToolCalls: true } })).toBe(true);
+  });
+
+  it("keeps routine auto-confirm off by default and accepts an explicit opt-in", () => {
+    expect(autoConfirmRoutineProposalsEnabled({})).toBe(false);
+    expect(autoConfirmRoutineProposalsEnabled({ features: {} })).toBe(false);
+    expect(parseConfigPatch({ features: { autoConfirmRoutineProposals: true } })).toEqual({
+      features: { autoConfirmRoutineProposals: true },
+    });
+    expect(autoConfirmRoutineProposalsEnabled({ features: { autoConfirmRoutineProposals: true } })).toBe(true);
+    expect(autoConfirmRoutineProposalsEnabled({ features: { autoConfirmRoutineProposals: false } })).toBe(false);
   });
 
   it.each([0, 1.5, 5, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {
@@ -985,6 +996,40 @@ describe("credential env preference", () => {
     syncCredentialEnv({ openaiCompat: { key: "just-saved" } });
     expect(process.env.OPENAI_COMPAT_MODEL).toBe("boot-model");
     expect(process.env.OPENAI_COMPAT_PROVIDER).toBe("boot-provider");
+  });
+});
+
+describe("OMB_AUTO_CONFIRM_ROUTINES env overlay", () => {
+  const path = join(DATA_DIR, "config.json");
+  let saved: string | undefined;
+
+  beforeEach(() => {
+    saved = process.env.OMB_AUTO_CONFIRM_ROUTINES;
+    delete process.env.OMB_AUTO_CONFIRM_ROUTINES;
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(path, { force: true });
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.OMB_AUTO_CONFIRM_ROUTINES;
+    else process.env.OMB_AUTO_CONFIRM_ROUTINES = saved;
+    rmSync(path, { force: true });
+  });
+
+  it("leaves the file flag unchanged when the env var is unset", () => {
+    writeFileSync(path, JSON.stringify({ features: { autoConfirmRoutineProposals: true } }));
+    expect(autoConfirmRoutineProposalsEnabled(loadConfig())).toBe(true);
+  });
+
+  it("turns the flag on when the env var is 1, even if the file is off", () => {
+    writeFileSync(path, JSON.stringify({ features: { autoConfirmRoutineProposals: false } }));
+    process.env.OMB_AUTO_CONFIRM_ROUTINES = "1";
+    expect(autoConfirmRoutineProposalsEnabled(loadConfig())).toBe(true);
+  });
+
+  it("turns the flag off when the env var is 0, even if the file is on", () => {
+    writeFileSync(path, JSON.stringify({ features: { autoConfirmRoutineProposals: true } }));
+    process.env.OMB_AUTO_CONFIRM_ROUTINES = "0";
+    expect(autoConfirmRoutineProposalsEnabled(loadConfig())).toBe(false);
   });
 });
 

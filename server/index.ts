@@ -26,7 +26,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { HELD_NOTE, approvalHeldNote, approvalHeldReason, approvalModeForOrigin, autoVerdict } from "./auto-approve.ts";
+import { HELD_NOTE, approvalHeldNote, approvalHeldReason, autoVerdict, cliYoloFromEnv, effectiveApprovalMode } from "./auto-approve.ts";
 import { updateClaudeCli } from "./claude-update.ts";
 import { configuredAccountDirectory, assertSeparateClaudeAccount, claudeAccountInfo, createClaudeAccountSchema, instanceSettingsSchema, newClaudeAccount } from "./claude-accounts.ts";
 import {
@@ -112,6 +112,7 @@ import {
   saveConfig,
   showToolCallsEnabled,
   skillAuthoringEnabled,
+  autoConfirmRoutineProposalsEnabled,
   builtInBrowserEnabled,
   browserProfileReplacementConflict,
   browserProfilePartitionTarget,
@@ -294,9 +295,10 @@ import {
   THREADS_PROMPT,
   LEARN_PROMPT,
   PROFILE_PROMPT,
-  ROUTINE_PROMPT,
+  routinePrompt,
   ROUTINE_EXECUTION_PROMPT,
   WEBHOOK_PROMPT,
+  browserTurnPrompt,
   type ComputerPromptKind,
 } from "./system-prompt.ts";
 import { readCuaConnection, gatedLocalComputer } from "./local-computer.ts";
@@ -1460,10 +1462,10 @@ function previewSystemPrompt(bot: BotRecord) {
     { id: "computer", label: "Computer", text: computerPrompt(computerPromptKind) },
     { id: "composio", label: "Connected apps", text: caps?.composioMcp && bot.composio !== false && composio.configured(cfg) ? COMPOSIO_PROMPT : "" },
     { id: "mcp", label: "MCP servers", text: caps?.customMcp ? customMcpPrompt(Object.keys(customMcpServers(cfg, bot.mcpServers))) : "" },
-    { id: "browser", label: "Browser", text: caps?.browserMcp && builtInBrowserEnabled(cfg) && bot.browser !== false && bot.computer !== "off" ? BUILT_IN_BROWSER_SYSTEM_PROMPT : "" },
+    { id: "browser", label: "Browser", text: browserTurnPrompt(BUILT_IN_BROWSER_SYSTEM_PROMPT, instance?.driverKind, caps?.browserMcp === true && builtInBrowserEnabled(cfg) && bot.browser !== false && bot.computer !== "off") },
     { id: "coordination", label: "Team", text: agentsMounted && coordination ? ` ${coordination}` : "" },
     { id: "credential", label: "Credentials", text: agentsMounted ? CREDENTIAL_PROMPT : "" },
-    { id: "routine", label: "Routines", text: agentsMounted ? ROUTINE_PROMPT : "" },
+    { id: "routine", label: "Routines", text: agentsMounted ? routinePrompt(autoConfirmRoutineProposalsEnabled(cfg)) : "" },
     { id: "profile", label: "Profile changes", text: agentsMounted ? PROFILE_PROMPT : "" },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     { id: "memory", label: "Memory", text: privateWorkspace ? memorySystemPrompt(bot.id) : "" },
@@ -1555,13 +1557,12 @@ async function botOverview(bot: BotRecord): Promise<BotOverview> {
  * this too, but no provider dispatch or later permission callback relies on
  * persistence having been produced exclusively by that route. Delegation
  * uses the receiving bot's grant, never the sender's — see approvalModeForOrigin. */
-const approvalModeForTurn = (bot: BotRecord, peerInitiated = false): ApprovalMode => {
-  const mode = approvalModeForOrigin(approvalModeFor(bot), { peerInitiated });
-  if (!supportsApprovalMode(registry.cliTarget(bot.modelSelection.instanceId)?.driverKind, mode)) {
-    return "ask";
-  }
-  return mode;
-};
+const approvalModeForTurn = (bot: BotRecord, peerInitiated = false): ApprovalMode =>
+  effectiveApprovalMode(
+    approvalModeFor(bot),
+    registry.cliTarget(bot.modelSelection.instanceId)?.driverKind,
+    { peerInitiated, yolo: cliYoloFromEnv() },
+  );
 
 /** Privileged approval-mode transitions are deliberately absent from the
  * loopback HTTP authority model: a bot with shell access can curl that
@@ -5016,7 +5017,7 @@ async function startTurn(
           ? peerRosterSystemPrompt(sectionPeers)
           : "";
       const credentialPrompt = integrations.agents ? CREDENTIAL_PROMPT + THREADS_PROMPT : "";
-      const routinePrompt = integrations.agents ? ROUTINE_PROMPT : "";
+      const routinePromptText = integrations.agents ? routinePrompt(autoConfirmRoutineProposalsEnabled(cfg)) : "";
       const profilePrompt = integrations.agents ? PROFILE_PROMPT : "";
       const recallPrompt = integrations.agents ? SESSION_SEARCH_SYSTEM_PROMPT : "";
       const learnPrompt = skillAuthoring ? LEARN_PROMPT : "";
@@ -5097,11 +5098,11 @@ async function startTurn(
         // bot whose driver actually mounted the tools
         { id: "composio", label: "Connected apps", text: integrations.composio ? COMPOSIO_PROMPT : "" },
         { id: "mcp", label: "MCP servers", text: customMcpPrompt(Object.keys(integrations.custom ?? {})) },
-        { id: "browser", label: "Browser", text: integrations.browser ? BUILT_IN_BROWSER_SYSTEM_PROMPT : "" },
+        { id: "browser", label: "Browser", text: browserTurnPrompt(BUILT_IN_BROWSER_SYSTEM_PROMPT, instance.driverKind, Boolean(integrations.browser)) },
         { id: "coordination", label: "Team", text: coordinationPrompt ? ` ${coordinationPrompt}` : "" },
         { id: "credential", label: "Credentials", text: credentialPrompt },
         { id: "recall", label: "Recall", text: recallPrompt },
-        { id: "routine", label: "Routines", text: routinePrompt },
+        { id: "routine", label: "Routines", text: routinePromptText },
         { id: "routine-execution", label: "Routine execution", text: opts?.automationSource === "schedule" || opts?.automationSource === "manual" ? ROUTINE_EXECUTION_PROMPT : "" },
         { id: "profile", label: "Profile changes", text: profilePrompt },
         { id: "learn", label: "Skill authoring", text: learnPrompt },
@@ -5474,6 +5475,12 @@ routines = new RoutineManager({
     if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
     return task;
   },
+  ensureTask: (botId, title, activate = false, webhookKey) => {
+    const task = store.ensureTask(botId, title, activate, webhookKey);
+    const bot = store.bot(botId);
+    if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
+    return task;
+  },
   createGoalTask: (groupId, title) => store.createGroupTask(groupId, title, false),
   isResultsThread: (botId, threadId) => {
     const bot = store.bot(botId);
@@ -5625,6 +5632,7 @@ const routineRequests = new RoutineRequestService({
     }
     return null;
   },
+  autoConfirm: () => autoConfirmRoutineProposalsEnabled(cfg),
 });
 const profileRequests = new ProfileRequestService({
   store,
@@ -6265,7 +6273,7 @@ async function runGroupMemberTurn(
     `Reply as yourself, briefly and conversationally. To bring a teammate in, mention them like @Name — they'll see the conversation and respond.`,
     outsideRoom.length > 0 && roomPeerRosterSystemPrompt(outsideRoom),
     integrations.agents && (CREDENTIAL_PROMPT + THREADS_PROMPT).trim(),
-    integrations.agents && ROUTINE_PROMPT.trim(),
+    integrations.agents && routinePrompt(autoConfirmRoutineProposalsEnabled(cfg)).trim(),
     integrations.agents && PROFILE_PROMPT.trim(),
     skillAuthoring && LEARN_PROMPT.trim(),
     orchestration?.systemInstructions,
@@ -6299,7 +6307,7 @@ async function runGroupMemberTurn(
   const roomSystem = buildSystemPrompt(system, store.bot(bot.id)?.soul ?? bot.soul ?? "", [
     { id: "mcp", label: "MCP servers", text: customMcpPrompt(Object.keys(integrations.custom ?? {})) },
     { id: "computer", label: "Computer", text: computerPrompt(roomVmTarget ? localVmMode(cfg) === "per-bot" ? "vm-private" : "vm-shared" : null) },
-    { id: "browser", label: "Browser", text: integrations.browser ? BUILT_IN_BROWSER_SYSTEM_PROMPT : "" },
+    { id: "browser", label: "Browser", text: browserTurnPrompt(BUILT_IN_BROWSER_SYSTEM_PROMPT, instance.driverKind, Boolean(integrations.browser)) },
     { id: "recall", label: "Recall", text: integrations.agents ? SESSION_SEARCH_SYSTEM_PROMPT : "" },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     // the room path has always put a newline before memory and trimmed
@@ -8185,6 +8193,7 @@ function configStatus() {
       skillAuthoring: skillAuthoringEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
       browser: builtInBrowserEnabled(cfg),
+      autoConfirmRoutineProposals: autoConfirmRoutineProposalsEnabled(cfg),
     },
     // first-run progress — not a secret; the app decides whether to show
     // the welcome tour from this, never from browser storage
@@ -9042,7 +9051,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // Audit what the human was actually shown, not the shorter tool
           // response returned to the model.
           summary: proposedCard?.subtitle ?? proposed.summary,
-          decision: "card-shown",
+          decision: proposed.applied ? "auto-approved" : "card-shown",
           source: "routine",
         });
         return json(res, 201, proposed);
@@ -13408,7 +13417,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // child proves it is OURS by echoing its pid (a stray dev server has
     // the same API shape but a different pid)
     if (method === "GET" && path === "/api/health") {
-      return json(res, 200, { app: "openmausbot", pid: process.pid, static: Boolean(STATIC_DIR) });
+      return json(res, 200, { app: "openmausbot", pid: process.pid, static: Boolean(STATIC_DIR), yolo: cliYoloFromEnv() });
     }
     // The bots' browser engine: install it on this machine (agent-browser +
     // a Chrome for Testing, a one-time download), or ask how that is going.
@@ -14772,6 +14781,7 @@ restoreChannelMessages();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+  if (cliYoloFromEnv()) console.log("YOLO: CLI engines run this process with Full access; stored bot levels are unchanged");
   followupsReady = true;
   drainQueuedSends();
   drainQueuedChannelSends();

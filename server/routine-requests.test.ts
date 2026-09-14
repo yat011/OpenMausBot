@@ -61,6 +61,7 @@ function harness(
     botId: string,
     threadId: string,
   ) => { ok: true } | { ok: false; status: number; error: string },
+  autoConfirm?: () => boolean,
 ) {
   const clock = { now: start };
   const dir = mkdtempSync(join(tmpdir(), "omb-routine-request-"));
@@ -80,6 +81,7 @@ function harness(
     timeZone: () => "Asia/Kolkata",
     cloudReady,
     canPersist,
+    autoConfirm,
   });
   return { clock, routines, service, store };
 }
@@ -130,6 +132,31 @@ describe("RoutineRequestService", () => {
     });
     expect(JSON.stringify(card)).not.toContain(secret);
     expect(JSON.stringify(card)).toContain("redacted");
+    expect(proposed.applied).toBeUndefined();
+    expect(routines.listRoutines()).toHaveLength(0);
+  });
+
+  it("auto-applies the proposal when autoConfirm is on, leaving the card answered", async () => {
+    const { service, store, routines } = harness(
+      Date.parse("2026-08-28T10:00:00Z"),
+      undefined,
+      undefined,
+      () => true,
+    );
+    const proposed = await service.propose({
+      botId: "bot-a",
+      threadId: "thread-a",
+      proposal: createProposal(),
+    });
+
+    expect(proposed.applied).toBe(true);
+    expect(proposed.action).toBe("create");
+    expect(proposed.resultId).toEqual(expect.any(String));
+    expect(routines.listRoutines()).toHaveLength(1);
+    expect(routines.listRoutines()[0]!.name).toBe("Morning brief");
+    const card = store.messagesFor("thread-a")[0]!.card!;
+    expect(card.answered).toBe("allow");
+    expect(card.requestId).toBe(proposed.requestId);
   });
 
   it("carries continuity from the proposal through the card to the created routine", async () => {

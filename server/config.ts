@@ -228,6 +228,11 @@ const featureConfigSchema = z.object({
   /** Experimental built-in browser. Off until explicitly enabled; each bot
    * also has its own switch. */
   browser: z.boolean().optional(),
+  /** Apply routine proposals immediately instead of waiting for the in-app
+   * confirmation card. Off unless explicitly enabled; env
+   * `OMB_AUTO_CONFIRM_ROUTINES` wins over the file. Profile, skill, and
+   * API-key cards are unchanged. */
+  autoConfirmRoutineProposals: z.boolean().optional(),
 });
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -528,6 +533,13 @@ export function showToolCallsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.showToolCalls === true;
 }
 
+/** Immediate apply of propose_routine / propose_routine_action. Off unless
+ * the Settings/file flag is true, or `OMB_AUTO_CONFIRM_ROUTINES` is a
+ * truthy value (`1` / `true` / `yes`). Env wins, including an explicit off. */
+export function autoConfirmRoutineProposalsEnabled(cfg: AppConfig): boolean {
+  return cfg.features?.autoConfirmRoutineProposals === true;
+}
+
 /** Workspace-level gate for the experimental built-in browser. A bot's own
  * switch sits under it, so either can withhold the browser. */
 export function builtInBrowserEnabled(cfg: AppConfig): boolean {
@@ -650,6 +662,12 @@ export function loadConfig(): AppConfig {
     cfg.signIn = { ...cfg.signIn };
     if (process.env.OMB_SIGNIN_EMAILS !== undefined) cfg.signIn.admins = splitEmails(process.env.OMB_SIGNIN_EMAILS);
     if (process.env.OMB_SIGNIN_MEMBER_EMAILS !== undefined) cfg.signIn.members = splitEmails(process.env.OMB_SIGNIN_MEMBER_EMAILS);
+  }
+  const autoConfirmRoutines = process.env.OMB_AUTO_CONFIRM_ROUTINES;
+  if (autoConfirmRoutines !== undefined && autoConfirmRoutines.trim() !== "") {
+    const normalized = autoConfirmRoutines.trim().toLowerCase();
+    const on = normalized === "1" || normalized === "true" || normalized === "yes";
+    cfg.features = { ...cfg.features, autoConfirmRoutineProposals: on };
   }
   return cfg;
 }

@@ -828,6 +828,17 @@ function routineFields(args: Json): { fields: Json; error?: string } {
 
 function confirmationResult(r: Json, fallback: string, noun = "routine"): { text: string } {
   const summary = typeof r.summary === "string" && r.summary.trim() ? `\n\n${r.summary.trim()}` : "";
+  if (r.applied === true) {
+    const nextRun = typeof r.nextRunAt === "number"
+      ? `\nNext run: ${new Date(r.nextRunAt).toISOString()}.`
+      : typeof r.nextRunAt === "string" && r.nextRunAt.trim()
+        ? `\nNext run: ${r.nextRunAt.trim()}.`
+        : "";
+    const tz = typeof r.timeZone === "string" && r.timeZone.trim() ? ` Timezone: ${r.timeZone.trim()}.` : "";
+    return {
+      text: `The ${noun} change was applied: ${fallback}.${summary}${nextRun}${tz}\n\nThis is in effect now. You may tell the user it landed. Profile, skill, and API-key cards still wait for confirmation.`,
+    };
+  }
   return {
     text: `A confirmation card is now visible to the user for ${fallback}.${summary}\n\nThis change has not been applied yet. End this turn and wait for the user to confirm or deny the card; do not claim the ${noun} was created or changed before confirmation.`,
   };

@@ -1,7 +1,7 @@
 import { t } from "./i18n";
 
 export interface FeatureFlagConfig {
-  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean };
+  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; autoConfirmRoutineProposals?: boolean };
   browserEngine?: { kind: "engine" | "unavailable"; reason?: string; installable?: boolean; installing?: boolean; installError?: string };
 }
 
@@ -36,4 +36,9 @@ export function builtInBrowserEnabled(config: FeatureFlagConfig | null | undefin
  * shows that work is happening. */
 export function showToolCallsEnabled(config: FeatureFlagConfig | null | undefined): boolean {
   return config?.features?.showToolCalls === true;
+}
+
+/** Immediate apply of routine proposals. Off until explicitly enabled. */
+export function autoConfirmRoutineProposalsEnabled(config: FeatureFlagConfig | null | undefined): boolean {
+  return config?.features?.autoConfirmRoutineProposals === true;
 }
