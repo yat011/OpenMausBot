@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { autoConfirmRoutineProposalsEnabled, builtInBrowserEnabled, showToolCallsEnabled, skillAuthoringEnabled } from "./feature-flags";
+import {
+  autoConfirmProfileProposalsEnabled,
+  autoConfirmRoutineProposalsEnabled,
+  autoConfirmSkillProposalsEnabled,
+  builtInBrowserEnabled,
+  showToolCallsEnabled,
+  skillAuthoringEnabled,
+} from "./feature-flags";
 
 describe("experimental feature flags", () => {
   it("keeps skill authoring on by default, before and after the config arrives", () => {
@@ -36,5 +43,19 @@ describe("experimental feature flags", () => {
     expect(autoConfirmRoutineProposalsEnabled({})).toBe(false);
     expect(autoConfirmRoutineProposalsEnabled({ features: { autoConfirmRoutineProposals: false } })).toBe(false);
     expect(autoConfirmRoutineProposalsEnabled({ features: { autoConfirmRoutineProposals: true } })).toBe(true);
+  });
+
+  it("keeps profile auto-confirm off until explicitly enabled", () => {
+    expect(autoConfirmProfileProposalsEnabled(null)).toBe(false);
+    expect(autoConfirmProfileProposalsEnabled({})).toBe(false);
+    expect(autoConfirmProfileProposalsEnabled({ features: { autoConfirmProfileProposals: false } })).toBe(false);
+    expect(autoConfirmProfileProposalsEnabled({ features: { autoConfirmProfileProposals: true } })).toBe(true);
+  });
+
+  it("keeps skill auto-confirm off until explicitly enabled", () => {
+    expect(autoConfirmSkillProposalsEnabled(null)).toBe(false);
+    expect(autoConfirmSkillProposalsEnabled({})).toBe(false);
+    expect(autoConfirmSkillProposalsEnabled({ features: { autoConfirmSkillProposals: false } })).toBe(false);
+    expect(autoConfirmSkillProposalsEnabled({ features: { autoConfirmSkillProposals: true } })).toBe(true);
   });
 });

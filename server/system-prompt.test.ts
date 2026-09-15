@@ -15,6 +15,9 @@ import {
   CREDENTIAL_PROMPT,
   LEARN_PROMPT,
   PROFILE_PROMPT,
+  profilePrompt,
+  learnPrompt,
+  remainingProposalWaitNote,
   ROUTINE_PROMPT,
   routinePrompt,
   ROUTINE_EXECUTION_PROMPT,
@@ -127,7 +130,7 @@ describe("computerPrompt", () => {
 
 describe("shared sentences", () => {
   it("each begins with one space so they concatenate onto the persona line", () => {
-    for (const sentence of [COMPOSIO_PROMPT, CREDENTIAL_PROMPT, ROUTINE_PROMPT, routinePrompt(true), ROUTINE_EXECUTION_PROMPT, LEARN_PROMPT, WEBHOOK_PROMPT, PROFILE_PROMPT, SIGN_IN_PROMPT, MUSE_WEB_THEN_BROWSER_PROMPT]) {
+    for (const sentence of [COMPOSIO_PROMPT, CREDENTIAL_PROMPT, ROUTINE_PROMPT, routinePrompt(true), ROUTINE_EXECUTION_PROMPT, LEARN_PROMPT, learnPrompt(true), WEBHOOK_PROMPT, PROFILE_PROMPT, profilePrompt(true), SIGN_IN_PROMPT, MUSE_WEB_THEN_BROWSER_PROMPT]) {
       expect(sentence.startsWith(" ")).toBe(true);
       expect(sentence.startsWith("  ")).toBe(false);
     }
@@ -158,6 +161,27 @@ describe("shared sentences", () => {
   it("PROFILE_PROMPT names the tool and the confirmation rule", () => {
     expect(PROFILE_PROMPT).toContain("propose_profile");
     expect(PROFILE_PROMPT).toContain("nothing changes until the user confirms");
+    const auto = profilePrompt(true);
+    expect(auto).toContain("auto-applies");
+    expect(auto).toContain("gatekeeper");
+    expect(auto).not.toContain("nothing changes until the user confirms");
+  });
+
+  it("learnPrompt keeps the card rule by default and names auto-apply when on", () => {
+    expect(LEARN_PROMPT).toContain("skill_manage");
+    expect(LEARN_PROMPT).toContain("wait for the review card");
+    const auto = learnPrompt(true);
+    expect(auto).toContain("auto-applies");
+    expect(auto).not.toContain("review card");
+  });
+
+  it("remainingProposalWaitNote lists only the cards that still wait", () => {
+    expect(remainingProposalWaitNote()).toContain("Profile");
+    expect(remainingProposalWaitNote()).toContain("skill");
+    expect(remainingProposalWaitNote()).toContain("API-key");
+    expect(remainingProposalWaitNote({ profileAuto: true, skillAuto: true })).toBe(
+      " API-key cards still wait for confirmation.",
+    );
   });
 
   it("routinePrompt keeps the card rule by default and names auto-apply when on", () => {

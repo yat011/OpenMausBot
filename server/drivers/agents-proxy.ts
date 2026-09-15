@@ -44,6 +44,12 @@ const THREAD_ID = process.env.OMB_THREAD_ID ?? "";
 const TOKEN = process.env.OMB_COMMS_TOKEN ?? "";
 const DEPTH = Number(process.env.OMB_TURN_DEPTH ?? "0") || 0;
 const SKILL_AUTHORING_ENABLED = process.env.OMB_SKILL_AUTHORING_ENABLED === "1";
+const AUTO_CONFIRM_PROFILES = process.env.OMB_AUTO_CONFIRM_PROFILES === "1"
+  || process.env.OMB_AUTO_CONFIRM_PROFILES === "true"
+  || process.env.OMB_AUTO_CONFIRM_PROFILES === "yes";
+const AUTO_CONFIRM_SKILLS = process.env.OMB_AUTO_CONFIRM_SKILLS === "1"
+  || process.env.OMB_AUTO_CONFIRM_SKILLS === "true"
+  || process.env.OMB_AUTO_CONFIRM_SKILLS === "yes";
 const MAX_CREATED_PER_TURN = 4;
 let createdThisTurn = 0;
 // Same spirit as MAX_CREATED_PER_TURN above and MAX_QUEUED_PER_THREAD in
@@ -826,6 +832,16 @@ function routineFields(args: Json): { fields: Json; error?: string } {
   return { fields };
 }
 
+function remainingCardWaitNote(): string {
+  const waiting: string[] = [];
+  if (!AUTO_CONFIRM_PROFILES) waiting.push("Profile");
+  if (!AUTO_CONFIRM_SKILLS) waiting.push("skill");
+  waiting.push("API-key");
+  if (waiting.length === 1) return ` ${waiting[0]} cards still wait for confirmation.`;
+  const last = waiting[waiting.length - 1]!;
+  return ` ${waiting.slice(0, -1).join(", ")}, and ${last} cards still wait for confirmation.`;
+}
+
 function confirmationResult(r: Json, fallback: string, noun = "routine"): { text: string } {
   const summary = typeof r.summary === "string" && r.summary.trim() ? `\n\n${r.summary.trim()}` : "";
   if (r.applied === true) {
@@ -836,7 +852,7 @@ function confirmationResult(r: Json, fallback: string, noun = "routine"): { text
         : "";
     const tz = typeof r.timeZone === "string" && r.timeZone.trim() ? ` Timezone: ${r.timeZone.trim()}.` : "";
     return {
-      text: `The ${noun} change was applied: ${fallback}.${summary}${nextRun}${tz}\n\nThis is in effect now. You may tell the user it landed. Profile, skill, and API-key cards still wait for confirmation.`,
+      text: `The ${noun} change was applied: ${fallback}.${summary}${nextRun}${tz}\n\nThis is in effect now. You may tell the user it landed.${remainingCardWaitNote()}`,
     };
   }
   return {
@@ -1435,10 +1451,15 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     });
     const nameLabel = typeof r.name === "string" ? r.name : "the skill";
     const warningText = Array.isArray(r.warnings) && r.warnings.length ? `\n\nScan warnings (shown to the user):\n- ${r.warnings.join("\n- ")}` : "";
+    const proposal = args.action === "update" ? `updating skill “${nameLabel}”` : `new skill “${nameLabel}”`;
+    if (r.applied === true) {
+      return {
+        text: `The skill change was applied: ${proposal}.${warningText}\n\nThis is in effect now. You may tell the user it landed.${remainingCardWaitNote()}`,
+      };
+    }
     const status = args.action === "update"
       ? "The current version remains unchanged until the user reviews and applies the update."
       : "The skill is staged and inactive until the user reviews and enables it.";
-    const proposal = args.action === "update" ? `updating skill “${nameLabel}”` : `new skill “${nameLabel}”`;
     return {
       text: `A confirmation card is now visible to the user for ${proposal}.${warningText}\n\n${status} End this turn and wait for the decision.`,
     };

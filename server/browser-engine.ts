@@ -370,10 +370,15 @@ export function agentBrowserIntegration(input: {
       ...(sourceEnv.USERPROFILE ? { USERPROFILE: sourceEnv.USERPROFILE } : {}),
     })),
   };
-  if (input.headless !== false) env.AGENT_BROWSER_HEADLESS = "1";
+  const headedFlag = sourceEnv.OMB_AGENT_BROWSER_HEADED ?? process.env.OMB_AGENT_BROWSER_HEADED;
+  const headed = input.headless === false
+    || (input.headless !== true && (headedFlag === "1" || headedFlag === "true"));
+  if (headed) env.AGENT_BROWSER_HEADED = "1";
+  else env.AGENT_BROWSER_HEADLESS = "1";
   // MCP clients may filter the parent environment. Carry the configured
   // Chrome path explicitly without forwarding unrelated secrets or flags.
-  for (const name of ["PATH", "AGENT_BROWSER_EXECUTABLE_PATH"] as const) {
+  // DISPLAY is required for headed Chrome on X11/Xvfb.
+  for (const name of ["PATH", "AGENT_BROWSER_EXECUTABLE_PATH", "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"] as const) {
     if (sourceEnv[name]) env[name] = sourceEnv[name];
   }
   const bundle = packagedBrowser({ env: sourceEnv });

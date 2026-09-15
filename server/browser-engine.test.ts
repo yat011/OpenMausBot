@@ -451,6 +451,9 @@ describe("what a bot gets", () => {
       AGENT_BROWSER_CONFIG: expect.stringContaining("omb-managed-config.json"),
       AGENT_BROWSER_HEADLESS: "1", PATH: "/usr/bin",
       AGENT_BROWSER_EXECUTABLE_PATH: "/opt/process-chrome/chrome",
+      ...(process.env.DISPLAY ? { DISPLAY: process.env.DISPLAY } : {}),
+      ...(process.env.XAUTHORITY ? { XAUTHORITY: process.env.XAUTHORITY } : {}),
+      ...(process.env.WAYLAND_DISPLAY ? { WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY } : {}),
     });
     for (const env of [{}, { AGENT_BROWSER_EXECUTABLE_PATH: "" }]) {
       const explicit = agentBrowserIntegration({ binaryPath: "/x", session: "s", encryptionKey: "k", env });
@@ -466,6 +469,16 @@ describe("what a bot gets", () => {
     expect(spec.env).toMatchObject({ AGENT_BROWSER_SESSION: "bot-1", AGENT_BROWSER_RESTORE: browserRestoreKey("bot-1"), AGENT_BROWSER_RESTORE_SAVE: "auto", AGENT_BROWSER_HEADLESS: "1", PATH: "/usr/bin" });
     expect(spec.env.AGENT_BROWSER_ENCRYPTION_KEY).toBe("k".repeat(64));
     expect(agentBrowserIntegration({ binaryPath: "/x", session: "s", encryptionKey: "k", headless: false }).env.AGENT_BROWSER_HEADLESS).toBeUndefined();
+    expect(agentBrowserIntegration({ binaryPath: "/x", session: "s", encryptionKey: "k", headless: false }).env.AGENT_BROWSER_HEADED).toBe("1");
+  });
+
+  it("defaults to headed when OMB_AGENT_BROWSER_HEADED is set", () => {
+    const spec = agentBrowserIntegration({
+      binaryPath: "/x", session: "s", encryptionKey: "k",
+      env: { PATH: "/usr/bin", OMB_AGENT_BROWSER_HEADED: "1", DISPLAY: ":7" },
+    });
+    expect(spec.env.AGENT_BROWSER_HEADLESS).toBeUndefined();
+    expect(spec.env).toMatchObject({ AGENT_BROWSER_HEADED: "1", DISPLAY: ":7", PATH: "/usr/bin" });
   });
 
   it("keeps saved state separate for different bots and never saves guest state", () => {

@@ -1,7 +1,14 @@
 import { t } from "./i18n";
 
 export interface FeatureFlagConfig {
-  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; autoConfirmRoutineProposals?: boolean };
+  features?: {
+    skillAuthoring?: boolean;
+    showToolCalls?: boolean;
+    browser?: boolean;
+    autoConfirmRoutineProposals?: boolean;
+    autoConfirmProfileProposals?: boolean;
+    autoConfirmSkillProposals?: boolean;
+  };
   browserEngine?: { kind: "engine" | "unavailable"; reason?: string; installable?: boolean; installing?: boolean; installError?: string };
 }
 
@@ -41,4 +48,14 @@ export function showToolCallsEnabled(config: FeatureFlagConfig | null | undefine
 /** Immediate apply of routine proposals. Off until explicitly enabled. */
 export function autoConfirmRoutineProposalsEnabled(config: FeatureFlagConfig | null | undefined): boolean {
   return config?.features?.autoConfirmRoutineProposals === true;
+}
+
+/** Immediate apply of profile proposals. Off until explicitly enabled. */
+export function autoConfirmProfileProposalsEnabled(config: FeatureFlagConfig | null | undefined): boolean {
+  return config?.features?.autoConfirmProfileProposals === true;
+}
+
+/** Immediate apply of learned-skill proposals. Off until explicitly enabled. */
+export function autoConfirmSkillProposalsEnabled(config: FeatureFlagConfig | null | undefined): boolean {
+  return config?.features?.autoConfirmSkillProposals === true;
 }

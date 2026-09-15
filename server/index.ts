@@ -113,6 +113,8 @@ import {
   showToolCallsEnabled,
   skillAuthoringEnabled,
   autoConfirmRoutineProposalsEnabled,
+  autoConfirmProfileProposalsEnabled,
+  autoConfirmSkillProposalsEnabled,
   builtInBrowserEnabled,
   browserProfileReplacementConflict,
   browserProfilePartitionTarget,
@@ -293,8 +295,9 @@ import {
   customMcpPrompt,
   CREDENTIAL_PROMPT,
   THREADS_PROMPT,
-  LEARN_PROMPT,
-  PROFILE_PROMPT,
+  learnPrompt,
+  profilePrompt,
+  remainingProposalWaitNote,
   routinePrompt,
   ROUTINE_EXECUTION_PROMPT,
   WEBHOOK_PROMPT,
@@ -789,6 +792,8 @@ function agentsIntegration(
       OMB_COMMS_TOKEN: token,
       OMB_TURN_DEPTH: String(depth),
       OMB_SKILL_AUTHORING_ENABLED: skillAuthoring ? "1" : "0",
+      OMB_AUTO_CONFIRM_PROFILES: autoConfirmProfileProposalsEnabled(cfg) ? "1" : "0",
+      OMB_AUTO_CONFIRM_SKILLS: autoConfirmSkillProposalsEnabled(cfg) ? "1" : "0",
     },
   };
 }
@@ -1416,6 +1421,17 @@ const wireTrustedApprovalBot = (bot: NonNullable<ReturnType<typeof store.bot>>) 
   return { ...rest, avatarUrl: rest.avatarUrl ?? null, ...(tasks ? { tasks: tasks.map(wireTask) } : {}) };
 };
 
+function agentProposalPrompts(agentsMounted: boolean, skillAuthoring: boolean) {
+  const profileAuto = autoConfirmProfileProposalsEnabled(cfg);
+  const skillAuto = autoConfirmSkillProposalsEnabled(cfg);
+  const wait = remainingProposalWaitNote({ profileAuto, skillAuto });
+  return {
+    routine: agentsMounted ? routinePrompt(autoConfirmRoutineProposalsEnabled(cfg), wait) : "",
+    profile: agentsMounted ? profilePrompt(profileAuto) : "",
+    learn: skillAuthoring ? learnPrompt(skillAuto) : "",
+  };
+}
+
 /** A settings-based preview, not a receipt of a dispatched turn. No
  * provisioning or credentials are needed to inspect it. The selected engine
  * bounds advertised tools; task-specific context is added only at dispatch. */
@@ -1450,6 +1466,7 @@ function previewSystemPrompt(bot: BotRecord) {
   // propose_routine and request_credential.
   const agentsMounted = caps?.agentsMcp === true;
   const privateWorkspace = instance && !["grok", "boxAgent"].includes(instance.driverKind);
+  const proposals = agentProposalPrompts(agentsMounted, skillAuthoringEnabled(cfg));
   const built = buildSystemPrompt(persona, bot.soul ?? "", [
     {
       id: "setup",
@@ -1465,8 +1482,8 @@ function previewSystemPrompt(bot: BotRecord) {
     { id: "browser", label: "Browser", text: browserTurnPrompt(BUILT_IN_BROWSER_SYSTEM_PROMPT, instance?.driverKind, caps?.browserMcp === true && builtInBrowserEnabled(cfg) && bot.browser !== false && bot.computer !== "off") },
     { id: "coordination", label: "Team", text: agentsMounted && coordination ? ` ${coordination}` : "" },
     { id: "credential", label: "Credentials", text: agentsMounted ? CREDENTIAL_PROMPT : "" },
-    { id: "routine", label: "Routines", text: agentsMounted ? routinePrompt(autoConfirmRoutineProposalsEnabled(cfg)) : "" },
-    { id: "profile", label: "Profile changes", text: agentsMounted ? PROFILE_PROMPT : "" },
+    { id: "routine", label: "Routines", text: proposals.routine },
+    { id: "profile", label: "Profile changes", text: proposals.profile },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     { id: "memory", label: "Memory", text: privateWorkspace ? memorySystemPrompt(bot.id) : "" },
     { id: "skills", label: "Skills index", text: privateWorkspace ? skillsSystemPrompt(bot.id) : "" },
@@ -4639,7 +4656,7 @@ async function startTurn(
   const setupText = agentsMounted ? expandSetupTurnText(providerText) : providerText;
   const { turnText, resume } = buildTurnContext({
     text: promptWithReply(
-      skillAuthoring ? expandLearnTurnText(setupText) : setupText,
+      skillAuthoring ? expandLearnTurnText(setupText, autoConfirmSkillProposalsEnabled(cfg)) : setupText,
       opts?.replyTo,
       cfg.profile?.name?.trim() || "User",
     ),
@@ -5017,10 +5034,11 @@ async function startTurn(
           ? peerRosterSystemPrompt(sectionPeers)
           : "";
       const credentialPrompt = integrations.agents ? CREDENTIAL_PROMPT + THREADS_PROMPT : "";
-      const routinePromptText = integrations.agents ? routinePrompt(autoConfirmRoutineProposalsEnabled(cfg)) : "";
-      const profilePrompt = integrations.agents ? PROFILE_PROMPT : "";
+      const proposals = agentProposalPrompts(Boolean(integrations.agents), skillAuthoring);
+      const routinePromptText = proposals.routine;
+      const profilePromptText = proposals.profile;
       const recallPrompt = integrations.agents ? SESSION_SEARCH_SYSTEM_PROMPT : "";
-      const learnPrompt = skillAuthoring ? LEARN_PROMPT : "";
+      const learnPromptText = proposals.learn;
 
       // (activeVpsThreads was already claimed above, before the provision or
       // reuse await, so the backend guards saw this turn the whole time.)
@@ -5104,8 +5122,8 @@ async function startTurn(
         { id: "recall", label: "Recall", text: recallPrompt },
         { id: "routine", label: "Routines", text: routinePromptText },
         { id: "routine-execution", label: "Routine execution", text: opts?.automationSource === "schedule" || opts?.automationSource === "manual" ? ROUTINE_EXECUTION_PROMPT : "" },
-        { id: "profile", label: "Profile changes", text: profilePrompt },
-        { id: "learn", label: "Skill authoring", text: learnPrompt },
+        { id: "profile", label: "Profile changes", text: profilePromptText },
+        { id: "learn", label: "Skill authoring", text: learnPromptText },
         { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
         { id: "memory", label: "Memory", text: privateWorkspace ? memorySystemPrompt(bot.id, { managedWrites: Boolean(integrations.agents) }) : "" },
         { id: "skills", label: "Skills index", text: privateWorkspace ? skillsSystemPrompt(bot.id) : "" },
@@ -5637,6 +5655,7 @@ const routineRequests = new RoutineRequestService({
 const profileRequests = new ProfileRequestService({
   store,
   canPersist: proposalPersistence,
+  autoConfirm: () => autoConfirmProfileProposalsEnabled(cfg),
   // A Chief may change a section peer; anyone else only itself. Re-checked at confirm.
   validateTarget: (proposerBotId, targetBotId) => {
     const proposer = store.bot(proposerBotId);
@@ -6273,16 +6292,23 @@ async function runGroupMemberTurn(
     `Reply as yourself, briefly and conversationally. To bring a teammate in, mention them like @Name — they'll see the conversation and respond.`,
     outsideRoom.length > 0 && roomPeerRosterSystemPrompt(outsideRoom),
     integrations.agents && (CREDENTIAL_PROMPT + THREADS_PROMPT).trim(),
-    integrations.agents && routinePrompt(autoConfirmRoutineProposalsEnabled(cfg)).trim(),
-    integrations.agents && PROFILE_PROMPT.trim(),
-    skillAuthoring && LEARN_PROMPT.trim(),
+    ...(() => {
+      const proposals = agentProposalPrompts(Boolean(integrations.agents), skillAuthoring);
+      return [
+        proposals.routine.trim(),
+        proposals.profile.trim(),
+        proposals.learn.trim(),
+      ];
+    })(),
     orchestration?.systemInstructions,
   ]
     .filter(Boolean)
     .join("\n");
 
   const latestUserText = usesNativeImageInput ? resolvedLatestImages.text : latestUser?.text;
-  const learnTurn = skillAuthoring && latestUserText ? expandLearnTurnText(latestUserText) : "";
+  const learnTurn = skillAuthoring && latestUserText
+    ? expandLearnTurnText(latestUserText, autoConfirmSkillProposalsEnabled(cfg))
+    : "";
   const learnBlock = learnTurn && learnTurn !== latestUserText ? `\n\n${learnTurn}` : "";
   const text = `${roomContext}\n\n(Reply to the conversation above as ${bot.name}.)${learnBlock}${cardContinuation ? `\n\n${cardContinuation}` : ""
   }`;
@@ -7467,6 +7493,7 @@ function resolveSkillRequest(args: {
   requestId: string;
   behavior: "allow" | "deny" | "answer";
   reviewedSha256?: string;
+  omitDecision?: boolean;
 }):
   | { claimed: false }
   | { claimed: true; status: number; error: string }
@@ -7492,6 +7519,19 @@ function resolveSkillRequest(args: {
     }
     return { claimed: true, outcome: card.answered === "allow" ? "allowed-once" : "rejected", alreadySettled: true };
   }
+  const recordDecision = (decision: string, source: string) => {
+    if (args.omitDecision) return;
+    appendDecision(DATA_DIR, {
+      threadId: args.threadId,
+      requestId: args.requestId,
+      botId: args.botId,
+      botName: args.botName,
+      tool: card.tool,
+      summary: card.subtitle,
+      decision,
+      source,
+    });
+  };
   if (args.behavior !== "allow") {
     const rejected = rejectStagedSkillWrite(args.botId, request.stagedId);
     if ("error" in rejected && rejected.error !== "no such staged skill") {
@@ -7501,31 +7541,13 @@ function resolveSkillRequest(args: {
       store.patchMessage(args.threadId, message.id, {
         card: { ...card, answered: "allow", dismissed: false, held: undefined },
       });
-      appendDecision(DATA_DIR, {
-        threadId: args.threadId,
-        requestId: args.requestId,
-        botId: args.botId,
-        botName: args.botName,
-        tool: card.tool,
-        summary: card.subtitle,
-        decision: "user-approved",
-        source: "user",
-      });
+      recordDecision("user-approved", "user");
       return { claimed: true, outcome: "allowed-once" };
     }
     store.patchMessage(args.threadId, message.id, {
       card: { ...card, answered: "deny", dismissed: true, held: undefined },
     });
-    appendDecision(DATA_DIR, {
-      threadId: args.threadId,
-      requestId: args.requestId,
-      botId: args.botId,
-      botName: args.botName,
-      tool: card.tool,
-      summary: card.subtitle,
-      decision: "user-denied",
-      source: "user",
-    });
+    recordDecision("user-denied", "user");
     return { claimed: true, outcome: "rejected" };
   }
   if (typeof request.preview !== "string" || typeof request.sha256 !== "string") {
@@ -7571,16 +7593,7 @@ function resolveSkillRequest(args: {
     if (!patched) {
       return { claimed: true, status: 409, error: "the learned-skill approval card is no longer available" };
     }
-    appendDecision(DATA_DIR, {
-      threadId: args.threadId,
-      requestId: args.requestId,
-      botId: args.botId,
-      botName: args.botName,
-      tool: card.tool,
-      summary: card.subtitle,
-      decision: "user-approved",
-      source: "user",
-    });
+    recordDecision("user-approved", "user");
     return { claimed: true, outcome: "allowed-once" };
   }
   if (
@@ -7608,16 +7621,7 @@ function resolveSkillRequest(args: {
     });
     return { claimed: true, status: 422, error: applied.error };
   }
-  appendDecision(DATA_DIR, {
-    threadId: args.threadId,
-    requestId: args.requestId,
-    botId: args.botId,
-    botName: args.botName,
-    tool: card.tool,
-    summary: card.subtitle,
-    decision: "user-approved",
-    source: "user",
-  });
+  recordDecision("user-approved", "user");
   return { claimed: true, outcome: "allowed-once" };
 }
 
@@ -8194,6 +8198,8 @@ function configStatus() {
       showToolCalls: showToolCallsEnabled(cfg),
       browser: builtInBrowserEnabled(cfg),
       autoConfirmRoutineProposals: autoConfirmRoutineProposalsEnabled(cfg),
+      autoConfirmProfileProposals: autoConfirmProfileProposalsEnabled(cfg),
+      autoConfirmSkillProposals: autoConfirmSkillProposalsEnabled(cfg),
     },
     // first-run progress — not a secret; the app decides whether to show
     // the welcome tour from this, never from browser storage
@@ -9081,8 +9087,13 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         });
         appendDecision(DATA_DIR, {
           threadId: body.fromThreadId, requestId: proposed.requestId, botId: from.id, botName: from.name,
-          tool: "update_profile", summary: proposed.detail, decision: "card-shown", source: "profile",
+          tool: "update_profile", summary: proposed.detail,
+          decision: proposed.applied ? "auto-approved" : "card-shown", source: "profile",
         });
+        if (proposed.applied) {
+          const target = store.bot(targetBotId);
+          if (target) broadcast({ kind: "bot", bot: wireBot(target) });
+        }
         return json(res, 201, proposed);
       }
       // session_search: ranked recall over the calling bot's OWN threads,
@@ -9220,6 +9231,19 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           rejectStagedSkillWrite(from.id, staged.id);
           throw error;
         }
+        let applied = false;
+        if (autoConfirmSkillProposalsEnabled(cfg)) {
+          const resolved = resolveSkillRequest({
+            botId: from.id,
+            botName: from.name,
+            threadId: fromThreadId,
+            requestId: card.requestId,
+            behavior: "allow",
+            reviewedSha256: staged.sha256,
+            omitDecision: true,
+          });
+          applied = resolved.claimed && "outcome" in resolved && resolved.outcome === "allowed-once";
+        }
         appendDecision(DATA_DIR, {
           threadId: fromThreadId,
           requestId: card.requestId,
@@ -9227,7 +9251,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           botName: from.name,
           tool: "stage_skill",
           summary: card.summary,
-          decision: "card-shown",
+          decision: applied ? "auto-approved" : "card-shown",
           source: "skill",
         });
         return json(res, 201, {
@@ -9237,6 +9261,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           gist: staged.gist,
           warnings: staged.warnings,
           summary: card.summary,
+          ...(applied ? { applied: true } : {}),
         });
       }
       if (method === "POST" && path === "/api/internal/ask-bot") {

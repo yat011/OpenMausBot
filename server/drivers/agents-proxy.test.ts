@@ -1339,6 +1339,24 @@ describe("agents-proxy MCP surface", () => {
     expect(res.result.isError).toBeFalsy();
   });
 
+  it("tells the model a profile proposal was applied when the harness auto-confirmed", async () => {
+    lastProfileRequestBody = null;
+    profileRequestResponse = {
+      requestId: "profile-request-applied",
+      summary: "Name → Kiwi",
+      applied: true,
+    };
+    try {
+      const res = await callTool("propose_profile", { name: "Kiwi", reason: "asked" });
+      expect(res.result.content[0].text).toContain("was applied");
+      expect(res.result.content[0].text).toContain("in effect now");
+      expect(res.result.content[0].text).not.toContain("has not been applied");
+      expect(res.result.isError).toBeFalsy();
+    } finally {
+      profileRequestResponse = { requestId: "profile-request-1", summary: "Name → Kiwi" };
+    }
+  });
+
   it("propose_profile forwards for_bot_id when proposing for another bot", async () => {
     lastProfileRequestBody = null;
     await callTool("propose_profile", { title: "Chief of Staff", reason: "asked", for_bot_id: "bot-helper" });
@@ -1399,6 +1417,20 @@ describe("agents-proxy MCP surface", () => {
     });
     expect(staged.result.content[0].text).toContain("staged and inactive");
     expect(staged.result.content[0].text).toContain("wait for the decision");
+
+    skillStageResponse = { name: "file-expense", action: "create", gist: "Files an expense.", warnings: [], applied: true };
+    try {
+      const applied = await callTool("skill_manage", {
+        action: "create",
+        skill_md: "---\nname: file-expense\ndescription: Files an expense in the company portal.\n---\n\n# File expense\n",
+        source: "conversation",
+      });
+      expect(applied.result.content[0].text).toContain("was applied");
+      expect(applied.result.content[0].text).toContain("in effect now");
+      expect(applied.result.content[0].text).not.toContain("wait for the decision");
+    } finally {
+      skillStageResponse = { name: "file-expense", action: "create", gist: "Files an expense.", warnings: [] };
+    }
 
     const updated = await callTool("skill_manage", {
       action: "update",

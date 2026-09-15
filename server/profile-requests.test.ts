@@ -76,9 +76,9 @@ class MemoryStore implements ProfileRequestStore {
   }
 }
 
-function harness(options: { name: string; chiefOfStaff?: boolean }) {
+function harness(options: { name: string; chiefOfStaff?: boolean; autoConfirm?: () => boolean }) {
   const store = new MemoryStore();
-  const service = new ProfileRequestService({ store });
+  const service = new ProfileRequestService({ store, autoConfirm: options.autoConfirm });
 
   function addBot(overrides: { name: string }): BotRecord {
     const record = {
@@ -183,6 +183,22 @@ describe("ProfileRequestService", () => {
     ]);
     expect(service.resolve({ botId: bot.id, threadId: bot.threadId, requestId, behavior: "allow" }))
       .toEqual({ claimed: true, state: "already_settled", behavior: "allow" });
+  });
+
+  it("auto-applies the proposal when autoConfirm is on, leaving the card answered", () => {
+    const { service, store, bot } = harness({ name: "Scout", autoConfirm: () => true });
+    const proposed = service.propose({
+      botId: bot.id,
+      threadId: bot.threadId,
+      changes: { name: "Kiwi", title: "Tracker" },
+      reason: "asked",
+    });
+    expect(proposed.applied).toBe(true);
+    expect(proposed.fields).toEqual(["name", "title"]);
+    expect(store.bot(bot.id)).toMatchObject({ name: "Kiwi", title: "Tracker" });
+    const card = store.messagesFor(bot.threadId).at(-1)!.card!;
+    expect(card.answered).toBe("allow");
+    expect(card.requestId).toBe(proposed.requestId);
   });
 
   it("denies without changing anything, and fails closed when the profile moved after the card", () => {

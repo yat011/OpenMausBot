@@ -74,4 +74,10 @@ describe("a run saved from the card, in plain words", () => {
         expect(expandLearnTurnText("/learn x")).toBe(buildLearnPrompt("x"));
         expect(parseLearnCommand(plain)).toBeNull();
     });
+
+    it("tells the authoring prompt the write is applied when auto-confirm is on", () => {
+        const expanded = buildLearnPrompt("the REST client", true);
+        expect(expanded).toContain("applies the change on this instance");
+        expect(expanded).not.toContain("only STAGES");
+    });
 });

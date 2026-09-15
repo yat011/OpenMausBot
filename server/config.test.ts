@@ -23,6 +23,8 @@ import { customMcpServers,
   saveConfig,
   skillAuthoringEnabled,
   autoConfirmRoutineProposalsEnabled,
+  autoConfirmProfileProposalsEnabled,
+  autoConfirmSkillProposalsEnabled,
   builtInBrowserEnabled,
   browserProfilePartitionId,
   browserProfilePartitionTarget,
@@ -410,6 +412,24 @@ describe("configuration boundaries", () => {
     });
     expect(autoConfirmRoutineProposalsEnabled({ features: { autoConfirmRoutineProposals: true } })).toBe(true);
     expect(autoConfirmRoutineProposalsEnabled({ features: { autoConfirmRoutineProposals: false } })).toBe(false);
+  });
+
+  it("keeps profile auto-confirm off by default and accepts an explicit opt-in", () => {
+    expect(autoConfirmProfileProposalsEnabled({})).toBe(false);
+    expect(autoConfirmProfileProposalsEnabled({ features: {} })).toBe(false);
+    expect(parseConfigPatch({ features: { autoConfirmProfileProposals: true } })).toEqual({
+      features: { autoConfirmProfileProposals: true },
+    });
+    expect(autoConfirmProfileProposalsEnabled({ features: { autoConfirmProfileProposals: true } })).toBe(true);
+  });
+
+  it("keeps skill auto-confirm off by default and accepts an explicit opt-in", () => {
+    expect(autoConfirmSkillProposalsEnabled({})).toBe(false);
+    expect(autoConfirmSkillProposalsEnabled({ features: {} })).toBe(false);
+    expect(parseConfigPatch({ features: { autoConfirmSkillProposals: true } })).toEqual({
+      features: { autoConfirmSkillProposals: true },
+    });
+    expect(autoConfirmSkillProposalsEnabled({ features: { autoConfirmSkillProposals: true } })).toBe(true);
   });
 
   it.each([0, 1.5, 5, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {
@@ -999,19 +1019,28 @@ describe("credential env preference", () => {
   });
 });
 
-describe("OMB_AUTO_CONFIRM_ROUTINES env overlay", () => {
+describe("auto-confirm env overlays", () => {
   const path = join(DATA_DIR, "config.json");
-  let saved: string | undefined;
+  const envNames = [
+    "OMB_AUTO_CONFIRM_ROUTINES",
+    "OMB_AUTO_CONFIRM_PROFILES",
+    "OMB_AUTO_CONFIRM_SKILLS",
+  ] as const;
+  const saved: Record<string, string | undefined> = {};
 
   beforeEach(() => {
-    saved = process.env.OMB_AUTO_CONFIRM_ROUTINES;
-    delete process.env.OMB_AUTO_CONFIRM_ROUTINES;
+    for (const name of envNames) {
+      saved[name] = process.env[name];
+      delete process.env[name];
+    }
     mkdirSync(DATA_DIR, { recursive: true });
     rmSync(path, { force: true });
   });
   afterEach(() => {
-    if (saved === undefined) delete process.env.OMB_AUTO_CONFIRM_ROUTINES;
-    else process.env.OMB_AUTO_CONFIRM_ROUTINES = saved;
+    for (const name of envNames) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
     rmSync(path, { force: true });
   });
 
@@ -1030,6 +1059,18 @@ describe("OMB_AUTO_CONFIRM_ROUTINES env overlay", () => {
     writeFileSync(path, JSON.stringify({ features: { autoConfirmRoutineProposals: true } }));
     process.env.OMB_AUTO_CONFIRM_ROUTINES = "0";
     expect(autoConfirmRoutineProposalsEnabled(loadConfig())).toBe(false);
+  });
+
+  it("turns profile auto-confirm on from OMB_AUTO_CONFIRM_PROFILES", () => {
+    writeFileSync(path, JSON.stringify({ features: { autoConfirmProfileProposals: false } }));
+    process.env.OMB_AUTO_CONFIRM_PROFILES = "1";
+    expect(autoConfirmProfileProposalsEnabled(loadConfig())).toBe(true);
+  });
+
+  it("turns skill auto-confirm on from OMB_AUTO_CONFIRM_SKILLS", () => {
+    writeFileSync(path, JSON.stringify({ features: { autoConfirmSkillProposals: false } }));
+    process.env.OMB_AUTO_CONFIRM_SKILLS = "yes";
+    expect(autoConfirmSkillProposalsEnabled(loadConfig())).toBe(true);
   });
 });
 

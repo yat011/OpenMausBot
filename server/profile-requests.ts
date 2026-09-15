@@ -62,6 +62,9 @@ export interface ProfileRequestServiceOptions {
   canPersist?: (botId: string, threadId: string) => { ok: true } | { ok: false; status: number; error: string };
   /** Chief targeting another bot: returns a refusal sentence or null. Checked at propose AND confirm. */
   validateTarget?: (proposerBotId: string, targetBotId: string) => string | null;
+  /** When true, confirm the card immediately after it is appended. Read live
+   * so a config PATCH can toggle without reconstructing the service. */
+  autoConfirm?: () => boolean;
 }
 
 export class ProfileRequestError extends Error {
@@ -220,12 +223,14 @@ export class ProfileRequestService {
   /** Public: a caller's section membership can change between propose and
    * confirm, and tests flip this mid-scenario to model that. */
   validateTarget?: ProfileRequestServiceOptions["validateTarget"];
+  private readonly autoConfirm?: () => boolean;
 
   constructor(options: ProfileRequestServiceOptions) {
     this.store = options.store;
     this.now = options.now ?? Date.now;
     this.canPersist = options.canPersist;
     this.validateTarget = options.validateTarget;
+    this.autoConfirm = options.autoConfirm;
   }
 
   propose(args: {
@@ -235,7 +240,15 @@ export class ProfileRequestService {
     changes: unknown;
     reason: unknown;
     from?: { botId: string; name: string; color: string };
-  }): { requestId: string; messageId: string; title: string; summary: string; detail: string } {
+  }): {
+    requestId: string;
+    messageId: string;
+    title: string;
+    summary: string;
+    detail: string;
+    applied?: boolean;
+    fields?: string[];
+  } {
     const reason = reasonText(args.reason);
     const changes = parseChanges(args.changes);
 
@@ -297,7 +310,28 @@ export class ProfileRequestService {
     };
     if (args.from) messageInput.from = args.from;
     const message = this.store.appendMessage(args.threadId, messageInput);
-    return { requestId, messageId: message.id, title: copy.title, summary: copy.summary, detail: copy.detail };
+    const result: {
+      requestId: string;
+      messageId: string;
+      title: string;
+      summary: string;
+      detail: string;
+      applied?: boolean;
+      fields?: string[];
+    } = { requestId, messageId: message.id, title: copy.title, summary: copy.summary, detail: copy.detail };
+    if (this.autoConfirm?.()) {
+      const resolved = this.resolve({
+        botId: args.botId,
+        threadId: args.threadId,
+        requestId,
+        behavior: "allow",
+      });
+      if (resolved.claimed && resolved.state === "applied") {
+        result.applied = true;
+        result.fields = resolved.fields;
+      }
+    }
+    return result;
   }
 
   /** Claims a profile card even after it was settled, so a duplicate click

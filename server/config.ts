@@ -230,9 +230,16 @@ const featureConfigSchema = z.object({
   browser: z.boolean().optional(),
   /** Apply routine proposals immediately instead of waiting for the in-app
    * confirmation card. Off unless explicitly enabled; env
-   * `OMB_AUTO_CONFIRM_ROUTINES` wins over the file. Profile, skill, and
-   * API-key cards are unchanged. */
+   * `OMB_AUTO_CONFIRM_ROUTINES` wins over the file. */
   autoConfirmRoutineProposals: z.boolean().optional(),
+  /** Apply profile proposals immediately instead of waiting for the in-app
+   * confirmation card. Off unless explicitly enabled; env
+   * `OMB_AUTO_CONFIRM_PROFILES` wins over the file. */
+  autoConfirmProfileProposals: z.boolean().optional(),
+  /** Apply learned-skill proposals immediately instead of waiting for the
+   * in-app review card. Off unless explicitly enabled; env
+   * `OMB_AUTO_CONFIRM_SKILLS` wins over the file. API-key cards are unchanged. */
+  autoConfirmSkillProposals: z.boolean().optional(),
 });
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -540,6 +547,18 @@ export function autoConfirmRoutineProposalsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.autoConfirmRoutineProposals === true;
 }
 
+/** Immediate apply of propose_profile. Off unless the file flag is true, or
+ * `OMB_AUTO_CONFIRM_PROFILES` is a truthy value. Env wins. */
+export function autoConfirmProfileProposalsEnabled(cfg: AppConfig): boolean {
+  return cfg.features?.autoConfirmProfileProposals === true;
+}
+
+/** Immediate apply of skill_manage. Off unless the file flag is true, or
+ * `OMB_AUTO_CONFIRM_SKILLS` is a truthy value. Env wins. */
+export function autoConfirmSkillProposalsEnabled(cfg: AppConfig): boolean {
+  return cfg.features?.autoConfirmSkillProposals === true;
+}
+
 /** Workspace-level gate for the experimental built-in browser. A bot's own
  * switch sits under it, so either can withhold the browser. */
 export function builtInBrowserEnabled(cfg: AppConfig): boolean {
@@ -663,13 +682,22 @@ export function loadConfig(): AppConfig {
     if (process.env.OMB_SIGNIN_EMAILS !== undefined) cfg.signIn.admins = splitEmails(process.env.OMB_SIGNIN_EMAILS);
     if (process.env.OMB_SIGNIN_MEMBER_EMAILS !== undefined) cfg.signIn.members = splitEmails(process.env.OMB_SIGNIN_MEMBER_EMAILS);
   }
-  const autoConfirmRoutines = process.env.OMB_AUTO_CONFIRM_ROUTINES;
-  if (autoConfirmRoutines !== undefined && autoConfirmRoutines.trim() !== "") {
-    const normalized = autoConfirmRoutines.trim().toLowerCase();
-    const on = normalized === "1" || normalized === "true" || normalized === "yes";
-    cfg.features = { ...cfg.features, autoConfirmRoutineProposals: on };
-  }
+  overlayAutoConfirmEnv(cfg, "OMB_AUTO_CONFIRM_ROUTINES", "autoConfirmRoutineProposals");
+  overlayAutoConfirmEnv(cfg, "OMB_AUTO_CONFIRM_PROFILES", "autoConfirmProfileProposals");
+  overlayAutoConfirmEnv(cfg, "OMB_AUTO_CONFIRM_SKILLS", "autoConfirmSkillProposals");
   return cfg;
+}
+
+function overlayAutoConfirmEnv(
+  cfg: AppConfig,
+  envName: string,
+  feature: "autoConfirmRoutineProposals" | "autoConfirmProfileProposals" | "autoConfirmSkillProposals",
+): void {
+  const raw = process.env[envName];
+  if (raw === undefined || raw.trim() === "") return;
+  const normalized = raw.trim().toLowerCase();
+  const on = normalized === "1" || normalized === "true" || normalized === "yes";
+  cfg.features = { ...cfg.features, [feature]: on };
 }
 
 /** After saveConfig() writes a credential, the running process's env must

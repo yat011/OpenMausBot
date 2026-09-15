@@ -58,10 +58,14 @@ Quality bar:
 - Frame work through tools this bot actually has: file tools, terminal, browser, phone, or skill_manage. Do not name shell utilities the file tools already wrap.`;
 
 /** Prompt the live agent runs as a normal turn after the user sends `/learn`. */
-export function buildLearnPrompt(userRequest: string): string {
+export function buildLearnPrompt(userRequest: string, autoConfirm = false): string {
   const req =
     userRequest.trim() ||
     "the workflow we just went through in this conversation — review the steps taken and distill them into a reusable skill";
+
+  const applyStep = autoConfirm
+    ? "4. skill_manage applies the change on this instance. After it reports applied, you may tell the user the skill is in effect.\n\n"
+    : "4. skill_manage only STAGES the change. A create stays inactive and an update leaves the current version untouched until the user approves the review card.\n\n";
 
   return (
     `${LEARN_PROMPT_MARKER} The user wants you to learn a reusable skill from the request below, and stage it for their review.\n\n` +
@@ -70,7 +74,7 @@ export function buildLearnPrompt(userRequest: string): string {
     "1. Inventory every source the user named, using the tools you already have — file tools for local paths, web fetch for URLs, and this conversation if they referred to something you just did. If the request is ambiguous about scope, make a reasonable choice and note it; do not stall.\n" +
     "2. Check existing skills with skills_list. If one already covers this topic, leave it alone unless the user explicitly asked to revise that named learned/editable skill. For an explicit revision, read only the exact SKILL.md path listed for that skill in your system prompt (the native .agents/skills/<exact-name>/SKILL.md link is a fallback), preserve every still-valid step, re-verify what changed, then call skill_manage with action=\"update\" and skill_name set to that exact name. If you cannot read or verify the current skill, stop instead of replacing it from memory. For a genuinely new skill, use action=\"create\".\n" +
     "3. Pass source as the exact URL or folder you used, or \"conversation\" when the conversation is the source.\n" +
-    "4. skill_manage only STAGES the change. A create stays inactive and an update leaves the current version untouched until the user approves the review card.\n\n" +
+    applyStep +
     AUTHORING_STANDARDS +
     "\n\nWhen done, tell the user the skill name and a one-line summary of what it captured."
   );
@@ -79,7 +83,7 @@ export function buildLearnPrompt(userRequest: string): string {
 /** The turn the engine runs: `/learn <request>` and the run card's plain
  * sentence followed by the request both become the authoring prompt; any
  * other message is passed through. */
-export function expandLearnTurnText(userText: string): string {
+export function expandLearnTurnText(userText: string, autoConfirm = false): string {
   const learn = parseLearnCommand(userText) ?? parseSaveRunRequest(userText);
-  return learn ? buildLearnPrompt(learn.request) : userText;
+  return learn ? buildLearnPrompt(learn.request, autoConfirm) : userText;
 }
