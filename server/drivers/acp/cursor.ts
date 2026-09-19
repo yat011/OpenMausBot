@@ -26,10 +26,32 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
  * Matching walks from most to least specific, and `auto` is special-cased
  * because Cursor calls that entry `default[]` while naming it "Auto".
  *
+ * `cursor-agent models` also prints namespaced picker slugs such as
+ * `cursor-grok-4.6-high` / `cursor-grok-4.6-high-fast`. ACP advertises only
+ * one Grok 4.6 combo (whatever `~/.cursor/cli-config.json` last saved, often
+ * `grok-4.6[effort=high,fast=true]`). Sending the picker slug earns -32602;
+ * using `byBase` on `grok-4.6` would pin that advertised Fast default.
+ *
+ * Expand the picker suffix onto `grok-4.6[effort=…,fast=…]` only when that
+ * exact combo is advertised. An unlisted combo is not "close enough": Cursor
+ * accepts `session/set_model` then sanitizes it to the default variant
+ * (High Fast), which undoes `--model cursor-grok-4.6-high`. Leave those
+ * unmatched so configureSession skips set_model and the argv pin stands.
+ *
  * Returns null when nothing matches, including when the agent advertised no
- * models at all. The caller then falls back to sending the slug unchanged,
- * which is what older CLIs that ignore the model list still expect.
+ * models at all. The caller then falls back to sending the slug unchanged
+ * (non-Grok), or skips set_model for a Grok picker.
  */
+const GROK_PICKER = /^(?:cursor-)?(grok-[\d.]+)-(xhigh|high|medium|low)(-fast)?$/i;
+
+/** Expand a Cursor Grok picker slug into the ACP parameterised id. */
+export function cursorPickerToAcpGrokId(wanted: string): string | null {
+  const match = wanted.trim().toLowerCase().match(GROK_PICKER);
+  if (!match) return null;
+  const fast = Boolean(match[3]);
+  return `${match[1]}[effort=${match[2]},fast=${fast}]`;
+}
+
 export function resolveCursorAcpModelId(
   available: Array<{ modelId?: string; name?: string }>,
   wanted: string,
@@ -39,11 +61,19 @@ export function resolveCursorAcpModelId(
   const ids = available.filter((m) => typeof m?.modelId === "string" && m.modelId);
   if (!ids.length) return null;
   const base = (id: string) => id.split("[")[0].trim().toLowerCase();
+  const stripped = want.startsWith("cursor-") ? want.slice("cursor-".length) : want;
 
   const exact = ids.find((m) => m.modelId!.toLowerCase() === want);
   if (exact) return exact.modelId!;
 
-  const byBase = ids.find((m) => base(m.modelId!) === want);
+  const grokAcp = cursorPickerToAcpGrokId(want);
+  if (grokAcp) {
+    const listed = ids.find((m) => m.modelId!.toLowerCase() === grokAcp);
+    if (listed) return listed.modelId!;
+    return null;
+  }
+
+  const byBase = ids.find((m) => base(m.modelId!) === want || base(m.modelId!) === stripped);
   if (byBase) return byBase.modelId!;
 
   const byName = ids.find((m) => (m.name ?? "").trim().toLowerCase() === want);
@@ -371,9 +401,12 @@ const support = (run: typeof execCli): AcpSupport => ({
 
   async configureSession({ request, sessionId, turn, sessionModels }) {
     if (!turn.model) return;
-    // Prefer the id this session actually advertised; fall back to the argv
-    // slug so a CLI that advertises nothing behaves exactly as before.
-    const modelId = resolveCursorAcpModelId(sessionModels ?? [], turn.model) ?? turn.model;
+    // Prefer the id this session actually advertised. An unmatched Grok
+    // picker must not be sent as grok-4.6[effort=…,fast=…] — Cursor will
+    // sanitize that to the default Fast variant and undo `--model`.
+    const mapped = resolveCursorAcpModelId(sessionModels ?? [], turn.model);
+    const modelId = mapped ?? (cursorPickerToAcpGrokId(turn.model) ? null : turn.model);
+    if (!modelId) return;
     try {
       await request("session/set_model", { sessionId, modelId });
     } catch (e) {

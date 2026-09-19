@@ -85,6 +85,7 @@ teammate can delegate work to this bot without downgrading its explicit Auto
 | Cursor | Native default | not offered | Native `--auto-review` | Native `--force` |
 | Antigravity | Native `default` | Native `auto_edit` | Legacy `auto` behaves as Ask; UI Auto selects Full access | Native `yolo` plus automatic approval of remaining tool-permission requests; shown as Auto |
 | Grok Build | Native `default` | Native `acceptEdits` | Native `--permission-mode auto`; availability of Grok's reviewer depends on its feature rollout | Native `bypassPermissions`; remaining native requests still appear |
+| Muse Code | Native `--approval-mode on-request` | not offered | not offered | Native `--yolo` (disable approval, disable sandbox, trust this workspace). `--approval-mode never` is not Full: sandbox stays on and the workspace stays untrusted. |
 | OpenCode | Ask | not offered | Ask | Approve individual ACP permission requests, never task questions |
 | Other/custom engines | Ask | not offered | Ask | Not offered until a provider mapping is implemented |
 

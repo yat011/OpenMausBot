@@ -170,6 +170,16 @@ interface Gate {
   changed: Set<() => void>;
 }
 
+/** Agent `close --all` is the complete Chrome restart for this bot session. */
+export function isCompleteBrowserClose(params: unknown): boolean {
+  if (!params || typeof params !== "object" || Array.isArray(params)) return false;
+  const name = "name" in params && typeof params.name === "string" ? params.name : "";
+  if (name !== "agent_browser_close" && name !== "close") return false;
+  const args = "arguments" in params ? params.arguments : undefined;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return false;
+  return (args as { all?: unknown }).all === true;
+}
+
 export class BrowserRuntime {
   private gates = new Map<string, Gate>();
   private clients = new Map<string, { key: string; client: BrowserClient }>();
@@ -214,8 +224,15 @@ export class BrowserRuntime {
     }
   }
 
-  async agentRpc(session: string, spec: BrowserSpawnSpec, method: "tools/list" | "tools/call", params: unknown, beforeDispatch?: () => void): Promise<unknown> {
+  async agentRpc(session: string, spec: BrowserSpawnSpec, method: "tools/list" | "tools/call", params: unknown, beforeDispatch?: () => void, recoverNative?: () => Promise<void>): Promise<unknown> {
     if (method !== "tools/list" && method !== "tools/call") throw new Error("Unsupported browser method.");
+    if (method === "tools/call" && isCompleteBrowserClose(params)) {
+      if (!recoverNative) throw new Error("Browser recovery is not configured.");
+      beforeDispatch?.();
+      await this.agentRestart(session, recoverNative);
+      beforeDispatch?.();
+      return { content: [{ type: "text", text: "Browser restarted." }] };
+    }
     const invoke = async () => {
       const key = JSON.stringify([spec.command, spec.args, Object.entries(spec.env).sort(([a], [b]) => a.localeCompare(b))]);
       let entry = this.clients.get(session);
@@ -309,6 +326,14 @@ export class BrowserRuntime {
       throw error;
     }
     finally { gate.humans--; this.changed(gate); }
+  }
+
+  /** Agent recovery for `close --all`. Does not take human control; refuses
+   * if a person already holds the panel. Native close is the safety barrier. */
+  async agentRestart(session: string, closeBrowser: () => Promise<void>): Promise<void> {
+    const gate = this.gate(session);
+    if (gate.owner !== null && gate.owner !== "agent") throw new Error(BROWSER_CONTROL_REFUSAL);
+    await this.restart(session, "agent", closeBrowser);
   }
 
   /** Exclusive recovery. Unlike take(), this never waits through active work

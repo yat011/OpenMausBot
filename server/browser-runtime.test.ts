@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BrowserRuntime, browserRuntimeEnv, type BrowserSpawnSpec } from "./browser-runtime.ts";
+import { BrowserRuntime, browserRuntimeEnv, isCompleteBrowserClose, type BrowserSpawnSpec } from "./browser-runtime.ts";
 
 const runtimes: BrowserRuntime[] = [];
 function runtime(options: ConstructorParameters<typeof BrowserRuntime>[0] = {}) {
@@ -217,6 +217,37 @@ describe("server-owned browser MCP runtime", () => {
     expect(value.canControl("s", "owner")).toBe(false);
     value.release("s", "owner");
     await value.close("s");
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "echo" })).resolves.toMatchObject({ content: [{ type: "text" }] });
+  });
+
+  it("treats agent close --all as a complete Chrome restart that clears an uncertain session", async () => {
+    const value = runtime({ requestTimeoutMs: 250 });
+    const recover = vi.fn(async () => {});
+    expect(isCompleteBrowserClose({ name: "agent_browser_close", arguments: { all: true } })).toBe(true);
+    expect(isCompleteBrowserClose({ name: "agent_browser_close", arguments: { all: false } })).toBe(false);
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "hang" })).rejects.toThrow(/Browser/);
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "echo" })).rejects.toThrow(/Restart/);
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_close", arguments: { all: false } }, undefined, recover)).rejects.toThrow(/Restart/);
+    expect(recover).not.toHaveBeenCalled();
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_close", arguments: { all: true } }, undefined, recover))
+      .resolves.toMatchObject({ content: [{ type: "text", text: "Browser restarted." }] });
+    expect(recover).toHaveBeenCalledOnce();
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "echo" })).resolves.toMatchObject({ content: [{ type: "text" }] });
+  });
+
+  it("refuses agent Chrome restart while a person holds the panel, and keeps the gate if native close fails", async () => {
+    const value = runtime({ requestTimeoutMs: 250 });
+    const recover = vi.fn(async () => {});
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "hang" })).rejects.toThrow(/Browser/);
+    await expect(value.take("s", "owner")).rejects.toThrow(/may still be running/);
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_close", arguments: { all: true } }, undefined, recover)).rejects.toThrow(/paused/);
+    expect(recover).not.toHaveBeenCalled();
+    value.release("s", "owner");
+    const failing = vi.fn(async () => { throw new Error("close timed out"); });
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_close", arguments: { all: true } }, undefined, failing)).rejects.toThrow(/timed out/);
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "echo" })).rejects.toThrow(/paused|Restart/);
+    await expect(value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_close", arguments: { all: true } }, undefined, recover))
+      .resolves.toMatchObject({ content: [{ type: "text", text: "Browser restarted." }] });
     await expect(value.agentRpc("s", spec(), "tools/call", { name: "echo" })).resolves.toMatchObject({ content: [{ type: "text" }] });
   });
 

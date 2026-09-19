@@ -117,7 +117,8 @@ describe("MuseDriver turns (fake CLI)", () => {
     expect(first.sessionId).toMatch(/^[0-9a-f-]{36}$/);
     expect(second.sessionId).toBe(first.sessionId);
     expect(first.argv).toContain("--json");
-    expect(first.argv).toEqual(expect.arrayContaining(["--approval-mode", "never", "--model", "muse-spark-1.2"]));
+    expect(first.argv).toEqual(expect.arrayContaining(["--yolo", "--model", "muse-spark-1.2"]));
+    expect(first.argv).not.toContain("--approval-mode");
     expect(first.prompt).toBe("You are Maus.\n\ndo the thing");
   });
 
@@ -375,6 +376,16 @@ describe("muse protocol helpers", () => {
       "--prompt-file",
       "/tmp/prompt.md",
     ]);
+  });
+
+  it("maps full access to muse --yolo instead of --approval-mode never", () => {
+    expect(
+      buildMuseExecArgs({
+        provider: "meta",
+        approval: "never",
+        promptFile: "/tmp/prompt.md",
+      }),
+    ).toEqual(["exec", "--json", "--provider", "meta", "--yolo", "--prompt-file", "/tmp/prompt.md"]);
   });
 
   it("reads the CLI catalog cache and ignores models the account does not list", async () => {

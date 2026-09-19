@@ -318,12 +318,13 @@ import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import { CalendarCallManager, type CalendarCall } from "./calendar-calls.ts";
 import { BUILT_IN_BROWSER_SYSTEM_PROMPT } from "./browser-engine.ts";
-import { BrowserRuntime } from "./browser-runtime.ts";
+import { BrowserRuntime, browserRuntimeEnv } from "./browser-runtime.ts";
 import { BrowserLive } from "./browser-live.ts";
 import {
   agentBrowserFrame,
   agentBrowserIntegration,
   browserEngineEncryptionKey,
+  closeBrowserSession,
   prepareBrowserSessionState,
   clearBrowserSessionState,
   ensureChrome,
@@ -8853,6 +8854,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           if (body.method === "tools/call" && !claimTurnResource(internalCapability, `browser:${browser.session}`)) {
             throw Object.assign(new Error("another thread is using this browser — pause browser work until that thread finishes"), { status: 409 });
           }
+        }, async () => {
+          const env = browserRuntimeEnv({ ...browser.spec.env, AGENT_BROWSER_SESSION: browser.session });
+          if (!await closeBrowserSession(browser.spec.command, env)) throw new Error("browser close failed");
         });
         requireActiveInternalCapability();
         return json(res, 200, { result });

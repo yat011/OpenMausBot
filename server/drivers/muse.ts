@@ -273,11 +273,19 @@ export function writeMuseMcpOverlay(
   return { xdgConfigHome, settingsPath };
 }
 
-/** OpenMausBot ask|auto|full|custom onto `muse exec --approval-mode`
- * (untrusted|on-request|never, default on-request). Full is the one mode
- * that stops asking, matching Claude's full→bypassPermissions. */
+/** OpenMausBot ask|auto|full|custom onto Muse exec safety flags.
+ * Full is encoded as approval `"never"` and emitted as `muse exec --yolo`
+ * (disable approval, disable sandbox, trust this workspace). Muse's
+ * `--approval-mode never` only closes prompts: the sandbox stays on and
+ * the workspace stays untrusted, so Full would still fail socket/spool
+ * work. Other levels stay `--approval-mode on-request`. */
 export function museApprovalFlag(mode: ApprovalMode | undefined): string {
   return mode === "full" ? "never" : "on-request";
+}
+
+/** argv fragment after `muse exec` for the mapped approval level. */
+export function museSafetyArgs(approval: string): string[] {
+  return approval === "never" ? ["--yolo"] : ["--approval-mode", approval];
 }
 
 export interface MuseExecOpts {
@@ -300,8 +308,7 @@ export function buildMuseExecArgs(opts: MuseExecOpts): string[] {
     "--json",
     "--provider",
     opts.provider,
-    "--approval-mode",
-    opts.approval,
+    ...museSafetyArgs(opts.approval),
     ...(opts.sessionId ? ["--session-id", opts.sessionId] : []),
     ...(opts.model ? ["--model", opts.model] : []),
     ...(opts.effort ? ["--reasoning-effort", opts.effort] : []),

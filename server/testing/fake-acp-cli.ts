@@ -109,8 +109,26 @@ const configOptions = () => {
 // parameterised ids (`default[]`) that differ from the argv `--model` slugs
 // (`auto`). Off unless FAKE_ACP_SESSION_MODELS is set, so every existing mode
 // stays byte-identical. Format: "id|Name,id|Name" — the name is optional.
-const acpModels = (process.env.FAKE_ACP_SESSION_MODELS ?? "")
-  .split(",")
+// Commas inside [...] stay inside the id (grok-4.6[effort=high,fast=false]).
+function splitAcpModelEntries(raw: string): string[] {
+  const entries: string[] = [];
+  let buf = "";
+  let depth = 0;
+  for (const ch of raw) {
+    if (ch === "[") depth += 1;
+    else if (ch === "]") depth = Math.max(0, depth - 1);
+    if (ch === "," && depth === 0) {
+      if (buf) entries.push(buf);
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf) entries.push(buf);
+  return entries;
+}
+
+const acpModels = splitAcpModelEntries(process.env.FAKE_ACP_SESSION_MODELS ?? "")
   .filter(Boolean)
   .map((entry) => {
     const [modelId, name] = entry.split("|");

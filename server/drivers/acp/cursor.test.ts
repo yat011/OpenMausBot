@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -336,6 +336,25 @@ describe("resolveCursorAcpModelId", () => {
   it("returns null for a model this session does not offer", () => {
     expect(resolveCursorAcpModelId(ADVERTISED, "no-such-model")).toBeNull();
   });
+
+  it("does not invent an unlisted non-fast Grok combo when Fast is advertised", () => {
+    expect(resolveCursorAcpModelId(ADVERTISED, "cursor-grok-4.6-high")).toBeNull();
+  });
+
+  it("expands cursor-grok-4.6-high-fast onto the advertised Fast combo", () => {
+    expect(resolveCursorAcpModelId(ADVERTISED, "cursor-grok-4.6-high-fast")).toBe(
+      "grok-4.6[effort=high,fast=true]",
+    );
+  });
+
+  it("expands cursor-grok-4.6-high when the session advertised non-fast", () => {
+    expect(
+      resolveCursorAcpModelId(
+        [{ modelId: "grok-4.6[effort=high,fast=false]", name: "grok-4.6" }],
+        "cursor-grok-4.6-high",
+      ),
+    ).toBe("grok-4.6[effort=high,fast=false]");
+  });
 });
 
 describe("cursor ACP model namespace (NS: set_model wiring)", () => {
@@ -372,6 +391,83 @@ describe("cursor ACP model namespace (NS: set_model wiring)", () => {
       delete process.env.FAKE_ACP_SESSION_MODELS;
       // the dir goes with it: a stale FAKE_ACP_DUMP makes the *next* test's
       // fake CLI die on ENOENT, which reads as an unrelated driver failure.
+      delete process.env.FAKE_ACP_DUMP;
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("skips set_model for cursor-grok-4.6-high when Fast is the only advertised combo", async () => {
+    ensureDirs();
+    chmodSync(FAKE_CLI, 0o755);
+    const scratch = mkdtempSync(join(tmpdir(), "omb-cursor-grok-high-"));
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    process.env.FAKE_ACP_SESSION_MODELS = "grok-4.6[effort=high,fast=true]|grok-4.6";
+
+    const instance = await CursorAgentDriver.create({
+      instanceId: "cursor-grok-high",
+      displayName: "Cursor",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-cursor-grok-high",
+        text: "hi",
+        model: "cursor-grok-4.6-high",
+      });
+      await recorder.until((e) => e.type === "turn.completed");
+      expect(existsSync(`${dump}.config.json`)).toBe(false);
+      expect(JSON.parse(readFileSync(dump, "utf8")).argv).toEqual([
+        "--model",
+        "cursor-grok-4.6-high",
+        "acp",
+      ]);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      delete process.env.FAKE_ACP_SESSION_MODELS;
+      delete process.env.FAKE_ACP_DUMP;
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("sends listed non-fast Grok ACP id when the session advertised it", async () => {
+    ensureDirs();
+    chmodSync(FAKE_CLI, 0o755);
+    const scratch = mkdtempSync(join(tmpdir(), "omb-cursor-grok-high-listed-"));
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    process.env.FAKE_ACP_SESSION_MODELS = "grok-4.6[effort=high,fast=false]|grok-4.6";
+
+    const instance = await CursorAgentDriver.create({
+      instanceId: "cursor-grok-high-listed",
+      displayName: "Cursor",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-cursor-grok-high-listed",
+        text: "hi",
+        model: "cursor-grok-4.6-high",
+      });
+      await recorder.until((e) => e.type === "turn.completed");
+      const applied = JSON.parse(readFileSync(`${dump}.config.json`, "utf8"));
+      expect(applied).toEqual([
+        {
+          method: "session/set_model",
+          params: { sessionId: "fake-acp-session", modelId: "grok-4.6[effort=high,fast=false]" },
+        },
+      ]);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      delete process.env.FAKE_ACP_SESSION_MODELS;
       delete process.env.FAKE_ACP_DUMP;
       await removeTempDir(scratch);
     }
