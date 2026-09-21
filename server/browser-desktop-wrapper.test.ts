@@ -50,6 +50,7 @@ describe.skipIf(!posix)("desktop sidecar browser wrapper", () => {
         ...process.env,
         OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
         OMB_DESKTOP_CDP: "http://127.0.0.1:9",
+        OMB_DESKTOP_CDP_TRIES: "0",
       });
       expect(args).toEqual(["open", "https://example.com"]);
     } finally {
@@ -68,6 +69,32 @@ describe.skipIf(!posix)("desktop sidecar browser wrapper", () => {
         });
         expect(args).toEqual(["--cdp", url, "open", "https://example.com"]);
       });
+    } finally {
+      removeTempDir(dir);
+    }
+  });
+
+  it("waits for a late sidecar instead of falling back", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-wrapper-"));
+    try {
+      const server = createServer((socket) => { socket.destroy(); });
+      try {
+        await new Promise<void>((done) => { server.listen(0, "127.0.0.1", done); });
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("no loopback port");
+        const url = `http://127.0.0.1:${address.port}`;
+        await new Promise<void>((done) => { server.close(() => done()); });
+        setTimeout(() => { server.listen(address.port, "127.0.0.1"); }, 1500);
+        const args = await runWrapper(["open", "https://example.com"], {
+          ...process.env,
+          OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
+          OMB_DESKTOP_CDP: url,
+          OMB_DESKTOP_CDP_TRIES: "10",
+        });
+        expect(args).toEqual(["--cdp", url, "open", "https://example.com"]);
+      } finally {
+        server.close();
+      }
     } finally {
       removeTempDir(dir);
     }

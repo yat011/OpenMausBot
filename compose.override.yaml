@@ -20,6 +20,8 @@ services:
     ports:
       # noVNC viewer of the desktop sidecar (shares omb's netns).
       - "127.0.0.1:6901:6901"
+    # No depends_on desktop: desktop's network_mode already depends on omb,
+    # so that would be a cycle. The browser wrapper waits for CDP instead.
     healthcheck:
       test:
         - CMD
@@ -30,9 +32,6 @@ services:
       timeout: 5s
       start_period: 10m
       retries: 5
-    depends_on:
-      desktop:
-        condition: service_healthy
   desktop:
     build: ./deploy/desktop
     image: ${OMB_DESKTOP_IMAGE:-openmausbot-desktop:latest}

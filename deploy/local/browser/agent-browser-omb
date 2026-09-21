@@ -34,9 +34,17 @@ for arg in "$@"; do
   esac
 done
 
-if [[ "$session_mgmt" -eq 0 ]] && cdp_up; then
-  export AGENT_BROWSER_PIN_TAB="${AGENT_BROWSER_PIN_TAB:-1}"
-  exec "$REAL" --cdp "$CDP" "$@"
+if [[ "$session_mgmt" -eq 0 ]]; then
+  # Wait for the sidecar (cold boot races the first browse); fall back to
+  # the bundled engine when it stays down.
+  for ((i = 0; i < ${OMB_DESKTOP_CDP_TRIES:-30}; i++)); do
+    cdp_up && break
+    sleep 1
+  done
+  if cdp_up; then
+    export AGENT_BROWSER_PIN_TAB="${AGENT_BROWSER_PIN_TAB:-1}"
+    exec "$REAL" --cdp "$CDP" "$@"
+  fi
 fi
 
 exec "$REAL" "$@"
