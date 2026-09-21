@@ -10,3 +10,11 @@ android/app/src/main/kotlin/com/openmausbot/companion/ui/MausBodies.kt text eol=
 # Vendor patch hashes and original notices must survive Windows checkout
 # byte-for-byte. Do not let core.autocrlf rewrite these reviewed inputs.
 third_party/browser/** text eol=lf
+# Fork addition: ty-desktop builds + boots from a Windows checkout. These
+# scripts are baked into the Linux image or executed from the mount, so a
+# CRLF checkout would break them. Pin to LF on every platform.
+deploy/local/*.sh text eol=lf
+deploy/local/browser/* text eol=lf
+deploy/local/gateway/*.sh text eol=lf
+deploy/local/gateway/bin/* text eol=lf
+deploy/desktop/*.sh text eol=lf
