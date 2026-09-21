@@ -38,6 +38,7 @@ import {
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions, flushDecisionLog } from "./decision-log.ts";
+import type { DecisionKind, DecisionSource } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import {
   ATTACHMENTS_DIR,
@@ -7520,7 +7521,7 @@ function resolveSkillRequest(args: {
     }
     return { claimed: true, outcome: card.answered === "allow" ? "allowed-once" : "rejected", alreadySettled: true };
   }
-  const recordDecision = (decision: string, source: string) => {
+  const recordDecision = (decision: DecisionKind, source: DecisionSource) => {
     if (args.omitDecision) return;
     appendDecision(DATA_DIR, {
       threadId: args.threadId,
