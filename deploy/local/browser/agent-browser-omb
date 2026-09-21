@@ -43,6 +43,11 @@ if [[ "$session_mgmt" -eq 0 ]]; then
   done
   if cdp_up; then
     export AGENT_BROWSER_PIN_TAB="${AGENT_BROWSER_PIN_TAB:-1}"
+    # The --cdp flag only steers this process; the daemon that owns session
+    # browsers connects via AGENT_BROWSER_CDP, so export it too (a caller's
+    # explicit value still wins). Without this, MCP sessions keep spawning
+    # the bundled headless engine while the CLI looks correctly attached.
+    export AGENT_BROWSER_CDP="${AGENT_BROWSER_CDP:-$CDP}"
     exec "$REAL" --cdp "$CDP" "$@"
   fi
 fi

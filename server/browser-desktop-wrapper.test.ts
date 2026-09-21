@@ -13,12 +13,21 @@ const WRAPPER = fileURLToPath(new URL("../deploy/local/browser/agent-browser-omb
 
 function fixtureReal(dir: string): string {
   const path = join(dir, "fake-agent-browser.mjs");
-  writeFileSync(path, '#!/usr/bin/env node\nconsole.log(JSON.stringify(process.argv.slice(2)));\n');
+  writeFileSync(
+    path,
+    "#!/usr/bin/env node\nconsole.log(JSON.stringify({args:process.argv.slice(2),cdp:process.env.AGENT_BROWSER_CDP??null,pinTab:process.env.AGENT_BROWSER_PIN_TAB??null}));\n",
+  );
   chmodSync(path, 0o755);
   return path;
 }
 
-function runWrapper(args: string[], env: NodeJS.ProcessEnv): Promise<string[]> {
+interface FixtureSeen {
+  args: string[];
+  cdp: string | null;
+  pinTab: string | null;
+}
+
+function runWrapper(args: string[], env: NodeJS.ProcessEnv): Promise<FixtureSeen> {
   return new Promise((done, fail) => {
     execFile(WRAPPER, args, { env, timeout: 15_000 }, (error, stdout, stderr) => {
       if (error) fail(new Error(`wrapper failed: ${String(stderr || error.message)}`));
@@ -28,6 +37,14 @@ function runWrapper(args: string[], env: NodeJS.ProcessEnv): Promise<string[]> {
       }
     });
   });
+}
+
+function cleanEnv(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...extra };
+  // Deterministic baseline: drop ambient values unless the test sets them.
+  if (extra.AGENT_BROWSER_CDP === undefined) delete env.AGENT_BROWSER_CDP;
+  if (extra.AGENT_BROWSER_PIN_TAB === undefined) delete env.AGENT_BROWSER_PIN_TAB;
+  return env;
 }
 
 async function withCdpServer(run: (url: string) => Promise<void>): Promise<void> {
@@ -46,13 +63,13 @@ describe.skipIf(!posix)("desktop sidecar browser wrapper", () => {
   it("passes through to the bundled engine when CDP is down", async () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-wrapper-"));
     try {
-      const args = await runWrapper(["open", "https://example.com"], {
-        ...process.env,
+      const seen = await runWrapper(["open", "https://example.com"], cleanEnv({
         OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
         OMB_DESKTOP_CDP: "http://127.0.0.1:9",
         OMB_DESKTOP_CDP_TRIES: "0",
-      });
-      expect(args).toEqual(["open", "https://example.com"]);
+      }));
+      expect(seen.args).toEqual(["open", "https://example.com"]);
+      expect(seen.cdp).toBeNull();
     } finally {
       removeTempDir(dir);
     }
@@ -62,12 +79,44 @@ describe.skipIf(!posix)("desktop sidecar browser wrapper", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-wrapper-"));
     try {
       await withCdpServer(async (url) => {
-        const args = await runWrapper(["open", "https://example.com"], {
-          ...process.env,
+        const seen = await runWrapper(["open", "https://example.com"], cleanEnv({
           OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
           OMB_DESKTOP_CDP: url,
-        });
-        expect(args).toEqual(["--cdp", url, "open", "https://example.com"]);
+        }));
+        expect(seen.args).toEqual(["--cdp", url, "open", "https://example.com"]);
+      });
+    } finally {
+      removeTempDir(dir);
+    }
+  });
+
+  it("exports AGENT_BROWSER_CDP so the daemon connects to the sidecar", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-wrapper-"));
+    try {
+      await withCdpServer(async (url) => {
+        const seen = await runWrapper(["open", "https://example.com"], cleanEnv({
+          OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
+          OMB_DESKTOP_CDP: url,
+        }));
+        expect(seen.cdp).toBe(url);
+        expect(seen.pinTab).toBe("1");
+      });
+    } finally {
+      removeTempDir(dir);
+    }
+  });
+
+  it("keeps a caller-set AGENT_BROWSER_CDP instead of overriding it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-wrapper-"));
+    try {
+      await withCdpServer(async (url) => {
+        const seen = await runWrapper(["open", "https://example.com"], cleanEnv({
+          OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
+          OMB_DESKTOP_CDP: url,
+          AGENT_BROWSER_CDP: "http://127.0.0.1:9",
+        }));
+        expect(seen.args).toEqual(["--cdp", url, "open", "https://example.com"]);
+        expect(seen.cdp).toBe("http://127.0.0.1:9");
       });
     } finally {
       removeTempDir(dir);
@@ -85,13 +134,12 @@ describe.skipIf(!posix)("desktop sidecar browser wrapper", () => {
         const url = `http://127.0.0.1:${address.port}`;
         await new Promise<void>((done) => { server.close(() => done()); });
         setTimeout(() => { server.listen(address.port, "127.0.0.1"); }, 1500);
-        const args = await runWrapper(["open", "https://example.com"], {
-          ...process.env,
+        const seen = await runWrapper(["open", "https://example.com"], cleanEnv({
           OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
           OMB_DESKTOP_CDP: url,
           OMB_DESKTOP_CDP_TRIES: "10",
-        });
-        expect(args).toEqual(["--cdp", url, "open", "https://example.com"]);
+        }));
+        expect(seen.args).toEqual(["--cdp", url, "open", "https://example.com"]);
       } finally {
         server.close();
       }
@@ -104,12 +152,12 @@ describe.skipIf(!posix)("desktop sidecar browser wrapper", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-wrapper-"));
     try {
       await withCdpServer(async (url) => {
-        const args = await runWrapper(["close", "--all"], {
-          ...process.env,
+        const seen = await runWrapper(["close", "--all"], cleanEnv({
           OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
           OMB_DESKTOP_CDP: url,
-        });
-        expect(args).toEqual(["close", "--all"]);
+        }));
+        expect(seen.args).toEqual(["close", "--all"]);
+        expect(seen.cdp).toBeNull();
       });
     } finally {
       removeTempDir(dir);
