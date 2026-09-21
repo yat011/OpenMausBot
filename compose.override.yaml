@@ -17,16 +17,31 @@ services:
       # Host SSH keys (read-only) so the bot can git pull/push itself.
       # repo-start.sh copies the private key to a 0600 file on boot.
       - ${USERPROFILE}/.ssh:/mnt/host-ssh:ro
+    ports:
+      # noVNC viewer of the desktop sidecar (shares omb's netns).
+      - "127.0.0.1:6901:6901"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8799/api/health', { signal: AbortSignal.timeout(4000) }).then(async r => { if (!r.ok || !(await r.text()).includes('openmausbot')) process.exit(1); }).catch(() => process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      start_period: 10m
+      retries: 5
     depends_on:
       desktop:
         condition: service_healthy
   desktop:
     build: ./deploy/desktop
     image: ${OMB_DESKTOP_IMAGE:-openmausbot-desktop:latest}
+    # Share omb's network namespace (same as caddy): current Chrome ignores
+    # --remote-debugging-address and binds CDP to loopback only, so omb must
+    # reach it as 127.0.0.1:9229. Ports are published on omb instead.
+    network_mode: service:omb
     restart: unless-stopped
     shm_size: "2gb"
-    ports:
-      - "127.0.0.1:6901:6901"
     volumes:
       - chrome-profile:/profile
     healthcheck:

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Route the bot's agent-browser at the headed desktop sidecar's Chrome over
 # CDP instead of spawning the bundled Chromium. Same role as the old box's
-# ~/bin/agent-browser wrapper, adapted for compose (CDP host `desktop`).
+# ~/bin/agent-browser wrapper. The sidecar shares omb's network namespace,
+# so its loopback-only CDP is 127.0.0.1:9229 from here.
 #
 # The harness spawns this binary through a restricted env (browser-runtime.ts
 # HOST_ENV), so the endpoint is a baked-in default, not compose env: override
@@ -9,7 +10,7 @@
 set -euo pipefail
 
 REAL="${OMB_AGENT_BROWSER_REAL:-/usr/local/bin/agent-browser}"
-CDP="${OMB_DESKTOP_CDP:-http://desktop:9229}"
+CDP="${OMB_DESKTOP_CDP:-http://127.0.0.1:9229}"
 
 if [[ "$REAL" == "$0" ]]; then
   echo "agent-browser-omb: OMB_AGENT_BROWSER_REAL points at the wrapper" >&2

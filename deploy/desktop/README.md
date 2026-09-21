@@ -5,10 +5,12 @@ Chrome, mirroring the old box's headed setup (`DISPLAY :7`, CDP `9229`).
 
 ## Wiring
 
-- `desktop` exposes CDP inside the compose network only (`9229` is NOT
-  published to the host). `omb` reaches it as `http://desktop:9229`.
+- `desktop` uses `network_mode: service:omb` (same as caddy): current Chrome
+  ignores `--remote-debugging-address` and binds CDP to loopback only, so
+  `omb` reaches it as `http://127.0.0.1:9229`. Nothing of the sidecar is
+  published except noVNC (see below).
 - `omb` sets `OMB_AGENT_BROWSER_PATH=/usr/local/bin/agent-browser-omb`; that
-  wrapper injects `--cdp http://desktop:9229` into every agent-browser call
+  wrapper injects `--cdp http://127.0.0.1:9229` into every agent-browser call
   except session management (`close`/`session`/`quit`/`exit`), so `close --all`
   can never kill the shared Chrome. When CDP is down it falls back to the
   bundled Chromium.
