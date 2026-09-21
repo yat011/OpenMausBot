@@ -305,6 +305,33 @@ describe("MuseDriver turns (fake CLI)", () => {
     });
   });
 
+  it("advertises agents MCP and mounts it through the per-turn overlay", async () => {
+    await create();
+    expect(instance.adapter.capabilities.agentsMcp).toBe(true);
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-agents",
+      text: "delegate",
+      integrations: {
+        agents: { command: "/usr/bin/node", args: ["agents-proxy.ts"], env: { OMB_COMMS_TOKEN: "tok" } },
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const launch = readDump(dump)[0]!;
+    expect(launch.xdgConfigHome).toBeTruthy();
+    expect(launch.settings).toMatchObject({
+      schema_version: 1,
+      mcpServers: {
+        agents: {
+          transport: "stdio",
+          command: "/usr/bin/node",
+          args: ["agents-proxy.ts"],
+          env: { OMB_COMMS_TOKEN: "tok" },
+          mode: "optional",
+        },
+      },
+    });
+  });
+
   it("decodes config with muse defaults", () => {
     expect(MuseDriver.decodeConfig({})).toEqual({ cli: "muse", provider: "meta", model: "", baseUrl: "" });
     expect(MuseDriver.models.default).toBe("muse-spark-1.2");

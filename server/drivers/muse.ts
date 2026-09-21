@@ -6,10 +6,10 @@
 // to the prompt — the same codex-style prepend the Grok ACP driver uses for
 // flags its CLI accepts but never delivers.
 //
-// Built-in browser and workspace custom MCP (e.g. wanderlog) are a per-turn
-// overlay: a temp XDG_CONFIG_HOME/muse/settings.json with mcpServers.*,
-// auth.json copied in so login survives the overlay. The person's
-// ~/.config/muse is not written. Muse's own web tools stay on
+// Peer-agent comms, built-in browser, and workspace custom MCP (e.g.
+// wanderlog) are a per-turn overlay: a temp XDG_CONFIG_HOME/muse/settings.json
+// with mcpServers.*, auth.json copied in so login survives the overlay. The
+// person's ~/.config/muse is not written. Muse's own web tools stay on
 // (no --disable-web-tools).
 //
 // Auth is the CLI's own: `muse login` (Meta account, stored at
@@ -205,24 +205,30 @@ export function museStdioMcpServer(spec: MuseStdioMcpSpec): Record<string, unkno
 }
 
 export interface MuseMcpMounts {
+  agents?: MuseStdioMcpSpec;
   browser?: MuseStdioMcpSpec;
   custom?: Record<string, MuseStdioMcpSpec>;
 }
 
 export function museMcpMountsFromTurn(turn: {
-  integrations?: { browser?: MuseStdioMcpSpec; custom?: Record<string, MuseStdioMcpSpec> };
+  integrations?: { agents?: MuseStdioMcpSpec; browser?: MuseStdioMcpSpec; custom?: Record<string, MuseStdioMcpSpec> };
 }): MuseMcpMounts | null {
+  const agents = turn.integrations?.agents;
   const browser = turn.integrations?.browser;
   const custom = turn.integrations?.custom;
   const customEntries = custom && Object.keys(custom).length ? custom : undefined;
-  if (!browser && !customEntries) return null;
-  return { ...(browser ? { browser } : {}), ...(customEntries ? { custom: customEntries } : {}) };
+  if (!agents && !browser && !customEntries) return null;
+  return {
+    ...(agents ? { agents } : {}),
+    ...(browser ? { browser } : {}),
+    ...(customEntries ? { custom: customEntries } : {}),
+  };
 }
 
 /** Merge harness MCP servers into a copy of the person's Muse settings.
  * CamelCase `mcpServers` is canonical; a legacy `mcp_servers` key is folded
- * in and dropped so Muse does not see both. Built-in `browser` wins over a
- * custom server of the same name. */
+ * in and dropped so Muse does not see both. Built-ins (`agents`, `browser`)
+ * win over a custom server of the same name. */
 export function buildMuseSettingsWithMcp(
   base: Record<string, unknown> | null,
   mounts: MuseMcpMounts,
@@ -239,6 +245,7 @@ export function buildMuseSettingsWithMcp(
     }
   }
   if (mounts.browser) servers.browser = museStdioMcpServer(mounts.browser);
+  if (mounts.agents) servers.agents = museStdioMcpServer(mounts.agents);
   settings.mcpServers = servers;
   return settings;
 }
@@ -640,6 +647,7 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
           images: true,
           nativeImageInput: true,
           effortLevels: EFFORT_LEVELS,
+          agentsMcp: true,
           browserMcp: true,
           customMcp: true,
         },
