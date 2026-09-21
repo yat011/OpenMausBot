@@ -14,7 +14,7 @@ ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 # backs the healthcheck; the rest are Chrome's libraries), plus python3/procps
 # for the gateway scripts and the browser wrapper.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl git python3 procps \
+  && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client python3 procps \
     libxcb-shm0 libx11-xcb1 libx11-6 libxcb1 libxext6 libxrandr2 \
     libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libxi6 libgtk-3-0 \
     libpangocairo-1.0-0 libpango-1.0-0 libatk1.0-0 libcairo-gobject2 \
