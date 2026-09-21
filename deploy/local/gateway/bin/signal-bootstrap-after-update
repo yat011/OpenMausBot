@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Restore Signal local-gateway wake path after a computer Update.
+# Wake target: OpenMausBot 私人AI via loopback webhook :8800 (not Grok :1340).
+set -uo pipefail
+
+export PATH="$HOME/bin:$PATH"
+ROOT="${SIGNAL_ROOT:-$HOME/signal}"
+
+fail() { echo "FAILED: $*" >&2; exit 1; }
+step() { echo "==> $*" }
+
+step "check signal-cli binary"
+if [[ ! -x "$ROOT/bin/signal-cli" && ! -x "$HOME/bin/signal-cli" ]]; then
+  if [[ -x "$ROOT/reinstall-cli.sh" ]]; then
+    step "reinstall signal-cli via reinstall-cli.sh"
+    "$ROOT/reinstall-cli.sh" || fail "reinstall-cli.sh failed"
+  else
+    fail "signal-cli missing; restore binary or run $ROOT/reinstall-cli.sh"
+  fi
+fi
+echo "ok: signal-cli present"
+
+step "ensure directories"
+mkdir -p "$ROOT/logs" "$ROOT/inbox-spool/done" "$ROOT/config" "$ROOT/data" "$HOME/logs" \
+  || fail "could not create signal dirs"
+echo "ok: dirs ready"
+
+step "verify account data"
+[[ -f "$ROOT/data/accounts.json" ]] || fail "$ROOT/data/accounts.json missing — re-register Signal account"
+echo "ok: accounts.json present"
+
+step "verify OpenMausBot webhook env"
+if [[ ! -f "$ROOT/config/openmaus-webhook.env" ]]; then
+  fail "$ROOT/config/openmaus-webhook.env missing (needed for local wake; do not invent tokens)"
+fi
+echo "ok: openmaus-webhook.env present"
+
+step "verify local-gateway bridge script"
+[[ -f "$ROOT/bridge/signal_local_gateway_bridge.py" ]] || fail "signal_local_gateway_bridge.py missing"
+echo "ok: bridge script present"
+
+step "stop legacy cloud webhook bridge if running"
+pkill -f 'signal_webhook_bridge.py' 2>/dev/null || true
+
+step "start daemon + local-gateway bridge"
+if [[ -x "$ROOT/bridge/start-local-bridge.sh" ]]; then
+  "$ROOT/bridge/start-local-bridge.sh" || fail "start-local-bridge.sh exited non-zero"
+elif [[ -x "$ROOT/bridge/watchdog.sh" ]]; then
+  "$ROOT/bridge/watchdog.sh" || fail "watchdog.sh exited non-zero"
+else
+  fail "start-local-bridge.sh / watchdog.sh missing"
+fi
+echo "ok: start script ran"
+
+step "health check localhost:8800 (loopback only)"
+sleep 1
+health_out=""
+if ! health_out="$(curl -fsS -m 5 http://127.0.0.1:8800/health 2>&1)"; then
+  fail "curl http://127.0.0.1:8800/health failed — OpenMausBot webhook receiver not reachable on loopback. Output: $health_out"
+fi
+echo "ok: health => ${health_out}"
+
+pgrep -f 'signal_local_gateway_bridge.py' >/dev/null || fail "signal_local_gateway_bridge.py not running"
+pgrep -f 'signal-cli.*daemon' >/dev/null || fail "signal-cli daemon not running"
+echo "ok: daemon + bridge processes up"
+
+echo
+echo "healthy"
+exit 0

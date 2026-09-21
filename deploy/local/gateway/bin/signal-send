@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Send a Signal text via the running signal-cli JSON-RPC UNIX socket."""
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+import time
+from pathlib import Path
+
+SOCKET_PATH = Path("/home/box/signal/signal.sock")
+
+
+def send_rpc(params: dict[str, object]) -> dict[str, object]:
+    if not SOCKET_PATH.is_socket():
+        raise SystemExit(f"signal-cli socket missing: {SOCKET_PATH}")
+    req = {
+        "jsonrpc": "2.0",
+        "method": "send",
+        "params": params,
+        "id": int(time.time() * 1000) % 1_000_000,
+    }
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(20)
+    try:
+        sock.connect(str(SOCKET_PATH))
+        sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    if not buf.strip():
+        raise SystemExit("signal-cli send: empty response")
+    try:
+        obj: object = json.loads(buf.split(b"\n", 1)[0].decode())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"signal-cli send: bad json: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise SystemExit("signal-cli send: unexpected response")
+    if obj.get("error"):
+        raise SystemExit(f"signal-cli send error: {obj['error']}")
+    return obj
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--to", help="1:1 recipient phone, e.g. +447999003749")
+    target.add_argument("--group", help="Signal groupId")
+    parser.add_argument("--message", required=True, help="Plain text body")
+    args = parser.parse_args()
+    text = str(args.message)
+    if not text:
+        print("empty --message", file=sys.stderr)
+        return 2
+    params: dict[str, object]
+    if args.group:
+        params = {"groupId": args.group, "message": text}
+    else:
+        params = {"recipient": [args.to], "message": text}
+    send_rpc(params)
+    print("sent")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

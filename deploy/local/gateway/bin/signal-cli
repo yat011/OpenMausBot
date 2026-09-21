@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Persist root: /home/box/signal  (contains data/ with accounts.json)
+ROOT="${SIGNAL_CLI_ROOT:-/home/box/signal}"
+exec /home/box/signal/bin/signal-cli -c "$ROOT" "$@"

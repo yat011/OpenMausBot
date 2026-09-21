@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Standing background watchdog for Signal daemon + local-gateway bridge.
+# Loops forever; does NOT depend on Grok Bot agent/routine wakes.
+set -u
+
+export PATH="$HOME/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/lib/jvm/java-21-openjdk-amd64/lib/server:/usr/lib/jvm/java-21-openjdk-amd64/lib:${LD_LIBRARY_PATH:-}"
+export _JAVA_OPTIONS="${_JAVA_OPTIONS:--Djava.awt.headless=true}"
+
+ROOT="${SIGNAL_ROOT:-$HOME/signal}"
+PIDFILE="${SIGNAL_WATCHDOG_PIDFILE:-$ROOT/logs/watchdog-daemon.pid}"
+LOG="${SIGNAL_WATCHDOG_LOG:-$HOME/logs/signal-watchdog-daemon.log}"
+ERR_LOG="$ROOT/logs/watchdog.log"
+SLEEP_SECS="${SIGNAL_WATCHDOG_SLEEP:-45}"
+HEARTBEAT_SECS=$((30 * 60))
+HEALTH_URL="http://127.0.0.1:8800/health"
+START="$ROOT/bridge/start-local-bridge.sh"
+
+mkdir -p "$ROOT/logs" "$ROOT/inbox-spool/done" "$HOME/logs" 2>/dev/null || true
+
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+dlog() { echo "$(ts) $*" >>"$LOG"; }
+
+alive_pidfile() {
+  local pidfile="$1" needle="$2"
+  local pid
+  [[ -f "$pidfile" ]] || return 1
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  [[ -n "${pid:-}" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "$needle"
+}
+
+daemon_ok() {
+  alive_pidfile "$ROOT/logs/daemon.pid" 'signal-cli' && [[ -S "$ROOT/signal.sock" ]]
+}
+
+bridge_ok() {
+  alive_pidfile "$ROOT/logs/bridge.pid" 'signal_local_gateway_bridge.py' \
+    || ps -eo args= | awk '/signal_local_gateway_bridge\.py/ {found=1} END{exit !found}'
+}
+
+already_running() {
+  local pid
+  [[ -f "$PIDFILE" ]] || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  [[ -n "${pid:-}" ]] || return 1
+  if kill -0 "$pid" 2>/dev/null; then
+    if [[ -r "/proc/$pid/cmdline" ]] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'signal-watchdog-daemon'; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+if already_running; then
+  exit 0
+fi
+
+echo $$ >"$PIDFILE"
+cleanup() { rm -f "$PIDFILE" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
+dlog "daemon started pid=$$ sleep=${SLEEP_SECS}s"
+last_heartbeat=$(date +%s)
+
+while true; do
+  need_restart=0
+  reason=""
+
+  if ! daemon_ok; then
+    need_restart=1
+    reason="daemon/socket down"
+  fi
+  if ! bridge_ok; then
+    need_restart=1
+    reason="${reason:+$reason; }bridge down"
+  fi
+
+  if [[ "$need_restart" -eq 1 ]]; then
+    echo "$(ts) watchdog-daemon: restarting via start-local-bridge ($reason)" >>"$ERR_LOG"
+    dlog "restarting via start-local-bridge ($reason)"
+    if [[ -x "$START" ]]; then
+      # Avoid recursion when start-local-bridge ensures this daemon
+      SIGNAL_WATCHDOG_SKIP_DAEMON_ENSURE=1 "$START" >>"$LOG" 2>&1 \
+        || dlog "ERROR: start-local-bridge failed ($reason)"
+    else
+      dlog "ERROR: start-local-bridge.sh missing"
+    fi
+  fi
+
+  if ! curl -fsS -m 3 "$HEALTH_URL" >/dev/null 2>&1; then
+    dlog "WARN: $HEALTH_URL not reachable"
+  fi
+
+  now=$(date +%s)
+  if (( now - last_heartbeat >= HEARTBEAT_SECS )); then
+    d=0; b=0
+    daemon_ok && d=1
+    bridge_ok && b=1
+    dlog "heartbeat daemon=$d bridge=$b sock=$([[ -S $ROOT/signal.sock ]] && echo 1 || echo 0) pid=$$"
+    last_heartbeat=$now
+  fi
+
+  sleep "$SLEEP_SECS"
+done

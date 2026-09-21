@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Thin one-shot: ensure standing signal-watchdog-daemon + daemon/bridge are up.
+# Normal recovery is the daemon loop; Grok Bot routine is optional backup only.
+set -u
+export PATH="$HOME/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/lib/jvm/java-21-openjdk-amd64/lib/server:/usr/lib/jvm/java-21-openjdk-amd64/lib:${LD_LIBRARY_PATH:-}"
+ROOT="${SIGNAL_ROOT:-$HOME/signal}"
+PIDFILE="${SIGNAL_WATCHDOG_PIDFILE:-$ROOT/logs/watchdog-daemon.pid}"
+DAEMON="$HOME/bin/signal-watchdog-daemon"
+LOG="$HOME/logs/signal-watchdog-daemon.log"
+START="$ROOT/bridge/start-local-bridge.sh"
+mkdir -p "$ROOT/logs" "$HOME/logs" 2>/dev/null || true
+
+daemon_alive() {
+  local pid
+  [[ -f "$PIDFILE" ]] || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  [[ -n "${pid:-}" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'signal-watchdog-daemon'
+}
+
+alive_pidfile() {
+  local pidfile="$1" needle="$2"
+  local pid
+  [[ -f "$pidfile" ]] || return 1
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  [[ -n "${pid:-}" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "$needle"
+}
+
+# 1) Ensure standing daemon looping
+if ! daemon_alive; then
+  if [[ -x "$DAEMON" ]]; then
+    nohup "$DAEMON" >>"$LOG" 2>&1 &
+    disown 2>/dev/null || true
+    sleep 0.5
+  else
+    echo "FAILED: signal-watchdog-daemon missing" >&2
+    exit 1
+  fi
+fi
+
+# 2) Ensure signal-cli + bridge now (don't wait ~45s)
+need_restart=0
+reason=""
+if ! alive_pidfile "$ROOT/logs/daemon.pid" 'signal-cli' || [[ ! -S "$ROOT/signal.sock" ]]; then
+  need_restart=1
+  reason="daemon/socket down"
+fi
+if ! alive_pidfile "$ROOT/logs/bridge.pid" 'signal_local_gateway_bridge.py'; then
+  if ! ps -eo args= | awk '/signal_local_gateway_bridge\.py/ {found=1} END{exit !found}'; then
+    need_restart=1
+    reason="${reason:+$reason; }bridge down"
+  fi
+fi
+
+if [[ "$need_restart" -eq 1 ]]; then
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "$ts watchdog: restarting via start-local-bridge ($reason)" >>"$ROOT/logs/watchdog.log"
+  SIGNAL_WATCHDOG_SKIP_DAEMON_ENSURE=1 "$START" || true
+  echo "restarted ($reason); daemon ensured"
+  exit 0
+fi
+
+echo "healthy (daemon+bridge+watchdog-daemon)"
+exit 0

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Route the bot's agent-browser at the headed desktop sidecar's Chrome over
+# CDP instead of spawning the bundled Chromium. Same role as the old box's
+# ~/bin/agent-browser wrapper, adapted for compose (CDP host `desktop`).
+#
+# The harness spawns this binary through a restricted env (browser-runtime.ts
+# HOST_ENV), so the endpoint is a baked-in default, not compose env: override
+# with OMB_DESKTOP_CDP only for manual runs outside the harness.
+set -euo pipefail
+
+REAL="${OMB_AGENT_BROWSER_REAL:-/usr/local/bin/agent-browser}"
+CDP="${OMB_DESKTOP_CDP:-http://desktop:9229}"
+
+if [[ "$REAL" == "$0" ]]; then
+  echo "agent-browser-omb: OMB_AGENT_BROWSER_REAL points at the wrapper" >&2
+  exit 2
+fi
+
+cdp_up() {
+  python3 -c 'import socket, sys, urllib.parse
+u = urllib.parse.urlparse(sys.argv[1])
+s = socket.socket(); s.settimeout(1.0)
+try:
+    s.connect((u.hostname or "127.0.0.1", u.port or 9229)); s.close()
+except Exception:
+    sys.exit(1)' "$CDP"
+}
+
+session_mgmt=0
+for arg in "$@"; do
+  case "$arg" in
+    close|session|quit|exit) session_mgmt=1; break ;;
+  esac
+done
+
+if [[ "$session_mgmt" -eq 0 ]] && cdp_up; then
+  export AGENT_BROWSER_PIN_TAB="${AGENT_BROWSER_PIN_TAB:-1}"
+  exec "$REAL" --cdp "$CDP" "$@"
+fi
+
+exec "$REAL" "$@"

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Standing background watchdog for wacli bridge/sync.
+# Loops forever; does NOT depend on Grok Bot agent/routine wakes.
+set -u
+
+export WACLI_STORE_DIR="${WACLI_STORE_DIR:-$HOME/.config/wacli}"
+export PATH="$HOME/bin:$PATH"
+
+STORE_DIR="$WACLI_STORE_DIR"
+PIDFILE="${WACLI_WATCHDOG_PIDFILE:-$STORE_DIR/watchdog-daemon.pid}"
+LOG="${WACLI_WATCHDOG_LOG:-$HOME/logs/wacli-watchdog-daemon.log}"
+BRIDGE_ERR="$HOME/logs/wacli-bridge.err"
+SLEEP_SECS="${WACLI_WATCHDOG_SLEEP:-45}"
+HEARTBEAT_SECS=$((30 * 60))
+HEALTH_URL="http://127.0.0.1:8800/health"
+
+mkdir -p "$STORE_DIR" "$HOME/logs" 2>/dev/null || true
+
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+dlog() {
+  echo "$(ts) $*" >>"$LOG"
+}
+
+bridge_pids() {
+  pgrep -f "[p]ython3 $HOME/bin/wacli-event-bridge.py" 2>/dev/null || true
+}
+
+already_running() {
+  local pid
+  [[ -f "$PIDFILE" ]] || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  [[ -n "${pid:-}" ]] || return 1
+  if kill -0 "$pid" 2>/dev/null; then
+    if [[ -r "/proc/$pid/cmdline" ]] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'wacli-watchdog-daemon'; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+if already_running; then
+  exit 0
+fi
+
+echo $$ >"$PIDFILE"
+cleanup() { rm -f "$PIDFILE" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
+dlog "daemon started pid=$$ sleep=${SLEEP_SECS}s"
+
+last_heartbeat=$(date +%s)
+
+while true; do
+  need_restart=0
+  reason=""
+
+  mapfile -t _bridges < <(bridge_pids)
+  bcount=${#_bridges[@]}
+
+  if [[ "$bcount" -eq 0 ]]; then
+    need_restart=1
+    reason="bridge missing"
+  elif [[ "$bcount" -gt 1 ]]; then
+    # Duplicate bridges cause double WhatsApp wakes — keep oldest, kill extras
+    dlog "duplicate bridges (${bcount}): keep ${_bridges[0]}, kill rest"
+    echo "$(ts) watchdog-daemon: killing duplicate bridges keep=${_bridges[0]}" >>"$BRIDGE_ERR"
+    for ((i=1; i<bcount; i++)); do
+      kill "${_bridges[$i]}" 2>/dev/null || true
+    done
+    sleep 0.5
+  elif ! pgrep -f "$HOME/bin/wacli sync --follow" >/dev/null 2>&1; then
+    need_restart=1
+    reason="sync missing"
+  fi
+
+  if [[ "$need_restart" -eq 1 ]]; then
+    echo "$(ts) watchdog-daemon: restarting via wacli-sync-start ($reason)" >>"$BRIDGE_ERR"
+    dlog "restarting via wacli-sync-start ($reason)"
+    if [[ -x "$HOME/bin/wacli-sync-start" ]]; then
+      WACLI_WATCHDOG_SKIP_DAEMON_ENSURE=1 "$HOME/bin/wacli-sync-start" >>"$LOG" 2>&1 || dlog "ERROR: wacli-sync-start failed ($reason)"
+    else
+      dlog "ERROR: wacli-sync-start missing or not executable"
+    fi
+  fi
+
+  if ! curl -fsS -m 3 "$HEALTH_URL" >/dev/null 2>&1; then
+    dlog "WARN: $HEALTH_URL not reachable"
+  fi
+
+  now=$(date +%s)
+  if (( now - last_heartbeat >= HEARTBEAT_SECS )); then
+    bridge_ok=0
+    sync_ok=0
+    mapfile -t _hb < <(bridge_pids)
+    [[ ${#_hb[@]} -eq 1 ]] && bridge_ok=1
+    pgrep -f "$HOME/bin/wacli sync --follow" >/dev/null 2>&1 && sync_ok=1
+    dlog "heartbeat bridge=$bridge_ok sync=$sync_ok bridges=${#_hb[@]} pid=$$"
+    last_heartbeat=$now
+  fi
+
+  sleep "$SLEEP_SECS"
+done

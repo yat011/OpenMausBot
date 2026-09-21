@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+export WACLI_STORE_DIR="${WACLI_STORE_DIR:-$HOME/.config/wacli}"
+export PATH="$HOME/bin:$PATH"
+exec wacli "$@"

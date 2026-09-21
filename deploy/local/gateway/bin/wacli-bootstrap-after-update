@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Restore WhatsApp local-gateway wake path after a computer Update.
+# Wake target: OpenMausBot 私人AI via loopback webhook :8800 (not Grok :1340).
+set -uo pipefail
+
+export WACLI_STORE_DIR="${WACLI_STORE_DIR:-$HOME/.config/wacli}"
+export PATH="$HOME/bin:$PATH"
+
+fail() {
+  echo "FAILED: $*" >&2
+  exit 1
+}
+
+step() {
+  echo "==> $*"
+}
+
+step "check wacli binary"
+if ! command -v wacli >/dev/null 2>&1 && [[ ! -x "$HOME/bin/wacli" ]]; then
+  fail "wacli binary missing under PATH/HOME/bin. Reinstall the wacli binary from your private backup or install source before re-running this script. (No download URL is provided here.)"
+fi
+if [[ ! -x "$HOME/bin/wacli" ]] && ! command -v wacli >/dev/null 2>&1; then
+  fail "wacli is not executable. Reinstall the binary, then re-run."
+fi
+echo "ok: wacli present ($(command -v wacli 2>/dev/null || echo "$HOME/bin/wacli"))"
+
+step "ensure directories"
+mkdir -p "$HOME/.config/wacli/inbox-spool/done" "$HOME/logs" || fail "could not create ~/.config/wacli/inbox-spool/done or ~/logs"
+echo "ok: dirs ready"
+
+step "verify OpenMausBot webhook env"
+if [[ ! -f "$WACLI_STORE_DIR/openmaus-webhook.env" ]]; then
+  fail "$WACLI_STORE_DIR/openmaus-webhook.env missing (needed for local wake; do not invent tokens)"
+fi
+echo "ok: openmaus-webhook.env present"
+
+step "start event-bridge via wacli-sync-start"
+if [[ ! -x "$HOME/bin/wacli-sync-start" ]]; then
+  fail "~/bin/wacli-sync-start missing or not executable"
+fi
+"$HOME/bin/wacli-sync-start" || fail "wacli-sync-start exited non-zero"
+echo "ok: wacli-sync-start ran"
+
+step "health check localhost:8800 (loopback only)"
+# Brief wait for OpenMausBot webhook receiver / bridge settle
+sleep 1
+health_out=""
+if ! health_out="$(curl -fsS -m 5 http://127.0.0.1:8800/health 2>&1)"; then
+  fail "curl http://127.0.0.1:8800/health failed — OpenMausBot webhook receiver not reachable on loopback. Output: $health_out"
+fi
+echo "ok: health => ${health_out}"
+
+echo
+echo "healthy"
+exit 0

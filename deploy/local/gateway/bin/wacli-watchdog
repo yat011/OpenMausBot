@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Thin one-shot: ensure standing watchdog-daemon + bridge/sync are up.
+set -u
+export WACLI_STORE_DIR="${WACLI_STORE_DIR:-$HOME/.config/wacli}"
+export PATH="$HOME/bin:$PATH"
+mkdir -p "$HOME/logs" "$WACLI_STORE_DIR" 2>/dev/null || true
+
+PIDFILE="${WACLI_WATCHDOG_PIDFILE:-$WACLI_STORE_DIR/watchdog-daemon.pid}"
+DAEMON="$HOME/bin/wacli-watchdog-daemon"
+LOG="$HOME/logs/wacli-watchdog-daemon.log"
+
+bridge_pids() {
+  pgrep -f "[p]ython3 $HOME/bin/wacli-event-bridge.py" 2>/dev/null || true
+}
+
+daemon_alive() {
+  local pid
+  [[ -f "$PIDFILE" ]] || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  [[ -n "${pid:-}" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'wacli-watchdog-daemon'
+}
+
+if ! daemon_alive; then
+  if [[ -x "$DAEMON" ]]; then
+    nohup "$DAEMON" >>"$LOG" 2>&1 9>&- &
+    disown 2>/dev/null || true
+    sleep 0.5
+  else
+    echo "FAILED: wacli-watchdog-daemon missing" >&2
+    exit 1
+  fi
+fi
+
+need_restart=0
+reason=""
+mapfile -t _bridges < <(bridge_pids)
+bcount=${#_bridges[@]}
+if [[ "$bcount" -eq 0 ]]; then
+  need_restart=1
+  reason="bridge missing"
+elif [[ "$bcount" -gt 1 ]]; then
+  need_restart=1
+  reason="duplicate bridges ($bcount)"
+elif ! pgrep -f "$HOME/bin/wacli sync --follow" >/dev/null 2>&1; then
+  need_restart=1
+  reason="sync missing"
+fi
+
+if [[ "$need_restart" -eq 1 ]]; then
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "$ts watchdog: restarting via wacli-sync-start ($reason)" >>"$HOME/logs/wacli-bridge.err"
+  "$HOME/bin/wacli-sync-start"
+  echo "restarted ($reason); daemon ensured"
+  exit 0
+fi
+
+echo "healthy (daemon+bridge+sync)"

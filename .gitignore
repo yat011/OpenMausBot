@@ -40,3 +40,8 @@ deploy/podman/.env
 deploy/podman/.env.*
 !deploy/podman/.env.example
 /.env
+# ty-desktop local-deploy binaries (see deploy/local/TY-DESKTOP.md):
+# place beside this file on the build host, never commit.
+/deploy/local/muse-linux/
+/deploy/local/gateway/bin/wacli
+/deploy/local/gateway/signal-bin/

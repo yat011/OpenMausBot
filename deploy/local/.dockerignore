@@ -1,2 +1,8 @@
 *
 !Dockerfile
+!muse-linux/
+!muse-linux/**
+!gateway/
+!gateway/**
+!browser/
+!browser/**

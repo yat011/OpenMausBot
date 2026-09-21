@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export WACLI_STORE_DIR="${WACLI_STORE_DIR:-$HOME/.config/wacli}"
+export PATH="$HOME/bin:$PATH"
+mkdir -p "$HOME/logs" "$WACLI_STORE_DIR"
+
+LOCKFILE="$WACLI_STORE_DIR/sync-start.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  echo "another wacli-sync-start in progress; skipping"
+  exit 0
+fi
+
+bridge_pids() {
+  # Match real python bridge only (not this shell / pgrep query text)
+  pgrep -f "[p]ython3 $HOME/bin/wacli-event-bridge.py" 2>/dev/null || true
+}
+
+# If exactly one healthy bridge already running, leave it alone
+mapfile -t _bridges < <(bridge_pids)
+if [[ ${#_bridges[@]} -eq 1 ]]; then
+  if pgrep -f "$HOME/bin/wacli sync --follow" >/dev/null 2>&1; then
+    echo "event-bridge already running pid ${_bridges[0]} (sync ok); skip restart"
+    # still ensure watchdog below
+  else
+    echo "event-bridge pid ${_bridges[0]} but sync missing; restarting"
+    pkill -f "[p]ython3 $HOME/bin/wacli-event-bridge.py" 2>/dev/null || true
+    pkill -f "$HOME/bin/wacli sync --follow" 2>/dev/null || true
+    sleep 1
+  fi
+fi
+
+# Re-check after possible skip path
+mapfile -t _bridges < <(bridge_pids)
+if [[ ${#_bridges[@]} -eq 1 ]] && pgrep -f "$HOME/bin/wacli sync --follow" >/dev/null 2>&1; then
+  :
+else
+  # Stop old sync / bridge (may be zero or many)
+  pkill -f "$HOME/bin/wacli sync --follow" 2>/dev/null || true
+  pkill -f "[p]ython3 $HOME/bin/wacli-event-bridge.py" 2>/dev/null || true
+  sleep 1
+  # Extra kill if duplicates lingered
+  mapfile -t _left < <(bridge_pids)
+  if [[ ${#_left[@]} -gt 0 ]]; then
+    kill -9 "${_left[@]}" 2>/dev/null || true
+    sleep 0.5
+  fi
+
+  nohup python3 "$HOME/bin/wacli-event-bridge.py" >>"$HOME/logs/wacli-bridge.out" 2>>"$HOME/logs/wacli-bridge.err" 9>&- &
+  disown 2>/dev/null || true
+  echo "started event-bridge pid $!"
+fi
+
+# Ensure standing watchdog-daemon is up (unless we were called FROM the daemon)
+ensure_watchdog_daemon() {
+  [[ "${WACLI_WATCHDOG_SKIP_DAEMON_ENSURE:-0}" == "1" ]] && return 0
+  local pidfile="${WACLI_WATCHDOG_PIDFILE:-$WACLI_STORE_DIR/watchdog-daemon.pid}"
+  local daemon="$HOME/bin/wacli-watchdog-daemon"
+  local log="$HOME/logs/wacli-watchdog-daemon.log"
+  [[ -x "$daemon" ]] || return 0
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+      if [[ -r "/proc/$pid/cmdline" ]] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'wacli-watchdog-daemon'; then
+        echo "watchdog-daemon already running pid $pid"
+        return 0
+      fi
+    fi
+  fi
+  nohup "$daemon" >>"$log" 2>&1 9>&- &
+  disown 2>/dev/null || true
+  sleep 0.3
+  echo "started watchdog-daemon (ensure)"
+}
+ensure_watchdog_daemon
