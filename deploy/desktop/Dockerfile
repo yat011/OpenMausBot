@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CHROME_PROFILE=/profile
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl gnupg \
+  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
   && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/google.pub https://dl.google.com/linux/linux_signing_key.pub \
   && test -s /tmp/google.pub \
   && gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg /tmp/google.pub \
