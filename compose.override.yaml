@@ -5,9 +5,11 @@ services:
       OMB_AUTO_CONFIRM_ROUTINES: "1"
       OMB_AUTO_CONFIRM_PROFILES: "1"
       OMB_AUTO_CONFIRM_SKILLS: "1"
-      OMB_AGENT_BROWSER_PATH: "/usr/local/bin/agent-browser-omb"
+      OMB_AGENT_BROWSER_PATH: "/src/deploy/local/browser/agent-browser-omb"
       OMB_STATIC_DIR: "/src/dist"
       OMB_SRC_DIR: "/src"
+    # Boot from the mounted repo copy so boot-logic updates are git-only.
+    command: ["/src/deploy/local/repo-start.sh"]
     volumes:
       # Fork repo (host checkout) -> the server boots from it; updates are
       # git pull + restart, no image rebuild.

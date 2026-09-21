@@ -54,9 +54,10 @@ docker compose restart omb
 bot from inside itself: `git pull` in `/src`, then exit the server process --
 `restart: unless-stopped` boots the new tree automatically.
 
-Rebuild `openmausbot-local` only when this directory's runtime files change
-(Dockerfile, repo-start.sh, gateway/, browser/, muse-linux/). Rebuild
-`openmausbot-desktop` only when `../desktop/` changes.
+Rebuild `openmausbot-local` only when the baked runtime files change
+(Dockerfile, gateway/, muse-linux/). `repo-start.sh` and `browser/` run from
+the mount, so they update with `git pull`. Rebuild `openmausbot-desktop`
+only when `../desktop/` changes.
 
 Recreate rule: desktop and caddy share omb's network namespace, so after an
 omb image rebuild, recreate the whole stack (`docker compose down &&
