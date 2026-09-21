@@ -8,9 +8,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CHROME_PROFILE=/profile
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends wget gnupg \
-  && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
-    | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+  && apt-get install -y --no-install-recommends curl gnupg \
+  && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/google.pub https://dl.google.com/linux/linux_signing_key.pub \
+  && test -s /tmp/google.pub \
+  && gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg /tmp/google.pub \
+  && rm /tmp/google.pub \
   && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
     > /etc/apt/sources.list.d/google-chrome.list \
   && apt-get update \
