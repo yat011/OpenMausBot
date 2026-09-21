@@ -58,6 +58,12 @@ Rebuild `openmausbot-local` only when this directory's runtime files change
 (Dockerfile, repo-start.sh, gateway/, browser/, muse-linux/). Rebuild
 `openmausbot-desktop` only when `../desktop/` changes.
 
+Recreate rule: desktop and caddy share omb's network namespace, so after an
+omb image rebuild, recreate the whole stack (`docker compose down &&
+docker compose up -d`) -- recreating omb alone orphans them. Plain
+`docker compose restart omb` (the code-update path) keeps the container and
+its network, so it is always safe.
+
 ## Binaries (git-ignored, on the build host only)
 
 | Path (under `deploy/local/`) | Contents | Source |
