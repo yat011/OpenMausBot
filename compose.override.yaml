@@ -1,5 +1,6 @@
 services:
   omb:
+    restart: always
     environment:
       OMB_YOLO: "1"
       OMB_AUTO_CONFIRM_ROUTINES: "1"
@@ -41,7 +42,7 @@ services:
     # --remote-debugging-address and binds CDP to loopback only, so omb must
     # reach it as 127.0.0.1:9229. Ports are published on omb instead.
     network_mode: service:omb
-    restart: unless-stopped
+    restart: always
     shm_size: "2gb"
     volumes:
       - chrome-profile:/profile
@@ -51,6 +52,8 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 12
+  caddy:
+    restart: always
 volumes:
   omb-node-modules:
   chrome-profile:
