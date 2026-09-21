@@ -40,6 +40,9 @@ deploy/podman/.env
 deploy/podman/.env.*
 !deploy/podman/.env.example
 /.env
+# pnpm content store must live on a Linux volume (see repo-start.sh);
+# never commit it if one lands in the checkout.
+/.pnpm-store/
 # ty-desktop local-deploy binaries (see deploy/local/TY-DESKTOP.md):
 # place beside this file on the build host, never commit.
 /deploy/local/muse-linux/

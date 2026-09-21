@@ -17,7 +17,8 @@ mkdir -p "$STATE_DIR"
 sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
 # --- dependencies (node_modules lives on a Linux volume: pnpm symlinks
-# cannot live on the Windows bind mount) ---
+# cannot live on the Windows bind mount; same for the content store) ---
+pnpm config set store-dir /data/.pnpm-store --global >/dev/null 2>&1 || true
 LOCK_FP="$STATE_DIR/pnpm-lock.sha"
 if [ ! -d "$SRC/node_modules" ] || [ "$(sha_of pnpm-lock.yaml)" != "$(cat "$LOCK_FP" 2>/dev/null)" ]; then
   echo "repo-start: installing dependencies"
@@ -25,10 +26,12 @@ if [ ! -d "$SRC/node_modules" ] || [ "$(sha_of pnpm-lock.yaml)" != "$(cat "$LOCK
   sha_of pnpm-lock.yaml > "$LOCK_FP"
 fi
 
-# --- build fingerprint: git tree, else newest-source mtime ---
+# --- build fingerprint: committed + dirty state of the build inputs only,
+# so doc-only pulls skip the rebuild (mtime fallback without git) ---
+CODE_PATHS="server src shared scripts index.html public vite.config.ts package.json pnpm-lock.yaml tsconfig.json tsconfig.server.json tsconfig.server.build.json tsconfig.companion.build.json"
 fingerprint() {
   if git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1; then
-    echo "git $(git -C "$SRC" rev-parse HEAD) $(git -C "$SRC" status --porcelain | sha256sum | cut -d' ' -f1)"
+    { git -C "$SRC" ls-tree -r HEAD -- $CODE_PATHS 2>/dev/null; git -C "$SRC" status --porcelain -- $CODE_PATHS; } | sha256sum | cut -d' ' -f1
   else
     echo "mtime $(find "$SRC/server" "$SRC/src" "$SRC/shared" "$SRC/scripts" "$SRC/package.json" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1)"
   fi

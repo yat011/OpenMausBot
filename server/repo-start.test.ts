@@ -88,13 +88,34 @@ describe.skipIf(!posix)("repo-start boot script", () => {
       writeFileSync(fx.pnpmLog, "");
       const out = await run(fx.env);
       expect(out).toContain("NODE_EXEC");
-      expect(execFileSync("wc", ["-c", fx.pnpmLog], { encoding: "utf8" }).trim()).toMatch(/^0\b/);
+      const idle = execFileSync("cat", [fx.pnpmLog], { encoding: "utf8" });
+      expect(idle).not.toContain("install");
+      expect(idle).not.toContain("build:server");
     } finally {
       removeTempDir(fx.dir);
     }
   });
 
   it("rebuilds on a new commit but does not reinstall", async () => {
+    const fx = setup();
+    try {
+      git("one", fx.src, fx.env);
+      await run(fx.env);
+      mkdirSync(join(fx.src, "server"), { recursive: true });
+      writeFileSync(join(fx.src, "server", "two.ts"), "export const two = 2;\n");
+      execFileSync("git", ["add", "-A"], { cwd: fx.src, env: fx.env });
+      execFileSync("git", ["commit", "-qm", "two"], { cwd: fx.src, env: fx.env });
+      writeFileSync(fx.pnpmLog, "");
+      await run(fx.env);
+      const log = execFileSync("cat", [fx.pnpmLog], { encoding: "utf8" });
+      expect(log).not.toContain("install");
+      expect(log).toContain("build:server");
+    } finally {
+      removeTempDir(fx.dir);
+    }
+  });
+
+  it("skips the rebuild when only docs changed", async () => {
     const fx = setup();
     try {
       git("one", fx.src, fx.env);
@@ -106,7 +127,7 @@ describe.skipIf(!posix)("repo-start boot script", () => {
       await run(fx.env);
       const log = execFileSync("cat", [fx.pnpmLog], { encoding: "utf8" });
       expect(log).not.toContain("install");
-      expect(log).toContain("build:server");
+      expect(log).not.toContain("build:server");
     } finally {
       removeTempDir(fx.dir);
     }
