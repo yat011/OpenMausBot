@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { canPairDevices, lastSeen, minutesLeft, pairingBlockedReason, ServerPairingCard } from "./ServerPairingCard";
+import { canPairDevices, lastSeen, minutesLeft, pairingBlockedReason, pairingQrValue, ServerPairingCard } from "./ServerPairingCard";
 
 describe("pairing devices from a hosted server's settings", () => {
   it("is offered to the owner on the box and to admin sessions, never to chat-only sessions", () => {
@@ -23,6 +23,16 @@ describe("pairing devices from a hosted server's settings", () => {
     expect(lastSeen(0, 3 * 60_000)).toBe("3 min ago");
     expect(lastSeen(0, 5 * 3_600_000)).toBe("5 h ago");
     expect(lastSeen(0, 3 * 86_400_000)).toBe("3 d ago");
+  });
+
+  it("encodes the native-app invite in the QR, falling back to the web link", () => {
+    const base = { id: "p", code: "123456", expiresAt: 1, hint: null };
+    expect(pairingQrValue({ ...base, url: "https://box.example/pair#code=123456", inviteUrl: "openmausbot://pair?address=https%3A%2F%2Fbox.example&token=omb_pair_x" })).toBe(
+      "openmausbot://pair?address=https%3A%2F%2Fbox.example&token=omb_pair_x",
+    );
+    // older servers send no invite: the web link still scans for browsers
+    expect(pairingQrValue({ ...base, url: "https://box.example/pair#code=123456" })).toBe("https://box.example/pair#code=123456");
+    expect(pairingQrValue({ ...base, url: null, inviteUrl: null })).toBeNull();
   });
 
   it("renders nothing until it knows who is asking", () => {

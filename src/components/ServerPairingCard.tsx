@@ -13,7 +13,15 @@ export interface PairingOffer {
   code: string;
   expiresAt: number;
   url: string | null;
+  inviteUrl?: string | null;
   hint: string | null;
+}
+
+/** The QR must scan in the native companion apps, which only accept the
+ * `openmausbot://pair` invite; the https `url` stays on screen for browsers
+ * and paste-into-app. Older servers send no invite: fall back to the url. */
+export function pairingQrValue(offer: PairingOffer): string | null {
+  return offer.inviteUrl ?? offer.url;
 }
 
 export interface PairedDevice {
@@ -110,6 +118,7 @@ export function ServerPairingCard({ initialSession = null, initialPairingCodes =
     );
   }
   const expired = offer ? offer.expiresAt <= now : false;
+  const qrValue = offer ? pairingQrValue(offer) : null;
 
   async function create() {
     setBusy(true);
@@ -167,9 +176,9 @@ export function ServerPairingCard({ initialSession = null, initialPairingCodes =
             <p className="text-[13px] text-ink-secondary">{t("remote.serverPairing.expired")}</p>
           ) : (
             <div className="flex flex-wrap items-start gap-5">
-              {offer.url ? (
+              {qrValue ? (
                 <div className="rounded-md bg-white p-2">
-                  <QRCodeSVG value={offer.url} size={160} level="M" bgColor="#ffffff" fgColor="#111111" />
+                  <QRCodeSVG value={qrValue} size={160} level="M" bgColor="#ffffff" fgColor="#111111" />
                 </div>
               ) : null}
               <div className="min-w-[200px] flex-1">
