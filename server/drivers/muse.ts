@@ -295,6 +295,84 @@ export function museSafetyArgs(approval: string): string[] {
   return approval === "never" ? ["--yolo"] : ["--approval-mode", approval];
 }
 
+/** Token window for `OMB_MUSE_AUTOCOMPACT`, mirroring the Claude driver's
+ * `--autocompact` default: compact the native session once it approaches
+ * this size, so a long thread stops re-reading its whole past every turn.
+ * The Muse CLI takes the threshold as a fraction of the model context, so
+ * the window below is converted per model (200k of a ~1M window ≈ 0.2). */
+export const DEFAULT_MUSE_AUTOCOMPACT_TOKENS = 200_000;
+const MIN_MUSE_AUTOCOMPACT_TOKENS = 100_000;
+const MAX_MUSE_AUTOCOMPACT_TOKENS = 1_000_000;
+const FALLBACK_CONTEXT_WINDOW = 1_007_997;
+
+/** Token window from the environment, or null when the CLI should decide
+ * (`"auto"`) or compaction is off. Mirrors `autoCompactWindow` semantics:
+ * a number names the window, anything unparsable falls back to the
+ * default, and the window is clamped rather than passed through. */
+export function museAutoCompactTokens(env: Record<string, string | undefined>): number | null {
+  const raw = (env.OMB_MUSE_AUTOCOMPACT ?? "").trim().toLowerCase();
+  if (raw === "off" || raw === "auto") return null;
+  const parsed = raw ? Number(raw) : DEFAULT_MUSE_AUTOCOMPACT_TOKENS;
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MUSE_AUTOCOMPACT_TOKENS;
+  return Math.min(MAX_MUSE_AUTOCOMPACT_TOKENS, Math.max(MIN_MUSE_AUTOCOMPACT_TOKENS, Math.floor(parsed)));
+}
+
+/** `--context-compaction-hard-threshold` value for this turn: the window as
+ * a fraction of the model's context, or null when no flag should ride. */
+export function museCompactionThreshold(
+  env: Record<string, string | undefined>,
+  contextWindow: number,
+): string | null {
+  const tokens = museAutoCompactTokens(env);
+  if (tokens === null) return null;
+  const window = Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : FALLBACK_CONTEXT_WINDOW;
+  return String(Math.round((tokens / window) * 1000) / 1000);
+}
+
+/** Soft starts this far below the hard stop. Muse 1.3.0 rejects the run
+ * unless soft < hard, both fractions, and its built-in soft default is
+ * 0.75 — below a 200k window (~0.2 of a 1M context) that default makes
+ * every turn exit 2. */
+const MUSE_SOFT_FRACTION_OF_HARD = 0.8;
+
+export interface MuseCompactionBounds {
+  soft: string;
+  hard: string;
+}
+
+/** Soft/hard pair the CLI will accept. The token window stays the hard
+ * stop; soft leads it so compaction starts as the session approaches that
+ * window. Hard is clamped into (0, 1], which is the range `muse exec` allows. */
+export function museCompactionBounds(
+  env: Record<string, string | undefined>,
+  contextWindow: number,
+): MuseCompactionBounds | null {
+  const hardText = museCompactionThreshold(env, contextWindow);
+  if (hardText === null) return null;
+  const parsed = Number(hardText);
+  if (!Number.isFinite(parsed)) return null;
+  const hard = Math.min(1, Math.max(0.002, parsed));
+  let soft = Math.round(hard * MUSE_SOFT_FRACTION_OF_HARD * 1000) / 1000;
+  if (!(soft > 0 && soft < hard)) soft = Math.round((hard - 0.001) * 1000) / 1000;
+  return { soft: String(soft), hard: String(hard) };
+}
+
+/** The oldest CLI verified to accept `--context-compaction-hard-threshold`
+ * (checked against `muse exec --help` on 1.3.0, the version pinned in this
+ * image). An unknown flag is a hard argument error, so older CLIs get no
+ * flag at all rather than a turn that fails the same way every time. */
+export const MUSE_COMPACTION_MIN_VERSION = [1, 3, 0] as const;
+
+export function museCliSupportsCompaction(version: string | null | undefined): boolean {
+  const match = /(\d+)\.(\d+)\.(\d+)/.exec(version ?? "");
+  if (!match) return false;
+  const [, major, minor, patch] = match.map(Number);
+  const [minMajor, minMinor, minPatch] = MUSE_COMPACTION_MIN_VERSION;
+  if (major !== minMajor) return major > minMajor;
+  if (minor !== minMinor) return minor > minMinor;
+  return patch >= minPatch;
+}
+
 export interface MuseExecOpts {
   provider: string;
   approval: string;
@@ -305,6 +383,7 @@ export interface MuseExecOpts {
   workspace?: string;
   images?: string[];
   promptFile: string;
+  compaction?: MuseCompactionBounds | null;
 }
 
 /** argv after the binary for `muse exec --json`. Exported so contract tests
@@ -322,6 +401,14 @@ export function buildMuseExecArgs(opts: MuseExecOpts): string[] {
     ...(opts.baseUrl ? ["--base-url", opts.baseUrl] : []),
     ...(opts.workspace ? ["--workspace", opts.workspace] : []),
     ...(opts.images ?? []).flatMap((image) => ["--image", image]),
+    ...(opts.compaction
+      ? [
+          "--context-compaction-soft-threshold",
+          opts.compaction.soft,
+          "--context-compaction-hard-threshold",
+          opts.compaction.hard,
+        ]
+      : []),
     "--prompt-file",
     opts.promptFile,
   ];
@@ -413,6 +500,10 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
     const models: ModelCatalog = { default: "", options: [] };
     const syncModels = () => applyCatalog(models, resolveMuseModels(childEnv()));
     syncModels();
+    // One `--version` probe per instance: the compaction flags below are a
+    // hard error on CLIs that predate them, so turns on an old CLI omit
+    // them instead of failing identically every time.
+    const compactionSupported = museCliSupportsCompaction(await museVersion(config.cli, childEnv()));
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const env = childEnv();
@@ -454,7 +545,8 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
           }
         };
         const env = childEnv();
-        const model = museModelOrDefault(turn.model || config.model || undefined, resolveMuseModels(env));
+        const catalog = resolveMuseModels(env);
+        const model = museModelOrDefault(turn.model || config.model || undefined, catalog);
         const mounts = museMcpMountsFromTurn(turn);
         if (mounts) {
           try {
@@ -476,6 +568,12 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
           workspace: turn.cwd,
           images: turn.images?.map((image) => image.path),
           promptFile,
+          compaction: compactionSupported
+            ? museCompactionBounds(
+                env,
+                catalog.options.find((option) => option.id === model)?.contextWindow ?? FALLBACK_CONTEXT_WINDOW,
+              )
+            : null,
         });
         appendNative(threadId, { dir: "out", source: "muse.exec", msg: { argv: [config.cli, ...args], model } });
         let child;
@@ -568,7 +666,16 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
         child.on("close", (code, signal) => {
           if (settled) return;
           flushAssistantText();
-          const detail = stderr.trim().split(/\r?\n/).slice(-3).join(" ").slice(0, 500);
+          // The CLI prints the real error first, then a full help page.
+          // The tail of that page is flag documentation, which is what a
+          // rejected compaction pair used to surface as the turn error.
+          const detail = stderr
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .slice(0, 2)
+            .join(" ")
+            .slice(0, 500);
           if (code === 0) {
             // Clean exit with no terminal record (a killed-early run): the
             // flushed stream is the whole answer.

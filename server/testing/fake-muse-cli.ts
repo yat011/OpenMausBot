@@ -21,9 +21,11 @@ const mode = process.env.FAKE_MUSE_MODE ?? "happy";
 const text = process.env.FAKE_MUSE_TEXT ?? "Hello from Muse";
 const argv = process.argv.slice(2);
 
-// The driver probes `<cli> --version` for snapshot(); answer and exit clean.
+// The driver probes `<cli> --version` for snapshot() and the compaction
+// gate; answer and exit clean. FAKE_MUSE_VERSION overrides the reported
+// version (default "1.1.1", which predates the compaction flags).
 if (argv.includes("--version") || argv.includes("-v")) {
-  process.stdout.write("Muse Code 1.1.1 (fake)\n");
+  process.stdout.write(`Muse Code ${process.env.FAKE_MUSE_VERSION ?? "1.1.1"} (fake)\n`);
   process.exit(0);
 }
 

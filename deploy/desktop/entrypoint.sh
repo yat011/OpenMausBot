@@ -13,6 +13,11 @@ PROFILE="${CHROME_PROFILE:-/profile}"
 mkdir -p /tmp/.X11-unix "$PROFILE"
 chmod 1777 /tmp/.X11-unix
 
+# /tmp survives `docker restart` (the writable layer is kept). Xvfb then
+# reads the previous lock, finds that PID reused by a new process, and
+# refuses display :7. This container owns :7 and nothing is serving it yet.
+rm -f /tmp/.X7-lock /tmp/.X11-unix/X7
+
 cleanup() {
   kill "${CHROME_PID:-}" "${NOVNC_PID:-}" "${VNC_PID:-}" "${WM_PID:-}" "${XVFB_PID:-}" 2>/dev/null || true
 }

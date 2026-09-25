@@ -13,7 +13,7 @@ import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { buildMuseExecArgs, buildMuseSettingsWithMcp, loadMuseCatalog, MuseDriver, parseMuseLine, type MuseConfig } from "./muse.ts";
+import { buildMuseExecArgs, buildMuseSettingsWithMcp, loadMuseCatalog, museCliSupportsCompaction, museCompactionBounds, museCompactionThreshold, MuseDriver, parseMuseLine, type MuseConfig } from "./muse.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-muse-cli.ts");
 
@@ -62,7 +62,7 @@ describe("MuseDriver turns (fake CLI)", () => {
     scratch = mkdtempSync(join(tmpdir(), "omb-muse-test-"));
     dump = join(scratch, "dump.jsonl");
     savedEnv = {};
-    for (const key of ["FAKE_MUSE_MODE", "FAKE_MUSE_DUMP", "FAKE_MUSE_TEXT", "FAKE_MUSE_DEAD_SESSION", "META_API_KEY", "XDG_CONFIG_HOME"]) {
+    for (const key of ["FAKE_MUSE_MODE", "FAKE_MUSE_DUMP", "FAKE_MUSE_TEXT", "FAKE_MUSE_DEAD_SESSION", "FAKE_MUSE_VERSION", "OMB_MUSE_AUTOCOMPACT", "META_API_KEY", "XDG_CONFIG_HOME"]) {
       savedEnv[key] = process.env[key];
       delete process.env[key];
     }
@@ -336,6 +336,33 @@ describe("MuseDriver turns (fake CLI)", () => {
     expect(MuseDriver.decodeConfig({})).toEqual({ cli: "muse", provider: "meta", model: "", baseUrl: "" });
     expect(MuseDriver.models.default).toBe("muse-spark-1.2");
   });
+
+  it("omits compaction flags on a CLI that predates them", async () => {
+    await create();
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-compact-old", text: "go" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const launches = readDump(dump);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]?.argv).not.toContain("--context-compaction-soft-threshold");
+    expect(launches[0]?.argv).not.toContain("--context-compaction-hard-threshold");
+  });
+
+  it("rides the compaction threshold onto every turn on a new CLI", async () => {
+    process.env.FAKE_MUSE_VERSION = "1.3.0";
+    await create();
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-compact-new", text: "go" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const launches = readDump(dump);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]?.argv).toEqual(
+      expect.arrayContaining([
+        "--context-compaction-soft-threshold",
+        "0.158",
+        "--context-compaction-hard-threshold",
+        "0.198",
+      ]),
+    );
+  });
 });
 
 describe("muse protocol helpers", () => {
@@ -414,6 +441,66 @@ describe("muse protocol helpers", () => {
       }),
     ).toEqual(["exec", "--json", "--provider", "meta", "--yolo", "--prompt-file", "/tmp/prompt.md"]);
   });
+
+  it("expresses the compaction window as a fraction of the model context", () => {
+    expect(museCompactionThreshold({}, 1_007_997)).toBe("0.198");
+    expect(museCompactionThreshold({ OMB_MUSE_AUTOCOMPACT: "300000" }, 1_007_997)).toBe("0.298");
+    expect(museCompactionThreshold({ OMB_MUSE_AUTOCOMPACT: "nonsense" }, 1_007_997)).toBe("0.198");
+    expect(museCompactionThreshold({ OMB_MUSE_AUTOCOMPACT: "0" }, 1_007_997)).toBe("0.198");
+    expect(museCompactionThreshold({ OMB_MUSE_AUTOCOMPACT: "50000" }, 1_007_997)).toBe("0.099");
+    expect(museCompactionThreshold({ OMB_MUSE_AUTOCOMPACT: "9000000" }, 1_007_997)).toBe("0.992");
+    expect(museCompactionThreshold({ OMB_MUSE_AUTOCOMPACT: "off" }, 1_007_997)).toBeNull();
+    expect(museCompactionThreshold({ OMB_MUSE_AUTOCOMPACT: "auto" }, 1_007_997)).toBeNull();
+  });
+
+  it("keeps the soft compaction threshold strictly below the hard one", () => {
+    // Muse 1.3.0 default soft is 0.75 and exits 2 when hard is lower.
+    expect(museCompactionBounds({}, 1_007_997)).toEqual({ soft: "0.158", hard: "0.198" });
+    expect(museCompactionBounds({ OMB_MUSE_AUTOCOMPACT: "9000000" }, 1_007_997)).toEqual({
+      soft: "0.794",
+      hard: "0.992",
+    });
+    expect(museCompactionBounds({ OMB_MUSE_AUTOCOMPACT: "off" }, 1_007_997)).toBeNull();
+  });
+
+  it("gates compaction flags on CLI versions known to accept them", () => {
+    expect(museCliSupportsCompaction("1.3.0")).toBe(true);
+    expect(museCliSupportsCompaction("1.3.0-R3401.1")).toBe(true);
+    expect(museCliSupportsCompaction("1.4.2")).toBe(true);
+    expect(museCliSupportsCompaction("1.2.1")).toBe(false);
+    expect(museCliSupportsCompaction("1.1.1")).toBe(false);
+    expect(museCliSupportsCompaction(null)).toBe(false);
+    expect(museCliSupportsCompaction("nonsense")).toBe(false);
+  });
+
+  it("adds compaction thresholds only when a pair is given", () => {
+    expect(
+      buildMuseExecArgs({
+        provider: "meta",
+        approval: "on-request",
+        promptFile: "/tmp/prompt.md",
+        compaction: { soft: "0.158", hard: "0.198" },
+      }),
+    ).toEqual([
+      "exec",
+      "--json",
+      "--provider",
+      "meta",
+      "--approval-mode",
+      "on-request",
+      "--context-compaction-soft-threshold",
+      "0.158",
+      "--context-compaction-hard-threshold",
+      "0.198",
+      "--prompt-file",
+      "/tmp/prompt.md",
+    ]);
+    expect(
+      buildMuseExecArgs({ provider: "meta", approval: "on-request", promptFile: "/tmp/prompt.md" }),
+    ).not.toContain("--context-compaction-hard-threshold");
+  });
+
+
 
   it("reads the CLI catalog cache and ignores models the account does not list", async () => {
     const dataHome = mkdtempSync(join(tmpdir(), "omb-muse-catalog-"));
