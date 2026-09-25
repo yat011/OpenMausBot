@@ -14,7 +14,7 @@ export const CREDENTIAL_TARGETS = {
     label: "Box API key",
     description: "Gives bots an isolated cloud computer when Box is selected.",
     placeholder: "Paste your Box API key",
-    helpUrl: "https://docs.ascii.dev/box/api-keys",
+    helpUrl: "https://docs.boat.dev/api-keys",
   },
   opencodeGoApiKey: {
     label: "OpenCode API key",
@@ -27,6 +27,12 @@ export const CREDENTIAL_TARGETS = {
     description: "Enables text-to-speech voices in calls.",
     placeholder: "Paste your ElevenLabs API key",
     helpUrl: "https://elevenlabs.io/app/settings/api-keys",
+  },
+  fishAudioKey: {
+    label: "Fish Audio API key",
+    description: "Enables Fish Audio voices in calls.",
+    placeholder: "Paste your Fish Audio API key",
+    helpUrl: "https://fish.audio/app/api-keys/",
   },
   openaiImageApiKey: {
     label: "OpenAI API key",
@@ -41,7 +47,7 @@ export type CredentialConfig = {
   xai?: { key?: string };
   box?: { token?: string };
   opencodeGo?: { apiKey?: string };
-  tts?: { key?: string };
+  tts?: { key?: string; fishKey?: string };
   imageGen?: { key?: string };
 };
 
@@ -59,6 +65,8 @@ export function credentialConfigPatch(id: CredentialTargetId, value: string): Cr
       return { opencodeGo: { apiKey: value } };
     case "ttsKey":
       return { tts: { key: value } };
+    case "fishAudioKey":
+      return { tts: { fishKey: value } };
     case "openaiImageApiKey":
       return { imageGen: { key: value } };
   }
@@ -74,6 +82,8 @@ export function credentialIsConfigured(config: CredentialConfig, id: CredentialT
       return Boolean(config.opencodeGo?.apiKey);
     case "ttsKey":
       return Boolean(config.tts?.key);
+    case "fishAudioKey":
+      return Boolean(config.tts?.fishKey);
     case "openaiImageApiKey":
       return Boolean(config.imageGen?.key);
   }

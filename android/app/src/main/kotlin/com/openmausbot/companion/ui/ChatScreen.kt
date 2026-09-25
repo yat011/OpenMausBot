@@ -1,5 +1,6 @@
 package com.openmausbot.companion.ui
 
+import android.view.KeyCharacterMap
 import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.foundation.rememberScrollState
@@ -38,13 +39,12 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
@@ -60,7 +60,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -91,7 +90,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -203,10 +201,8 @@ private fun LoadedChat(
 ) {
     // This screen's selected task, independent of the desktop's selection.
     val threadId = chat.threadId
-    // Stable conversation identity — not threadId. iOS keeps `@State draft`
-    // across a task switch inside the same ChatView; keying the draft on
-    // threadId would wipe it.
     val chatId = chat.id
+    val draftKey = chat.threadId
     val environment = LocalCompanion.current
     val session = environment.session
     val dictation = environment.dictation
@@ -251,6 +247,7 @@ private fun LoadedChat(
         }
     }
     var showingTasks by remember { mutableStateOf(false) }
+    var creatingThread by remember(chatId) { mutableStateOf(false) }
     // Saveable: the profile form is a form, and a rotation must not throw away
     // what was typed into it — the sheet has to come back for that to matter.
     var showingProfile by rememberSaveable { mutableStateOf(false) }
@@ -259,13 +256,17 @@ private fun LoadedChat(
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
 
-    // Attachments waiting above the composer, and the flags iOS keeps beside
-    // them. Keyed on the conversation like the draft: a task switch inside the
-    // same chat keeps them, leaving the chat drops them.
-    val attachments = remember(chatId) { mutableStateListOf<PendingMessageAttachment>() }
-    var preparingAttachments by remember(chatId) { mutableStateOf(false) }
-    var sendingMessage by remember(chatId) { mutableStateOf(false) }
-    var attachmentError by remember(chatId) { mutableStateOf<String?>(null) }
+    val attachmentDraft = remember(draftKey, chatDrafts) {
+        chatDrafts.register(chatId, draftKey)
+        chatDrafts.attachments(draftKey)
+    }
+    val attachments = attachmentDraft.items
+    var preparingAttachments by attachmentDraft.preparing
+    var sendingMessage by attachmentDraft.sending
+    var attachmentError by attachmentDraft.error
+    // A notification can change owners while the system picker is open.
+    // Its result still belongs to the draft that launched it.
+    var pickerDraft by remember { mutableStateOf(attachmentDraft) }
     // A bot-linked file on its way from the computer, and where it landed.
     var openingFileName by remember(threadId) { mutableStateOf<String?>(null) }
     var fileOpenError by remember(threadId) { mutableStateOf<String?>(null) }
@@ -289,29 +290,30 @@ private fun LoadedChat(
     }
     val canAddAttachment = AttachmentImportRules.canAdd(attachments.size, preparingAttachments, sendingMessage)
 
-    suspend fun importInto(count: Int, read: suspend (Int, Int) -> PendingMessageAttachment) {
-        if (preparingAttachments || sendingMessage) return
-        if (count > AttachmentPolicy.MAXIMUM_ITEMS - attachments.size) {
-            attachmentError = AttachmentImportRules.TOO_MANY
+    suspend fun importInto(target: ChatDraftHolder.Attachments, count: Int, read: suspend (Int, Int) -> PendingMessageAttachment) {
+        if (target.preparing.value || target.sending.value) return
+        val existing = target.items.toList()
+        if (count > AttachmentPolicy.MAXIMUM_ITEMS - existing.size) {
+            target.error.value = AttachmentImportRules.TOO_MANY
             return
         }
-        preparingAttachments = true
-        attachmentError = null
+        target.preparing.value = true
+        target.error.value = null
         try {
             val imported = mutableListOf<PendingMessageAttachment>()
             for (index in 0 until count) {
-                val remaining = AttachmentImportRules.remainingBytes(attachments + imported)
+                val remaining = AttachmentImportRules.remainingBytes(existing + imported)
                 val candidate = withContext(Dispatchers.IO) { read(index, remaining) }
-                AttachmentPolicy.validate(attachments + imported + candidate)
+                AttachmentPolicy.validate(existing + imported + candidate)
                 imported += candidate
             }
-            attachments += imported
+            target.items += imported
             haptics.play(HapticCue.SELECT)
         } catch (error: Exception) {
             if (error is kotlinx.coroutines.CancellationException) throw error
-            attachmentError = error.message ?: "Couldn't add that attachment."
+            target.error.value = error.message ?: "Couldn't add that attachment."
         } finally {
-            preparingAttachments = false
+            target.preparing.value = false
         }
     }
 
@@ -319,16 +321,18 @@ private fun LoadedChat(
         ActivityResultContracts.PickMultipleVisualMedia(AttachmentPolicy.MAXIMUM_ITEMS),
     ) { uris ->
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        val target = pickerDraft
         scope.launch {
-            importInto(uris.size) { index, remaining ->
+            importInto(target, uris.size) { index, remaining ->
                 AttachmentImport.readPhoto(context.contentResolver, uris[index], index, uris.size, remaining)
             }
         }
     }
     val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        val target = pickerDraft
         scope.launch {
-            importInto(uris.size) { index, remaining ->
+            importInto(target, uris.size) { index, remaining ->
                 AttachmentImport.readDocument(context.contentResolver, uris[index], remaining)
             }
         }
@@ -427,6 +431,8 @@ private fun LoadedChat(
     val transcript = remember(rawTranscript, activityDetail) {
         transcriptRows(rawTranscript, activityDetail)
     }
+    var expandedTurns by remember(threadId) { mutableStateOf(emptySet<String>()) }
+    var revealedTurnMessageId by remember(threadId) { mutableStateOf<String?>(null) }
     val predictiveChips = remember(quickReplies) {
         quickReplies.map { PredictiveChip(title = it.title, prompt = it.prompt, icon = it.icon) }
     }
@@ -434,7 +440,7 @@ private fun LoadedChat(
     val reasoning = state.reasoning[threadId]
     // Stream, then reasoning, then the bare fact of being busy — the order in
     // `ChatView.swift`, and the reason it is a rule rather than three `if`s here.
-    val tail = LiveTail.of(streaming = streaming, reasoning = reasoning, busy = chat.busy)
+    val tail = LiveTail.of(streaming = streaming, reasoning = reasoning, busy = chat.busy, detail = activityDetail)
     val liveText = streaming?.takeIf { tail == TranscriptTail.STREAM }
     val liveReasoning = reasoning?.takeIf { tail == TranscriptTail.REASONING }
     val hasMore = state.hasMore[threadId] == true
@@ -444,39 +450,23 @@ private fun LoadedChat(
         ComposerAccessories.hasPendingApproval(rawTranscript)
     }
 
-    // Two halves of the composer draft:
-    // (a) ChatComposerDraft under its saver — rememberSaveable persists only
-    //     [ChatComposerDraft.saveableValue] (typed before any dictation). The
-    //     screen never chooses a field; the saver is the only bridge (§6).
-    // (b) draft — volatile TextField mirror; the holder keeps the full string
-    //     across a Computer push (which removes ChatScreen from composition).
-    // iOS `@State draft` survives rotation and an in-view Computer push
-    // because ChatView's identity stays; Android needs this split to match
-    // that without serialising transcripts.
-    //
-    // Push vs pop: leave-to-roster clears both halves via
-    // [ChatComposerDraft.onLeaveToRoster] before pop. Computer must not —
-    // [retainsDraft] stays true while the chat is under Computer.
-    //
-    // Keys include chatDrafts as well as chatId: the saver and ChatComposerDraft
-    // both capture the holder, so a replaced CompanionEnvironment must remount
-    // them together. Today MainActivity builds the holder once per Activity
-    // (unreachable while the same chat stays composed); the key still guards
-    // that latent case. Factory stays inside remember — never per recomposition.
-    val heldOnEntry = remember(chatId, chatDrafts) { chatDrafts.get(chatId) }
+    // One live composer per thread, including when an upload finishes after
+    // switching away and back. Only typed text enters saved instance state;
+    // dictation and attachments remain memory-only. Back clears this owner's
+    // drafts, while a Computer push retains them.
+    val heldOnEntry = remember(draftKey, chatDrafts) { chatDrafts.get(draftKey) }
     // Hoist the saver: building it inline in rememberSaveable reallocates the
     // Saver + both lambdas on every LoadedChat recomposition (partials included).
-    val composerSaver = remember(chatId, chatDrafts) {
-        ChatComposerDraft.saver(chatId, chatDrafts)
+    val composerSaver = remember(draftKey, chatDrafts) {
+        ChatComposerDraft.saver(draftKey, chatDrafts)
     }
-    val composer = rememberSaveable(chatId, chatDrafts, saver = composerSaver) {
-        ChatComposerDraft(
-            chatId,
-            chatDrafts,
+    val composer = rememberSaveable(draftKey, chatDrafts, saver = composerSaver) {
+        chatDrafts.composer(
+            draftKey,
             initialSaveable = heldOnEntry?.typedSnapshot.orEmpty(),
         )
     }
-    var draft by remember(chatId, chatDrafts) { mutableStateOf(composer.text) }
+    val draft = composer.text
     // The command HUD opens from the button *or* from a draft that starts with a
     // slash — and typing anything else closes it again. iOS drives that from
     // `onChange(of: draft)`, which fires however the draft moved, so the rule
@@ -488,15 +478,13 @@ private fun LoadedChat(
     // would ever re-apply the rule to a `/dif` that is already in the field.
     // Closing the HUD by hand still sticks — the seed runs once per mount, and
     // `remember` does not re-run it.
-    var hudOpen by remember(chatId, chatDrafts) {
+    var hudOpen by remember(draftKey, chatDrafts) {
         mutableStateOf(SlashCommands.openOnEntry(composer.text))
     }
     val listState = rememberLazyListState()
 
     fun publishFrom(composerDraft: ChatComposerDraft) {
-        // UI mirror only. Saveable half is owned by the composer + its saver.
-        draft = composerDraft.text
-        hudOpen = SlashCommands.opensOnDraft(draft)
+        hudOpen = SlashCommands.opensOnDraft(composerDraft.text)
     }
 
     // Bind dictation to this chat's lifecycle: leaving the screen (including
@@ -511,7 +499,7 @@ private fun LoadedChat(
     DisposableEffect(chatId) {
         onDispose {
             if (!retainsDraft(chatId)) {
-                chatDrafts.clear(chatId)
+                chatDrafts.clearOwner(chatId)
             }
         }
     }
@@ -542,14 +530,22 @@ private fun LoadedChat(
     LaunchedEffect(showingTasks) { if (showingTasks) dictation.stop() }
     LaunchedEffect(showingProfile) { if (showingProfile) dictation.stop() }
 
+    val connection by session.connection.collectAsState()
+    LaunchedEffect(chatId, threadId, connection?.id) {
+        environment.chatPreferences.rememberThread(chat, connection?.id)
+    }
+
     // Opening a chat is what marks it read, exactly as on the desktop — and a
     // message can arrive while it is already on screen, so this keys on the bit
     // rather than running once.
     LaunchedEffect(threadId, chat.unread) {
         if (chat.unread) session.markRead(chat)
     }
-    LaunchedEffect(threadId, state.messages.containsKey(threadId)) {
-        if (!state.messages.containsKey(threadId)) session.loadThread(threadId)
+    // A non-resumable reconnect replaces the fleet snapshot and invalidates
+    // history for nonactive threads. The open chat's ID has not changed, but
+    // it must fetch its page again instead of waiting for the user to reopen it.
+    LaunchedEffect(threadId, state.hasLoadedPage(threadId)) {
+        session.loadThreadIfNeeded(threadId)
     }
 
     val headerCount = if (hasMore) 1 else 0
@@ -585,12 +581,19 @@ private fun LoadedChat(
     LaunchedEffect(focusedMessageId, transcript.size) {
         val target = focusedMessageId ?: return@LaunchedEffect
         val index = transcript.indexOfFirst { row ->
-            row.id == target ||
-                (row as? TranscriptRow.ActivityRun)?.items?.any { it.id == target } == true
+            row.id == target || row.containsMessage(target)
         }
         if (index < 0) return@LaunchedEffect
+        val turn = transcript[index] as? TranscriptRow.AssistantTurn
+        if (turn != null) expandedTurns = expandedTurns + turn.turnId
         listState.scrollToItem(headerCount + index)
-        session.consumeFocus(target)
+        if (turn != null) {
+            // The fold can span several screens. Its child brings the actual
+            // search hit into view before retiring the pending focus.
+            revealedTurnMessageId = target
+        } else {
+            session.consumeFocus(target)
+        }
         settled = true
     }
 
@@ -603,17 +606,34 @@ private fun LoadedChat(
     // there is — including both export formats.
     val onAction: (ChatActionId) -> Unit = { action ->
         when (action) {
-            ChatActionId.PHOTOS -> pickPhotos.launch(
+            ChatActionId.PHOTOS -> {
+                pickerDraft = attachmentDraft
+                pickPhotos.launch(
                 PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-            )
-            ChatActionId.FILES -> pickFiles.launch(
+                )
+            }
+            ChatActionId.FILES -> {
+                pickerDraft = attachmentDraft
+                pickFiles.launch(
                 (AttachmentPolicy.IMAGE_MIME_TYPES + AttachmentPolicy.DOCUMENT_MIME_TYPES).toTypedArray(),
-            )
-            ChatActionId.NEW_TASK -> scope.launch {
-                when (chat) {
-                    is Chat.BotChat -> session.createTask(chat.bot, null)?.let { onSelectTask(Chat.BotChat(it).target) }
-                    is Chat.RoomChat -> if (chat.supportsTasks) session.createTask(chat.room, null)
-                        ?.let { onSelectTask(Chat.RoomChat(it).target) }
+                )
+            }
+            ChatActionId.NEW_TASK -> if (!creatingThread && TaskRules.canCreate(chat)) {
+                creatingThread = true
+                scope.launch {
+                    try {
+                        val created = when (chat) {
+                            is Chat.BotChat -> session.createTask(chat.bot, null)?.let(Chat::BotChat)
+                            is Chat.RoomChat -> if (chat.supportsTasks) session.createTask(chat.room, null)
+                                ?.let(Chat::RoomChat) else null
+                        }
+                        if (created == null) {
+                            attachmentError = session.actionError ?: "Couldn't create this thread. Try again."
+                            session.actionError = null
+                        } else onSelectTask(created.target)
+                    } finally {
+                        creatingThread = false
+                    }
                 }
             }
             ChatActionId.TASKS -> showingTasks = true
@@ -660,8 +680,11 @@ private fun LoadedChat(
             attachmentError = null
             showingPlus = false
             scope.launch {
-                val sent = session.send(text, outgoing, chat)
-                sendingMessage = false
+                val sent = try {
+                    session.send(text, outgoing, chat)
+                } finally {
+                    sendingMessage = false
+                }
                 if (!sent) {
                     attachmentError = session.actionError ?: "Couldn't send this message. Try again."
                     session.actionError = null
@@ -669,7 +692,7 @@ private fun LoadedChat(
                 }
                 // Compare with what was in the field at tap time, so a newer
                 // edit made while uploading survives the clear.
-                if (draft == draftAtSend) {
+                if (composer.text == draftAtSend) {
                     composer.onSend()
                     publishFrom(composer)
                 }
@@ -795,10 +818,7 @@ private fun LoadedChat(
                                             activityDetail,
                                         )
                                         val index = freshRows.indexOfFirst { row ->
-                                            row.id == anchor ||
-                                                (row as? TranscriptRow.ActivityRun)
-                                                    ?.items
-                                                    ?.any { it.id == anchor } == true
+                                            row.id == anchor || row.containsMessage(anchor)
                                         }
                                         if (index < 0) return@launch
                                         // The "load earlier" row is item 0 for as
@@ -845,6 +865,23 @@ private fun LoadedChat(
                                     openThread = ::openThread,
                                 )
                                 is TranscriptRow.ActivityRun -> ActivityRunChip(message.items, ::openThread)
+                                is TranscriptRow.AssistantTurn -> AssistantTurnChip(
+                                    turn = message,
+                                    chat = chat,
+                                    expanded = message.turnId in expandedTurns,
+                                    revealMessageId = revealedTurnMessageId,
+                                    onRevealed = { target ->
+                                        session.consumeFocus(target)
+                                        if (revealedTurnMessageId == target) revealedTurnMessageId = null
+                                    },
+                                    onToggle = {
+                                        expandedTurns = if (message.turnId in expandedTurns) expandedTurns - message.turnId
+                                            else expandedTurns + message.turnId
+                                    },
+                                    openLink = ::openLink,
+                                    openAttachment = ::openAttachment,
+                                    openThread = ::openThread,
+                                )
                             }
                         }
                     }
@@ -869,6 +906,11 @@ private fun LoadedChat(
                         (state.unreadCount - if (chat.unread) 1 else 0).coerceAtLeast(0)
                     },
                     onBack = { leaveToRoster() },
+                    onOpenThreads = {
+                        dictation.stop()
+                        focusManager.clearFocus()
+                        showingTasks = true
+                    },
                     onWatchComputer = {
                         dictation.stop()
                         if (bot != null) onOpenComputer(bot.id)
@@ -982,7 +1024,7 @@ private fun LoadedChat(
     }
 
     if (showingTasks) {
-        if (chat.supportsTasks) TaskSheet(chat = chat, onDismiss = { showingTasks = false }, onSelectTask = onSelectTask)
+        if (chat.supportsTasks) TaskSheet(chat = chat, onDismiss = { showingTasks = false }, onSelectTask = onSelectTask, onDeletedCurrent = onBack)
     }
 
     if (showingProfile && bot != null) {
@@ -1060,6 +1102,7 @@ private fun ChatHeader(
     onBack: () -> Unit,
     onWatchComputer: () -> Unit,
     onOpenProfile: () -> Unit,
+    onOpenThreads: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val surface = MaterialTheme.colorScheme.surface
@@ -1118,7 +1161,7 @@ private fun ChatHeader(
                     Modifier
                 },
             )
-            NamePill(chat = chat, onOpen = onOpenProfile)
+            NamePill(chat = chat, onOpen = if (chat.supportsTasks) onOpenThreads else onOpenProfile)
         }
     }
 }
@@ -1162,12 +1205,11 @@ private fun BackPill(unreadElsewhere: Int, onBack: () -> Unit) {
 
 /**
  * The bot's name over its job, and the door to its profile — "who this is", as
- * against the composer's + for "do something". A room has no profile, so its
- * pill opens that same + sheet.
+ * The conversation title opens thread navigation; the avatar opens settings.
  */
 @Composable
 private fun NamePill(chat: Chat, onOpen: () -> Unit) {
-    val isBot = chat is Chat.BotChat
+    val hasThreads = chat.supportsTasks
     Row(
         modifier = Modifier
             .chromeCapsule()
@@ -1175,8 +1217,8 @@ private fun NamePill(chat: Chat, onOpen: () -> Unit) {
             .heightIn(min = MIN_TOUCH_TARGET)
             .clickable(
                 role = Role.Button,
-                onClickLabel = if (isBot) {
-                    "Open ${chat.name} settings"
+                onClickLabel = if (hasThreads) {
+                    "Switch thread"
                 } else {
                     "Open ${chat.name} chat options"
                 },
@@ -1194,9 +1236,10 @@ private fun NamePill(chat: Chat, onOpen: () -> Unit) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f, fill = false),
         )
-        if (chat.subtitle.isNotEmpty()) {
+        val subtitle = if (hasThreads) chat.threadTitle else chat.subtitle
+        if (subtitle.isNotEmpty()) {
             Text(
-                text = chat.subtitle,
+                text = subtitle,
                 fontSize = 13.sp,
                 color = secondaryTint,
                 maxLines = 1,
@@ -1205,7 +1248,7 @@ private fun NamePill(chat: Chat, onOpen: () -> Unit) {
             )
         }
         Icon(
-            imageVector = if (isBot) Icons.Filled.Settings else Icons.Filled.MoreVert,
+            imageVector = if (hasThreads) Icons.Filled.ArrowDropDown else Icons.Filled.MoreVert,
             contentDescription = null,
             tint = secondaryTint,
             modifier = Modifier.size(16.dp),
@@ -1538,7 +1581,11 @@ private fun Composer(
             Row(
                 modifier = Modifier
                     .weight(1f)
-                    .chromeCapsule()
+                    // A capsule at one line (48dp tall, 24dp corners) that keeps
+                    // those corners as the draft grows, the way Messages does.
+                    // CircleShape rounds to half the height, and a five-line
+                    // draft became a giant pill.
+                    .chromeSheet(cornerRadius = MIN_TOUCH_TARGET / 2)
                     .heightIn(min = MIN_TOUCH_TARGET),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.Bottom,
@@ -1601,22 +1648,23 @@ private fun Composer(
                             color = MaterialTheme.colorScheme.onSurface,
                         ),
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.onSurface),
-                        // Software keyboards have no Shift+Return, so their Return key
-                        // is a send — which is what the Send action promises.
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                        keyboardActions = KeyboardActions(onSend = { onSend() }),
+                        // The software keyboard's Return breaks the line, like
+                        // Messages; the arrow button on the bar is the one send.
+                        // A hardware Return still sends and Shift+Return breaks
+                        // the line. Some soft keyboards deliver their Return as a
+                        // key event too, so the rule also asks where it came from.
                         modifier = Modifier
                             .fillMaxWidth()
-                            // Return sends, Shift+Return breaks the line — the shape
-                            // every chat app has on a hardware keyboard.
                             .onPreviewKeyEvent { event ->
-                                val isReturn = event.key == Key.Enter || event.key == Key.NumPadEnter
-                                if (event.type == KeyEventType.KeyDown && isReturn && !event.isShiftPressed) {
-                                    onSend()
-                                    true
-                                } else {
-                                    false
-                                }
+                                val sends = ComposerReturn.sends(
+                                    isReturnKey = event.key == Key.Enter || event.key == Key.NumPadEnter,
+                                    keyDown = event.type == KeyEventType.KeyDown,
+                                    shift = event.isShiftPressed,
+                                    fromSoftwareKeyboard =
+                                        event.nativeKeyEvent.deviceId == KeyCharacterMap.VIRTUAL_KEYBOARD,
+                                )
+                                if (sends) onSend()
+                                sends
                             },
                     )
                 }

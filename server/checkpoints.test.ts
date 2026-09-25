@@ -5,7 +5,7 @@
 // user's own git repo in the folder is never touched, and dangerous folders
 // (home) are refused outright.
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -53,6 +53,14 @@ function userGit(cwd: string, ...args: string[]): string {
 }
 
 describe("snapshot", () => {
+  it("cancels optional digest capture without disabling later checkpoints", async () => {
+    const { bot, cwd } = workspace();
+    writeFileSync(join(cwd, "a.txt"), "one");
+    expect(await snapshot(bot, cwd, "cancelled capture", AbortSignal.abort())).toBeNull();
+    expect(await listCheckpoints(bot, cwd)).toEqual([]);
+    expect(await snapshot(bot, cwd, "next turn")).toMatch(/^[0-9a-f]{40}$/);
+  });
+
   it("creates a checkpoint commit and is idempotent while nothing changes", async () => {
     const { bot, cwd } = workspace();
     writeFileSync(join(cwd, "a.txt"), "one");
@@ -262,10 +270,63 @@ describe("refusals", () => {
     expect(await checkpointsEnabled(bot, linkedHome)).toBe(false);
   });
 
+  // Windows folder names are case-insensitive: every spelling below is the
+  // same folder on disk. Only side-effect-free checks here — on a build that
+  // missed the refusal, a snapshot would stage the whole home folder.
+  it.runIf(process.platform === "win32")("refuses the home and protected folders in any Windows spelling", async () => {
+    const { bot } = workspace();
+    expect(refusalReason(homedir().toLowerCase())).toBe("checkpoints are not taken in the home folder");
+    expect(refusalReason(homedir().toUpperCase())).toBe("checkpoints are not taken in the home folder");
+    for (const [name, spelling] of [["Desktop", "DESKTOP"], ["Documents", "documents"], ["Downloads", "DownLoads"]]) {
+      // A machine without the folder answers "does not exist", also a refusal.
+      const expected = existsSync(join(homedir(), name!))
+        ? `checkpoints are not taken in the ${name} folder`
+        : "the working folder does not exist";
+      expect(refusalReason(join(homedir(), spelling!))).toBe(expected);
+    }
+    // The 8.3 alias of Documents, on volumes that keep short names.
+    const shortDocuments = join(homedir(), "DOCUME~1");
+    if (existsSync(shortDocuments) && existsSync(join(homedir(), "Documents"))) {
+      expect(refusalReason(shortDocuments)).toBe("checkpoints are not taken in the Documents folder");
+    }
+    expect(await checkpointsEnabled(bot, homedir().toUpperCase())).toBe(false);
+  });
+
   it("lists nothing (and creates nothing) for a folder never snapshotted", async () => {
     const { bot, cwd } = workspace();
     expect(await listCheckpoints(bot, cwd)).toEqual([]);
     const shadow = join(process.env.OMB_DATA_DIR!, "checkpoints", bot);
     expect(existsSync(shadow)).toBe(false);
+  });
+});
+
+describe("diffStat", () => {
+  it("names the files added, changed and deleted between two checkpoints", async () => {
+    const { diffStat } = await import("./checkpoints.ts");
+    const { bot, cwd } = workspace();
+    writeFileSync(join(cwd, "keep.txt"), "same");
+    writeFileSync(join(cwd, "edit.txt"), "before");
+    writeFileSync(join(cwd, "gone.txt"), "bye");
+    const before = await snapshot(bot, cwd, "turn aaaaaaaa");
+    writeFileSync(join(cwd, "edit.txt"), "after");
+    writeFileSync(join(cwd, "new.txt"), "hello");
+    unlinkSync(join(cwd, "gone.txt"));
+    const after = await snapshot(bot, cwd, "settle aaaaaaaa");
+    expect(before).not.toBeNull();
+    expect(after).not.toBeNull();
+    expect(await diffStat(bot, cwd, before!, after!)).toEqual({
+      changed: ["edit.txt"],
+      added: ["new.txt"],
+      deleted: ["gone.txt"],
+    });
+  });
+
+  it("returns null when the two hashes are equal or the folder is refused", async () => {
+    const { diffStat } = await import("./checkpoints.ts");
+    const { bot, cwd } = workspace();
+    writeFileSync(join(cwd, "a.txt"), "one");
+    const hash = await snapshot(bot, cwd, "turn bbbbbbbb");
+    expect(await diffStat(bot, cwd, hash!, hash!)).toBeNull();
+    expect(await diffStat(bot, homedir(), hash!, hash!)).toBeNull();
   });
 });

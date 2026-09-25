@@ -4,11 +4,11 @@
 // provider's own permission mode passed straight through (Claude `auto`,
 // Grok `--permission-mode`, Codex `approvalsReviewer`, …), and a request that
 // reaches this process is one the provider left for a person. The only
-// verdict the app synthesizes is Full access, because that level is the
-// person's explicit, separately confirmed grant to answer every prompt.
+// grants the app applies are Full access and the person's exact saved commands.
 // Questions never come through here: a bot's question always reaches a human.
 
 import { supportsApprovalMode, type ApprovalMode } from "../shared/approval-mode.ts";
+import type { ProviderAdapter, RequestOutcome } from "./contracts.ts";
 
 /** Process-level CLI YOLO (`openmausbot --yolo` / `OMB_YOLO=1`). Does not
  * persist Full access, and does not open the HTTP elevation path. */
@@ -19,8 +19,30 @@ export function cliYoloFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes";
 }
 
+/** A failed delivery is a runtime error, not another permission decision.
+ * An expired ask must never become a fresh Allow/Deny card. */
+export async function deliverFullAccessApproval(
+  adapter: Pick<ProviderAdapter, "respondToRequest" | "interruptTurn"> | undefined,
+  threadId: string,
+  requestId: string,
+  turnId?: string,
+  isCurrent: () => boolean = () => false,
+): Promise<RequestOutcome | "failed"> {
+  if (!adapter) return "failed";
+  try {
+    return await adapter.respondToRequest(threadId, requestId, { behavior: "allow" });
+  } catch {
+    // Some adapters ignore the optional native turn id. Recheck the
+    // server's owning generation before interrupting that thread.
+    if (turnId && isCurrent()) await adapter.interruptTurn(threadId, turnId).catch(() => {});
+    return "failed";
+  }
+}
+
 /** Full access is the person's explicit grant to this receiving bot, including
- * delegated work. It never inherits the sender's mode or elevates another bot.
+ * delegated work. It never inherits the sender's mode or elevates another bot
+ * — with the one exception below (delegationInheritsFullAccess), applied
+ * where a Chief's delegated thread is created rather than here.
  * Custom is a provider-config choice rather than an app Full-access grant, so
  * peer-started Custom turns use Auto. Provider support and grant confirmation
  * are checked by the caller. */
@@ -42,13 +64,41 @@ export function effectiveApprovalMode(
   return mode;
 }
 
+/** Whether work a bot hands to a teammate runs with Full access. Only a Chief
+ * of Staff passes access on, and only the Full access the person gave it for
+ * the conversation it is delegating from: the Chief exists to get the team's
+ * work done without the person answering every card, and a teammate stopping
+ * that work to ask defeats the grant. The recipient's engine has to implement
+ * Full, or the work keeps the recipient's own level. A bot never elevates
+ * itself this way. */
+export function delegationInheritsFullAccess(input: {
+  senderIsChief: boolean;
+  senderHasFullAccess: boolean;
+  sameBot: boolean;
+  recipientDriverKind: string | undefined;
+}): boolean {
+  return input.senderIsChief && input.senderHasFullAccess && !input.sameBot
+    && supportsApprovalMode(input.recipientDriverKind, "full");
+}
+
+// Tools that ask a PERSON something. A question exists so that a human
+// decides; any mode answering one on their behalf defeats the only reason
+// it was asked. They normally arrive typed as questions and never reach a
+// verdict at all — this is the backstop for the path where one arrives
+// mis-typed as a permission (a malformed AskUserQuestion call falls back to
+// the permission path in permission-proxy). Approving it there does not
+// produce an answer: the CLI runs the tool with none and the model is told
+// "The user did not answer the questions." — a question silently lost.
+const ASKS_A_PERSON = new Set(["askuserquestion", "ask_user", "omb-ask"]);
+
 /** Why a permission request landed where it did — the decision log's "which
- * rule". `full-access` is the one auto-approval; `native-approval` is a card
+ * rule". `full-access` and `command-allowlist` are explicit user grants; `native-approval` is a card
  * the provider's own reviewer (Auto, or Custom's config) left for the person;
  * `explicit-approval-block` is a sandbox widening only Full may answer;
  * `no-grant` is an Ask or Edits card, where asking is the whole point. */
 export type AutoVerdictSource =
   | "full-access"
+  | "command-allowlist"
   | "native-approval"
   | "explicit-approval-block"
   | "no-grant";
@@ -68,13 +118,22 @@ export function autoVerdict(
     /** The provider is asking to widen its configured sandbox rather than
      * perform one ordinary action. Only explicit Full may synthesize this. */
     requiresExplicitApproval?: boolean;
+    /** Exact bot/provider/folder/command match against the person's saved rules. */
+    commandAllowed?: boolean;
   },
 ): AutoVerdict {
+  // A question is for a person, whatever channel it arrived on — and
+  // whatever the mode: even Full has no answer to give, only an approval
+  // that would run the tool with none.
+  if (ASKS_A_PERSON.has(tool.replace(/^mcp__[^_]+__/, "").toLowerCase())) {
+    return { approve: null, source: "no-grant" };
+  }
   // Full's promise is literal: even a sandbox widening is approved. Entering
   // Full is separately consent-gated by the bot PATCH endpoint, and the
   // request.opened caller invokes this for permissions only, never questions.
   if (mode === "full") return { approve: `approved ${tool} (full access)`, source: "full-access" };
   if (context?.requiresExplicitApproval) return { approve: null, source: "explicit-approval-block" };
+  if (context?.commandAllowed) return { approve: `approved ${tool} (saved command)`, source: "command-allowlist" };
   if (mode === "auto" || mode === "custom") return { approve: null, source: "native-approval" };
   return { approve: null, source: "no-grant" };
 }

@@ -97,6 +97,108 @@ describe("independent bot tasks through the isolated control surface", () => {
     await session.close();
   });
 
+  it("queues coordinated work behind a peer's approval even with a spare thread, and delivers it once without another user prompt", async () => {
+    const chief = (await tool("create_bot", { name: "Mailbox Chief", instance_id: "claude", model: models[0] })).bot;
+    const peer = (await tool("create_bot", { name: "Mailbox Peer", instance_id: "claude", model: models[1] })).bot;
+    await api("PATCH", `/api/bots/${peer.id}/tasks/${peer.activeTaskId}`, { approvalMode: "ask" });
+    await control(["send", "--bot", peer.id, "--text", "Hold this review until I approve the check."]);
+    const answers = await permission(models[1], "mailbox-approval");
+    await expect.poll(async () => (await botState(peer.id)).activity).toBe("waiting-on-you");
+    // A spare slot must not hide the approval hold. Capacity 1 would queue
+    // this for a different reason.
+    expect((await api("PATCH", "/api/config", { threads: { maxConcurrentPerBot: 3 } })).status).toBe(200);
+    await control(["send", "--bot", chief.id, "--text", "Ask the reviewer to check the release notes, then return the result here."]);
+    const token = (await dump(models[0])).mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN;
+    const roster = await internal(token, "GET", "/api/internal/agents");
+    expect(roster.status).toBe(200);
+    expect(roster.body.bots.find((bot: any) => bot.id === peer.id)).toMatchObject({
+      status: "waiting-on-user", statusText: "waiting on the user", busy: true,
+    });
+    const queued = await internal(token, "POST", "/api/internal/coordinate-bots", {
+      botIds: [peer.id], requestKey: "mailbox-review", message: "MAILBOX_REVIEW: check the release notes.",
+    });
+    expect(queued.status).toBe(200);
+    expect(queued.body.accepted).toHaveLength(1);
+    const requestId = queued.body.accepted[0].requestId;
+    const handoff = () => JSON.parse(readFileSync(join(session.info.dataDir, "room-handoffs.json"), "utf8"))
+      .find((node: any) => node.id === requestId);
+    const peerThread = handoff().threadId;
+    expect(peerThread).not.toBe(peer.activeTaskId);
+    // The open approval keeps fresh work queued across a tick, spare slot or
+    // not. Ending the source turn does not release it. #1589 admits a spare
+    // slot only beside a sibling that is running, not beside this card.
+    writeFileSync(modelFile(models[0], "gate"), "finish");
+    await expect.poll(async () => {
+      const current = (await api("GET", "/api/bots")).body.bots.find((bot: any) => bot.id === chief.id);
+      return current.messages.filter((message: any) => message.tool?.name === "Sent to Mailbox Peer").length;
+    }).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const peerNow = (await api("GET", "/api/bots")).body.bots.find((bot: any) => bot.id === peer.id);
+    const side = peerNow?.tasks?.find((task: any) => task.threadId === peerThread || task.taskId === peerThread);
+    expect(peerNow?.activity).toBe("waiting-on-you");
+    expect(side?.busy).not.toBe(true);
+    expect(handoff()?.status).toBe("queued");
+    expect(answers).toEqual([]);
+    await control(["messages", "--bot", chief.id, "--limit", "10"]);
+    const allowed = await api("POST", `/api/threads/${peer.activeTaskId}/respond`, { requestId: "mailbox-approval", behavior: "allow" });
+    expect(allowed.body.outcome).toBe("allowed-once");
+    await expect.poll(() => answers.some((answer) => answer.id === "mailbox-approval")).toBe(true);
+    writeFileSync(modelFile(models[1], "gate"), "finish");
+    await expect.poll(async () => {
+      const bots = (await api("GET", "/api/bots")).body.bots;
+      const current = bots.find((bot: any) => bot.id === chief.id);
+      return !current.busy && current.messages.some((message: any) =>
+        message.from?.botId === peer.id && message.roomRequest?.id === requestId && message.roomRequest.phase === "result");
+    }, { timeout: 20_000 }).toBe(true);
+    const bots = (await api("GET", "/api/bots")).body.bots;
+    const peerState = bots.find((bot: any) => bot.id === peer.id);
+    expect(peerState.threadId).toBe(peer.activeTaskId);
+    expect(peerState.messages.some((message: any) => message.text?.includes("MAILBOX_REVIEW"))).toBe(false);
+    const targetMessages = (await api("GET", `/api/threads/${peerThread}/messages?limit=100`)).body.messages;
+    expect(targetMessages.filter((message: any) => message.roomRequest?.id === requestId && message.roomRequest.phase === "request")).toHaveLength(1);
+    expect(targetMessages.some((message: any) => message.text?.includes("MAILBOX_REVIEW"))).toBe(true);
+    await expect.poll(() => handoff()?.status, { timeout: 10_000 }).toBe("completed");
+    expect((await control(["wait", "--bot", peer.id, "--timeout", "15"])).status).toBe("settled");
+    await control(["messages", "--bot", peer.id, "--limit", "10"]);
+    await control(["messages", "--bot", chief.id, "--limit", "15"]);
+  }, 60_000);
+
+  it("replaces the final worked thread with blank context but refuses to delete it while running", async () => {
+    const created = await tool("create_bot", { name: "Last thread fixture", instance_id: "claude", model: models[0] });
+    const botId = created.bot.id;
+    const threadId = created.bot.activeTaskId;
+    await control(["send", "--bot", botId, "--task", threadId, "--text", "LAST_THREAD_WORK"]);
+    await dump(models[0]);
+    expect((await api("DELETE", `/api/bots/${botId}/tasks/${threadId}`)).status).toBe(409);
+    writeFileSync(modelFile(models[0], "gate"), "finish");
+    expect((await control(["wait", "--bot", botId, "--task", threadId, "--timeout", "15"])).status).toBe("settled");
+    const before = (await api("GET", "/api/bots")).body.bots.find((bot: any) => bot.id === botId);
+    expect(before.tasks).toHaveLength(1);
+    expect(before.messages.some((message: any) => message.role === "user" && message.text === "LAST_THREAD_WORK")).toBe(true);
+    const artifact = join(session.info.dataDir, "task-workspaces", botId, threadId, "result.txt");
+    writeFileSync(artifact, "Retain generated project files");
+
+    const deleted = await api("DELETE", `/api/bots/${botId}/tasks/${threadId}`);
+    expect(deleted.status).toBe(200);
+    const fresh = deleted.body.bot;
+    expect(fresh.tasks).toHaveLength(1);
+    expect(fresh.threadId).not.toBe(threadId);
+    expect(fresh.tasks[0]).toMatchObject({ threadId: fresh.threadId, title: "New thread", busy: false });
+    expect(fresh.messages).toEqual([]);
+    expect(fresh.modelSelection).toEqual(before.modelSelection);
+    expect(readFileSync(artifact, "utf8")).toBe("Retain generated project files");
+    expect((await api("DELETE", `/api/bots/${botId}/tasks/${threadId}`)).status).toBe(404);
+    const loaded = (await api("GET", "/api/bots")).body.bots.find((bot: any) => bot.id === botId);
+    expect(loaded.threadId).toBe(fresh.threadId);
+    expect(loaded.messages).toEqual([]);
+    await control(["send", "--bot", botId, "--task", fresh.threadId, "--text", "NEW_THREAD_WORK"]);
+    expect((await control(["wait", "--bot", botId, "--task", fresh.threadId, "--timeout", "15"])).status).toBe("settled");
+    const messages = (await api("GET", "/api/bots")).body.bots.find((bot: any) => bot.id === botId).messages;
+    expect(messages.some((message: any) => message.text === "NEW_THREAD_WORK")).toBe(true);
+    expect(messages.some((message: any) => message.text === "LAST_THREAD_WORK")).toBe(false);
+    evidence.push({ deletedThreadId: threadId, replacementThreadId: fresh.threadId, blankReplacement: true, artifactRetained: true });
+  }, 30_000);
+
   it("rejects blank memory replacements, caps new titles, and retains project files after deletion", async () => {
     const created = await tool("create_bot", { name: "Release review fixture", instance_id: "claude", model: models[0] });
     const botId = created.bot.id;
@@ -304,12 +406,14 @@ describe("independent bot tasks through the isolated control surface", () => {
     // a no-op relative to the task is not a no-op relative to the Group.
     expect((await api("PATCH", `/api/bots/${botId}/model`, selection)).status).toBe(409);
     expect((await api("PATCH", `/api/bots/${botId}`, { modelSelection: selection })).status).toBe(409);
+    expect((await api("PATCH", `/api/bots/${botId}/tasks/${threadId}`, { modelSelection: selection, updateBotDefault: true })).status).toBe(409);
     expect((await botState(botId)).tasks.find((task: any) => task.taskId === threadId)?.modelSelection).toEqual(selection);
     const profile = (await api("GET", "/api/bots")).body.bots.find((bot: any) => bot.id === botId);
     expect(profile.modelSelection.model).toBe(models[0]);
     expect((await api("POST", `/api/groups/${group.id}/interrupt`, {})).status).toBe(200);
     await expect.poll(async () => (await botState(botId)).busy, { timeout: 10_000 }).toBe(false);
-    expect((await api("PATCH", `/api/bots/${botId}/model`, selection)).status).toBe(200);
+    expect((await api("PATCH", `/api/bots/${botId}/tasks/${threadId}`, { modelSelection: selection, updateBotDefault: true })).status).toBe(200);
+    expect((await botState(botId)).modelSelection).toEqual(selection);
     evidence.push({ groupDefaultPreservedUntilStop: true, groupId: group.id, selectedTaskId: threadId });
   }, 30_000);
 
@@ -345,7 +449,8 @@ describe("independent bot tasks through the isolated control surface", () => {
     const descriptorDir = join(session.info.dataDir, "Library", "Application Support", "OpenMausBot");
     mkdirSync(descriptorDir, { recursive: true });
     writeFileSync(join(descriptorDir, "cua-connection.json"), JSON.stringify({
-      mcpCommand: join(session.info.dataDir, "never-launched-computer"), mcpArgs: [], mcpEnv: {},
+      mode: "embedded", socketPath: join(session.info.dataDir, "never-used.sock"),
+      mcpCommand: join(session.info.dataDir, "never-launched-computer"), mcpArgs: ["mcp"], mcpEnv: {},
     }));
     const created = await tool("create_bot", { name: "Computer lease fixture", instance_id: "claude", model: models[0] });
     const botId = created.bot.id;

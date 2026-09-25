@@ -18,9 +18,11 @@ import {
 } from "@/state/store";
 import { BotAvatar } from "./Avatar";
 import { ThreadChip } from "./ThreadChip";
+import { ToolActivity } from "./ToolActivity";
 import { ThreadRefText } from "./ThreadRefs";
 import { TurnPresence } from "./TurnPresence";
 import { showToolCallsEnabled } from "@/lib/feature-flags";
+import { CompactionChip, DigestChip } from "./DigestChip";
 import { roomActivityVisible } from "@/lib/room-activity";
 import { normalizeState } from "@/lib/mascot";
 import { effectiveDefaultResponder, groupResponseHint } from "@/lib/group-routing";
@@ -28,20 +30,24 @@ import { ChatMarkdown } from "./ChatMarkdown";
 import { Composer } from "./Composer";
 import { ChatFindBar } from "./ChatFindBar";
 import { GroupTaskPicker } from "./TaskPicker";
+import { GroupUsageChip } from "./GroupUsageChip";
 import { ExportTranscriptMenu } from "./ExportTranscriptMenu";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
 import { hasRoutineExecutionTask, RoutineRunCard } from "./RoutineRunCard";
 import { GoalRunCard } from "./GoalRunCard";
-import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
+import { AttachmentGallery, MessageAttachmentGallery } from "./AttachmentGallery";
+import { VoiceNoteBubble, type VoiceNoteAttachment } from "./VoiceNoteBubble";
+import { OptionCard } from "./OptionCard";
 import { GroupCallButton, GroupCallOverlay } from "./GroupCallView";
 
 import { ApprovalCard } from "./ApprovalCard";
+import { QuestionCard } from "./QuestionCard";
 import { ManageMembersPanel } from "./ManageMembersPanel";
 import { groupActivityRuns } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
-import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { useDesktopCapabilities, useCaptionChrome } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { useFocusMessage } from "@/lib/focus-message";
 import { shortPath } from "@/lib/short-path";
@@ -88,7 +94,13 @@ export function RoomToolChip({ message, roomId }: { message: Message; roomId?: s
       <div className="flex justify-start">
         <button
           type="button"
-          onClick={() => dispatch({ type: "select", id: comm.groupId })}
+          onClick={() => {
+            dispatch({ type: "select", id: comm.groupId });
+            const destination = state.groups.find(g => g.id === comm.groupId);
+            if (comm.threadId && destination?.tasks?.some(task => task.threadId === comm.threadId)) {
+              dispatch({ type: "switchGroupTask", groupId: comm.groupId, threadId: comm.threadId });
+            }
+          }}
           title={t("room.openBot", { name: comm.withName })}
           className="flex items-center gap-2 rounded-full border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
         >
@@ -99,6 +111,7 @@ export function RoomToolChip({ message, roomId }: { message: Message; roomId?: s
       </div>
     );
   }
+  if (!comm) return <ToolActivity tool={tool} />;
   return (
     <div className="flex justify-start">
       <div
@@ -107,7 +120,8 @@ export function RoomToolChip({ message, roomId }: { message: Message; roomId?: s
           tool.ok === false ? "text-danger" : "text-ink-secondary",
         )}
       >
-        <span className="max-w-[480px] truncate font-mono">{tool.name}</span>
+        {comm && <BotAvatar bot={state.bots.find(b => b.id === comm.withBotId) ?? { name: comm.withName, color: comm.withColor }} state="happy" size={16} />}
+        <span className={cn("max-w-[480px] truncate", !comm && "font-mono")}>{tool.name}</span>
       </div>
     </div>
   );
@@ -177,7 +191,8 @@ const Transcript = memo(function Transcript({
   const memberOf = (id?: string) => members.find((b) => b.id === id);
   // Several bots working at once turn a room into a wall of chips; fold the
   // finished ones the same way a 1:1 chat does.
-  const items = useMemo(() => groupActivityRuns(messages), [messages]);
+  const items = useMemo(() => groupActivityRuns(messages.filter(message =>
+    message.kind !== "activity" || roomActivityVisible(message, showToolCalls))), [messages, showToolCalls]);
   const newestMessageId = messages.at(-1)?.id;
   const newestUserMessageId = [...messages].reverse().find((message) => message.role === "user")?.id;
   const focus = state.focusMessage;
@@ -215,7 +230,7 @@ const Transcript = memo(function Transcript({
         const m = item.message;
         const user = m.role === "user";
         const attachments = user && m.text ? splitTranscriptAttachments(m.text) : null;
-        const newCluster = !prev || prev.role !== m.role || prev.from?.botId !== m.from?.botId || newDay;
+        const newCluster = !prev || prev.role !== m.role || prev.from?.botId !== m.from?.botId || Boolean(prev.comm) || newDay;
         const routineOwner = m.kind === "routine.run" ? memberOf(m.from?.botId) : undefined;
         const routineExecutionThreadId = m.routineRun?.executionThreadId;
         const routineTarget = routineOwner && hasRoutineExecutionTask(routineOwner.tasks, routineExecutionThreadId)
@@ -225,15 +240,27 @@ const Transcript = memo(function Transcript({
           // a member can hit a permission ask mid-turn; without this the
           // card never rendered here and the bot waited out its timeout.
           // `tool` distinguishes a permission from a QUESTION — a question
-          // only accepts an "answer", so routing it here would offer an
-          // Allow the broker rejects
+          // only accepts an "answer", so routing it to the approval box
+          // would offer an Allow the broker rejects. A structured ask is
+          // one of those questions, and answers in its own card.
           m.kind === "secret" && m.secret && m.from?.botId ? (
             <SecretRequestCard botId={m.from.botId} threadId={group.threadId} message={m} />
           ) : m.kind === "connector" && m.connector && m.from?.botId ? (
             <ConnectorCard botId={m.from.botId} threadId={group.threadId} message={m} />
+          ) : m.kind === "options" && m.card?.requestId && m.card.questionRequest ? (
+            <div className="flex justify-start">
+              <QuestionCard threadId={group.threadId} bot={memberOf(m.from?.botId)} message={m} />
+            </div>
           ) : m.kind === "options" && m.card?.requestId && m.card.tool ? (
             <div className="flex justify-start">
               <ApprovalCard bot={memberOf(m.from?.botId)} message={m} />
+            </div>
+          ) : m.kind === "options" && m.card && m.from?.botId ? (
+            // a QUESTION from a member. Without this branch the card fell
+            // through to null: invisible on screen, and the asking bot sat
+            // there until its 15-minute timeout answered for you
+            <div className="flex justify-start">
+              <OptionCard botId={m.from.botId} threadId={group.threadId} groupId={group.id} message={m} />
             </div>
           ) : m.kind === "goal.run" ? (
             <div className="flex justify-start">
@@ -252,6 +279,10 @@ const Transcript = memo(function Transcript({
             roomActivityVisible(m, showToolCalls) ? (
               <RoomToolChip message={m} roomId={group.id} />
             ) : null
+          ) : m.kind === "compaction" ? (
+            <CompactionChip message={m} />
+          ) : m.kind === "digest" ? (
+            showToolCalls ? <DigestChip message={m} /> : null
           ) : m.kind === "text" && (m.text || m.attachments?.length) ? (
             <div className={cn("group flex w-full flex-col", user ? "items-end" : "items-start")}>
               <div className={cn("flex w-full items-end gap-1.5", user ? "justify-end" : "justify-start")}>
@@ -294,19 +325,7 @@ const Transcript = memo(function Transcript({
                   })()}
                   {user ? (
                     <>
-                      {attachments && attachments.images.length > 0 && (
-                        <AttachedImageGallery
-                          paths={attachments.images}
-                          eager={m.id === newestMessageId || m.id === newestUserMessageId}
-                        />
-                      )}
-                      {attachments && attachments.files.length > 0 && (
-                        <AttachedFileChips
-                          files={attachments.files}
-                          message={{ threadId: group.threadId, messageId: m.id }}
-                          className={!attachments.display ? "mb-0" : undefined}
-                        />
-                      )}
+                      {attachments && <AttachmentGallery images={attachments.images} files={attachments.files} message={{ threadId: group.threadId, messageId: m.id }} eager={m.id === newestMessageId || m.id === newestUserMessageId} className={!attachments.display ? "mb-0" : undefined} />}
                       <ThreadRefText text={attachments?.display ?? m.text ?? ""} peers={members} everyone={!group.dm} />
                       {m.via === "api" && (
                         <div className="mt-1 text-[11px] text-ink-secondary">Sent through the API, not typed here</div>
@@ -314,13 +333,14 @@ const Transcript = memo(function Transcript({
                     </>
                   ) : (
                     <>
-                      {m.attachments?.length ? (
-                        <AttachedImageGallery
-                          paths={m.attachments.map((attachment) => attachment.path)}
-                          className={m.text ? "justify-start" : "mb-0 justify-start"}
-                          eager={m.id === newestMessageId || m.id === newestUserMessageId}
-                        />
-                      ) : null}
+                      {(m.attachments ?? []).some((attachment) => attachment.kind === "audio") && (
+                        <div className={cn("flex flex-col", (m.text || (m.attachments ?? []).some((attachment) => attachment.kind === "image")) && "mb-2")}>
+                          {m.attachments!.filter((attachment): attachment is VoiceNoteAttachment => attachment.kind === "audio").map((note) => (
+                            <VoiceNoteBubble key={note.path} attachment={note} />
+                          ))}
+                        </div>
+                      )}
+                      <MessageAttachmentGallery text={m.text ?? ""} attachments={m.attachments?.filter((attachment) => attachment.kind === "image")} message={{ threadId: group.threadId, messageId: m.id }} className={m.text ? undefined : "mb-0"} eager={m.id === newestMessageId || m.id === newestUserMessageId} />
                       {m.text ? <ChatMarkdown text={m.text} mentionPeers={members} everyone={!group.dm} message={{ threadId: group.threadId, messageId: m.id }} /> : null}
                     </>
                   )}
@@ -353,7 +373,7 @@ const Transcript = memo(function Transcript({
                 {dayLabel(m.at)} {formatTime(m.at)}
               </div>
             )}
-            {!user && m.from && newCluster && (
+            {!user && m.from && newCluster && !(m.kind === "activity" && m.comm) && (
               <ClusterLabel bot={memberOf(m.from.botId)} name={m.from.name} color={m.from.color} />
             )}
             {row}
@@ -881,6 +901,9 @@ function RoomSetup({ group, members }: { group: Group; members: Bot[] }) {
 export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();
   const remoteClient = window.ogb?.remoteClient?.active === true;
+  // Same Windows caption handling as ChatView: drag on the header, shift the
+  // right-hand controls below the renderer-drawn caption buttons.
+  const { dragStyle: headerDragStyle, noDragStyle: headerNoDragStyle, controlsShiftStyle } = useCaptionChrome();
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1036,9 +1059,12 @@ export function GroupView({ group }: { group: Group }) {
   // Expanding prepends rows: capture the height first, then after the commit
   // shift scrollTop by the growth so the message under the cursor stays put
   // (browser scroll anchoring is disabled on this container).
-  const preExpandHeight = useRef<number | null>(null);
+  // The captured height belongs to the thread it was taken in: a switch
+  // between the capture and the commit would otherwise shift the new
+  // thread's viewport by the old one's growth.
+  const preExpandHeight = useRef<{ key: string; height: number } | null>(null);
   const showEarlier = () => {
-    preExpandHeight.current = scrollRef.current?.scrollHeight ?? null;
+    preExpandHeight.current = scrollRef.current ? { key: transcriptKey, height: scrollRef.current.scrollHeight } : null;
     // expanding means reading scrollback — never let a mid-expand stream
     // event pin the viewport back to the bottom
     setBottomFollow(false);
@@ -1047,19 +1073,45 @@ export function GroupView({ group }: { group: Group }) {
   };
   useLayoutEffect(() => {
     const el = scrollRef.current;
-    if (preExpandHeight.current === null || !el) return;
-    el.scrollTop += el.scrollHeight - preExpandHeight.current;
+    const captured = preExpandHeight.current;
+    if (!captured || !el) return;
     preExpandHeight.current = null;
+    if (captured.key !== transcriptKey) return;
+    el.scrollTop += el.scrollHeight - captured.height;
     // keep the resume-follow heuristic from reading the restore as a
     // downward user scroll
     previousScrollTop.current = el.scrollTop;
-  }, [transcriptWindow.start]);
+    // transcriptKey is a dependency so a switch runs this and drops a capture
+    // that belongs to the thread being left.
+  }, [transcriptWindow.start, transcriptKey]);
 
   const showLater = () => {
     setBottomFollow(false);
     const nextEnd = Math.min(group.messages.length, endIndex + TRANSCRIPT_WINDOW_SIZE);
     setTranscriptWindow((w) => ({ ...w, end: nextEnd >= group.messages.length ? null : nextEnd }));
   };
+
+  // Scrollback across the network: the snapshot holds a bounded page, and
+  // everything before it is still on the server. Asking for it prepends rows
+  // exactly like expanding the local window, so the same height capture keeps
+  // the viewport still — here it is applied when the transcript grows at the
+  // front rather than when the boundary moves.
+  const olderPending = Boolean(state.loadingOlder[group.threadId]);
+  const loadOlder = () => {
+    preExpandHeight.current = scrollRef.current ? { key: transcriptKey, height: scrollRef.current.scrollHeight } : null;
+    setBottomFollow(false);
+    dispatch({ type: "loadOlderMessages", threadId: group.threadId });
+  };
+  const oldestId = group.messages[0]?.id;
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const captured = preExpandHeight.current;
+    if (!captured || !el) return;
+    preExpandHeight.current = null;
+    if (captured.key !== transcriptKey) return;
+    el.scrollTop += el.scrollHeight - captured.height;
+    previousScrollTop.current = el.scrollTop;
+  }, [oldestId, transcriptKey]);
 
   const atEnd = () => {
     const el = scrollRef.current;
@@ -1098,17 +1150,23 @@ export function GroupView({ group }: { group: Group }) {
       )}
       {/* Header: static member avatars; a ring + dot marks the working bot. */}
       <div
+        style={headerDragStyle}
         className={cn(
           "flex items-center justify-between px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2" style={headerNoDragStyle}>
           <span className="truncate text-[15px] font-semibold text-ink">{group.name}</span>
           {!setupPending && !group.dm && <GroupTaskPicker group={group} />}
         </div>
-        <div className="flex items-center gap-1.5">
+        <div
+          className="flex items-center gap-1.5"
+          // The caption buttons sit over the header's right end; drop this
+          // control row 16px (visual only) below the 26px overlay.
+          style={controlsShiftStyle}
+        >
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}
@@ -1128,6 +1186,7 @@ export function GroupView({ group }: { group: Group }) {
             isGroup
           />
           <GroupCallButton group={group} members={members} />
+          <GroupUsageChip usage={group.usage} />
           {!remoteClient && !setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!remoteClient && !setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
           {group.dm || remoteClient ? (
@@ -1296,7 +1355,7 @@ export function GroupView({ group }: { group: Group }) {
               </div>
             </div>
           )}
-          {hiddenCount > 0 && (
+          {hiddenCount > 0 ? (
             <div className="flex justify-center pt-2">
               <button
                 onClick={showEarlier}
@@ -1305,7 +1364,17 @@ export function GroupView({ group }: { group: Group }) {
                 {t("chat.showEarlier", { count: hiddenCount })}
               </button>
             </div>
-          )}
+          ) : group.hasMore ? (
+            <div className="flex justify-center pt-2">
+              <button
+                onClick={loadOlder}
+                disabled={olderPending}
+                className="rounded-full border border-hairline/40 bg-panel px-3 py-1 text-[12.5px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-60"
+              >
+                {olderPending ? t("chat.loadingEarlier") : t("chat.loadEarlier")}
+              </button>
+            </div>
+          ) : null}
           <Transcript
             group={group}
             members={members}
@@ -1341,6 +1410,7 @@ export function GroupView({ group }: { group: Group }) {
               visible={presenceVisible}
               label={activityLabel}
               answering={popping !== null}
+              since={speaker ? group.turnStartedAt ?? null : null}
             />
           )}
         </div>

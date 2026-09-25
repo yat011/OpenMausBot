@@ -199,6 +199,19 @@ export function resolveQwenTurnModel(model: string | undefined, env: Record<stri
   return matches[0].id;
 }
 
+/** Qwen Code's own approval ladder, passed through (qwen --help, 0.24):
+ * `--approval-mode default` asks, `auto-edit` approves file edits, `auto`
+ * runs Qwen's LLM classifier that approves safe actions and blocks risky
+ * ones, and `--yolo` approves everything. Ask sends nothing, so an older
+ * CLI without the flag keeps working at the level it always had; the ACP
+ * client still answers residual permission asks itself under Full. */
+export function qwenApprovalArgs(fullAuto: boolean, approvalMode: string | undefined): string[] {
+  if (fullAuto) return ["--yolo"];
+  if (approvalMode === "auto") return ["--approval-mode", "auto"];
+  if (approvalMode === "edits") return ["--approval-mode", "auto-edit"];
+  return [];
+}
+
 const support: AcpSupport = {
   driverKind: "qwenAgent",
   displayName: "Qwen",
@@ -219,7 +232,7 @@ const support: AcpSupport = {
   },
   // A raw -m only changes the model within the saved provider. ACP switches
   // the complete route and confirms it before any prompt leaves OMB.
-  spawnArgs: () => ["--acp"],
+  spawnArgs: (config, turn) => ["--acp", ...qwenApprovalArgs(config.fullAuto, turn.approvalMode)],
   selectModel: { configId: "model" },
   pickAuthMethod: () => null,
   authFailure: "continue",

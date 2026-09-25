@@ -42,6 +42,13 @@ const WONT_ORDER = [
 ];
 
 describe("buildBotOverview", () => {
+  it("describes additional teams only for an authorized Chief", () => {
+    const facts = baseFacts({ bot: { ...baseFacts().bot, chiefOfStaff: true, managedSections: ["Engineering", "Research"], peers: undefined }, engine: { agentsMcp: true }, sectionPeers: 3 });
+    expect(buildBotOverview(facts).reaches).toContain("Can talk to 3 other bots in its allowed teams.");
+    expect(buildBotOverview(facts).reaches).toContain("May also coordinate these teams: Engineering, Research.");
+    facts.bot.chiefOfStaff = false;
+    expect(buildBotOverview(facts).reaches.join(" ")).not.toContain("Engineering");
+  });
   it("yields all six wont lines in order and no does lines for a fresh bot", () => {
     const overview = buildBotOverview(baseFacts());
     expect(overview.wont).toEqual(WONT_ORDER);
@@ -58,6 +65,20 @@ describe("buildBotOverview", () => {
     expect(buildBotOverview(baseFacts({ bot })).wont).not.toContain(WONT_ORDER[0]);
     expect(buildBotOverview(baseFacts({ bot: { ...bot, approvalMode: "custom" } })).wont)
       .toContain("Command approvals follow the provider's custom configuration.");
+  });
+
+  it("does not promise duplicate profile or peer approvals in Full Access", () => {
+    const bot = { ...baseFacts().bot, peers: undefined, approvePeerComms: true, approvalMode: "full" as const, autoApprove: false };
+    const full = buildBotOverview(baseFacts({ bot })).wont;
+    expect(full).not.toContain("Asks before contacting other bots.");
+    expect(full).not.toContain("Profile proposal cards require your approval.");
+    for (const approvalMode of ["ask", "custom"] as const) {
+      const reviewed = buildBotOverview(baseFacts({ bot: { ...bot, approvalMode, autoApprove: true } })).wont;
+      expect(reviewed).toContain("Asks before contacting other bots.");
+      expect(reviewed).toContain("Profile proposal cards require your approval.");
+    }
+    expect(buildBotOverview(baseFacts({ bot: { ...bot, peers: [] } })).wont)
+      .toContain("Cannot initiate contact with other bots.");
   });
 
   it("does not advertise a browser disabled globally or unsupported by the engine", () => {

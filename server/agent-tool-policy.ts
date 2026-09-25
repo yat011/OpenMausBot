@@ -6,12 +6,15 @@
  */
 export const READ_ONLY_AGENT_TOOL_NAMES: ReadonlySet<string> = new Set([
   "list_bots",
+  "list_team_setup",
+  "list_shared_computers",
   "list_rooms",
   "list_threads",
   "check_delegation",
   "wait_delegation",
   "session_search",
   "session_read",
+  "tool_result_read",
   "list_routines",
   "skills_list",
 ]);

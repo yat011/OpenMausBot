@@ -1,10 +1,13 @@
+import { cloudRunner } from "@/lib/remote-desktop";
 import { useEffect, useRef, useState } from "react";
 import { CalendarClock, CalendarDays, ImageOff, Loader2, Monitor, Plus, X } from "lucide-react";
 
 import { cn } from "@/lib/cn";
+import { useCaptionChrome } from "@/components/DesktopCapabilities";
 import { usePageVisible } from "@/lib/page-visible";
 import { isRemoteScreenshotContention, remoteScreenshotSource } from "@/lib/remote-desktop";
 import type { Routine } from "@/lib/routines";
+import { scheduleLabel } from "@/lib/schedule-label";
 import { api, ApiError, useStore, type Bot } from "@/state/store";
 import { RoutineEditor } from "./RoutinesPage";
 
@@ -15,6 +18,7 @@ function viewerAddress(raw: unknown): string {
 }
 
 function routineScheduleLabel(routine: Routine) {
+  if (routine.schedule.type === "cron") return scheduleLabel(routine.schedule);
   if (routine.schedule.type === "once") {
     return new Date(routine.schedule.at).toLocaleString([], {
       month: "short",
@@ -55,6 +59,8 @@ function nextRunLabel(at: number | null) {
 
 export function RemoteDesktopPanel({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
+  // Docked flush under the Windows caption corner: drop the header 16px.
+  const { padClass } = useCaptionChrome();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [frame, setFrame] = useState<string | null>(null);
@@ -73,9 +79,7 @@ export function RemoteDesktopPanel({ bot }: { bot: Bot }) {
   );
   const cloudRoutineReady = Boolean(
     state.config?.box.configured &&
-      state.instances.some(
-        (instance) => instance.driverKind === "boxAgent" && instance.snapshot.state === "available",
-      ),
+      cloudRunner(state.instances, bot.modelSelection.instanceId)?.snapshot.state === "available",
   );
 
   useEffect(() => {
@@ -192,7 +196,7 @@ export function RemoteDesktopPanel({ bot }: { bot: Bot }) {
 
   return (
     <aside className="relative z-20 flex h-full w-[400px] shrink-0 flex-col border-l border-hairline bg-panel">
-      <div className="flex items-center justify-between border-b border-hairline px-5 py-4">
+      <div className={cn("flex items-center justify-between border-b border-hairline px-5 py-4", padClass)}>
         <div>
           <div className="text-[14px] font-medium text-ink">{bot.name}&apos;s computer</div>
           <div className="mt-0.5 text-[11px] text-ink-secondary">

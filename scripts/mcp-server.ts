@@ -572,6 +572,7 @@ function projectTask(task: Record<string, any>, activeThreadId: unknown) {
     title: task.title,
     createdAt: task.createdAt,
     ...(typeof task.busy === "boolean" ? { busy: task.busy } : {}),
+    ...(typeof task.waitingForTeammates === "boolean" ? { waitingForTeammates: task.waitingForTeammates } : {}),
     ...(task.activity ? { activity: task.activity } : {}),
     ...(task.modelSelection ? { modelSelection: task.modelSelection } : {}),
     ...(typeof activeThreadId === "string" ? { active: task.threadId === activeThreadId } : {}),
@@ -596,6 +597,7 @@ function projectBot(bot: Record<string, any>) {
     chiefOfStaff: Boolean(bot.chiefOfStaff),
     modelSelection: bot.modelSelection,
     busy: Boolean(bot.busy),
+    waitingForTeammates: Boolean(bot.waitingForTeammates),
     activity: bot.activity,
     unread: Boolean(bot.unread),
     activeTaskId: bot.threadId,
@@ -630,7 +632,9 @@ function projectMessage(message: Record<string, any>) {
       }
     : undefined;
   const tool = isRecord(message.tool)
-    ? { name: message.tool.name, ok: message.tool.ok, spoken: message.tool.spoken, setup: message.tool.setup }
+    ? { name: message.tool.name, ok: message.tool.ok, spoken: message.tool.spoken, setup: message.tool.setup,
+        ...(message.tool.terminal === true ? { terminal: true } : {}),
+      }
     : undefined;
   const connector = isRecord(message.connector)
     ? {
@@ -694,6 +698,9 @@ function messageNeedsInput(message: Record<string, any>): boolean {
 function dispatchFailedAfterLatestUser(messages: Array<Record<string, any>>): boolean {
   const lastUser = messages.findLastIndex((message) => message.role === "user");
   const turnMessages = messages.slice(lastUser + 1);
+  // Only an explicit terminal receipt overrides prose. Existing providers
+  // also emit diagnostics on intentional cancellation, which remain settled.
+  if (turnMessages.some((message) => message.tool?.terminal === true && message.tool.ok === false)) return true;
   if (turnMessages.some((message) => message.role === "bot" && message.kind === "text" && message.text?.trim())) {
     return false;
   }
@@ -1088,7 +1095,7 @@ export async function handleToolCall(
           if (task.activity === "waiting-on-you") return terminal("needs-user");
           if (task.activity === "dead") return terminal("failed");
           if (task.activity === "no-signal") return terminal("stalled");
-          if (!task.busy) return terminal("settled");
+          if (!task.busy && !task.waitingForTeammates) return terminal("settled");
           sawBusy = true;
         } else {
           if (target.threadId !== taskId) return terminal("settled");

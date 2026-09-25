@@ -19,6 +19,7 @@ struct ChatListView: View {
     @State private var searching = false
     @State private var searchOpen = false
     @State private var showingUpdates = false
+    @State private var showingWalkie = false
     @State private var showingNewGroup = false
     @State private var showingNewSection = false
     @State private var expandedBots = Set<String>()
@@ -105,8 +106,7 @@ struct ChatListView: View {
             .overlay(alignment: .top) {
                 if CompanionLayout.supportsIslandPresentation {
                     NeedsYouIsland(
-                        update: session.state.updates.first { $0.kind == .needsYou },
-                        hasIsland: IslandGeometry.hasIsland(topInset: geo.safeAreaInsets.top)
+                        update: session.state.updates.first { $0.kind == .needsYou }
                     ) { chat in path.append(chat) }
                 }
             }
@@ -131,6 +131,9 @@ struct ChatListView: View {
                 if ProcessInfo.processInfo.arguments.contains("-open-new-section") {
                     showingNewSection = true
                 }
+                if ProcessInfo.processInfo.arguments.contains("-open-walkie") {
+                    showingWalkie = true
+                }
                 if ProcessInfo.processInfo.arguments.contains("-open-first"),
                    path.isEmpty, let first = chats.first {
                     path.append(first.chat)
@@ -142,6 +145,13 @@ struct ChatListView: View {
                     showingUpdates = false
                     path.append(chat)
                 }
+            }
+            .fullScreenCover(isPresented: $showingWalkie) {
+                WalkieView { chat in
+                    showingWalkie = false
+                    path.append(chat)
+                }
+                .environmentObject(session)
             }
             .sheet(isPresented: $showingNewGroup) {
                 NewGroupSheet { room in
@@ -234,8 +244,31 @@ struct ChatListView: View {
 
     // MARK: - Sidebar sections
 
+    /// Every thread across every bot that needs the person right now — the
+    /// same rule and order as the thread tree, so the inbox can never
+    /// disagree with it.
+    private var attention: [AttentionThread] {
+        crossBotAttentionThreads(session.state.bots)
+    }
+
     @ViewBuilder
     private var rosterSections: some View {
+        if !attention.isEmpty {
+            sectionLabel(Text("Needs attention"))
+                .padding(.top, 10)
+                .padding(.bottom, 4)
+            ForEach(attention) { entry in
+                Button {
+                    Haptics.selection()
+                    openAttention(entry)
+                } label: {
+                    AttentionRow(entry: entry)
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+            }
+        }
+
         if let chief = session.state.unsectionedChief {
             botRows(summaries(for: [chief]))
         }
@@ -320,7 +353,9 @@ struct ChatListView: View {
     private func botRows(_ rows: [ChatSummary]) -> some View {
         ForEach(Array(rows.enumerated()), id: \.element.id) { index, summary in
             VStack(spacing: 0) {
-                NavigationLink(value: summary.chat) {
+                Button {
+                    path.append(session.threadSelection.restoringThread(summary.chat, connectionID: session.connection?.id))
+                } label: {
                     ChatRow(
                         chat: summary.chat,
                         preview: summary.preview,
@@ -413,6 +448,7 @@ struct ChatListView: View {
             updatesButton
                 .frame(width: 180)
             searchButton
+            walkieButton
             if session.canAdminister {
                 sectionButton
                 newBotButton
@@ -425,6 +461,7 @@ struct ChatListView: View {
             updatesButton
                 .frame(minWidth: 148)
             searchButton
+            walkieButton
             // Creating bots and sections needs the admin scope on a server;
             // a chat-only phone is not shown buttons the server would refuse.
             if session.canAdminister {
@@ -461,6 +498,15 @@ struct ChatListView: View {
             searchFocused = true
         }
         .accessibilityLabel("Search")
+    }
+
+    /// Walkie: hold-to-talk with every agent's state at a glance.
+    private var walkieButton: some View {
+        GlassButton(systemImage: "waveform", size: 48, weight: .semibold) {
+            Haptics.selection()
+            showingWalkie = true
+        }
+        .accessibilityLabel("Walkie")
     }
 
     private var sectionButton: some View {
@@ -514,7 +560,12 @@ struct ChatListView: View {
 
     private func matchesThread(_ chat: Chat) -> Bool {
         guard case let .bot(bot) = chat else { return false }
-        return !bot.threadGroups(matching: query).isEmpty
+        return !bot.threadGroups(matching: query, queuedThreadIds: session.state.queuedThreadIds).isEmpty
+    }
+
+    private func openAttention(_ entry: AttentionThread) {
+        guard let bot = entry.destinationBot(in: session.state) else { return }
+        path.append(Chat.bot(bot))
     }
 
     private func summaries(for bots: [Bot]) -> [ChatSummary] {
@@ -600,6 +651,56 @@ struct GroupTile: View {
 
     private func memberBots(_ room: Room) -> [Bot] {
         room.memberIds.compactMap { session.state.bot($0) }
+    }
+}
+
+/// One thread that needs the person, from any bot: title, status, and the
+/// bot it belongs to, ready to jump straight there. Waiting outranks
+/// working, which outranks queued and unread — the same order as the tree.
+struct AttentionRow: View {
+    let entry: AttentionThread
+
+    private var waiting: Bool { entry.task.activity == "waiting-on-you" }
+    private var working: Bool { !waiting && (entry.task.busy == true || entry.task.activity == "working") }
+    private var queued: Bool { !waiting && !working && entry.task.activity == "queued" }
+
+    private var statusText: String {
+        if waiting { return "Waiting on you" }
+        if working { return "Working" }
+        if queued { return "Queued" }
+        return "Unread"
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Group {
+                if working {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: waiting ? "exclamationmark.circle.fill" : queued ? "clock" : "bell.badge.fill")
+                        .font(.system(size: 15, weight: .medium))
+                }
+            }
+            .foregroundStyle(waiting ? Color.orange : queued ? Color.secondary : Color.accentColor)
+            .frame(width: 24)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verbatim: entry.task.displayTitle)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Color.primary)
+                    .lineLimit(1)
+                Text("\(entry.botName) · \(statusText)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 8)
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(entry.task.displayTitle), \(entry.botName), \(statusText)")
     }
 }
 

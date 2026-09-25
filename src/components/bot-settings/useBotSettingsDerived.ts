@@ -9,6 +9,7 @@ import { instanceSupportsLocalComputer, localComputerDisabledReason, localComput
 import { stateForBot } from "@/lib/mascot";
 import { useStore, type Bot } from "@/state/store";
 import { approvalModeFor } from "../../../shared/approval-mode";
+import { connectorGrantsState, type ConnectorGrantsState } from "@/lib/connector-grants";
 
 export type BotPatch = Partial<
   Pick<
@@ -31,13 +32,22 @@ export type BotPatch = Partial<
     | "speakReplies"
     | "voice"
     | "chiefOfStaff"
+    | "managedSections"
     | "approvePeerComms"
     | "composio"
     | "browser"
     | "mcpServers"
     | "modelSelection"
   >
-> & { computer?: Bot["computer"] | null; acknowledgeLocalAuto?: boolean; confirmFullAccess?: boolean };
+> & {
+  computer?: Bot["computer"] | null;
+  /** null drops the explicit record and returns the bot to the legacy
+   * all-tools boolean. */
+  connectorTools?: Bot["connectorTools"] | null;
+  acknowledgeLocalAuto?: boolean;
+  confirmFullAccess?: boolean;
+  acknowledgePeerScope?: boolean;
+};
 
 export function useBotSettingsDerived(bot: Bot) {
   const { state, dispatch } = useStore();
@@ -60,6 +70,7 @@ export function useBotSettingsDerived(bot: Bot) {
   const canUseVps = engine?.capabilities?.computerMcp === true && engine.driverKind !== "boxAgent";
   const connectedAppsConfigured = state.config?.composio?.configured === true;
   const connectedAppsEnabled = bot.composio !== false;
+  const connectorGrantState: ConnectorGrantsState = connectorGrantsState(bot);
   const canUseBrowser = engine?.capabilities?.browserMcp === true;
   const desktopBrowser = browserAvailable(state.config);
   const browserBlockedOnWindows = window.ogb?.platform === "win32" && !desktopBrowser;
@@ -93,6 +104,7 @@ export function useBotSettingsDerived(bot: Bot) {
     canUseVps,
     connectedAppsConfigured,
     connectedAppsEnabled,
+    connectorGrantState,
     canUseBrowser,
     desktopBrowser,
     browserBlockedOnWindows,

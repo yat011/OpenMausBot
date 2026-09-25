@@ -55,6 +55,18 @@ describe("local computer UI eligibility", () => {
     ).toBe(false);
   });
 
+  it("keeps This computer selectable on Windows before the driver is live", () => {
+    const capabilities = {
+      host: { platform: "win32" as const, label: "Windows" },
+      localComputer: { available: false, enabled: false, status: "unavailable" },
+    } as DesktopCapabilities;
+    expect(localComputerSelectable({ capabilities, providerSupportsLocal: true })).toBe(true);
+    expect(localComputerSelectable({ capabilities, providerSupportsLocal: false })).toBe(false);
+    expect(localComputerDisabledReason({ capabilities, providerSupportsLocal: true })).toContain(
+      "Cua Driver",
+    );
+  });
+
   it("states that Linux Auto never selects this computer", () => {
     expect(linuxAutoDescription()).toContain("otherwise computer use stays off");
     expect(
@@ -101,6 +113,19 @@ describe("local computer UI eligibility", () => {
         localSelectable: true,
       }),
     ).toBe(false);
+  });
+
+  it("reports an inherited team Box without choosing a private Box or local fallback", () => {
+    for (const configured of [false, true]) {
+      for (const boxState of [null, "idle", "archived", "provisioning"]) {
+        for (const canUseCloud of [false, true]) {
+          expect(resolveBoxPanelAction({ computer: undefined, configured, boxState, canUseCloud,
+            autoLocal: true, teamComputer: true })).toBe("team-box");
+        }
+      }
+    }
+    expect(resolveBoxPanelAction({ computer: "cloud", configured: true, boxState: "idle",
+      canUseCloud: true, autoLocal: true, teamComputer: true })).toBe("ensure-box");
   });
 
   it("never creates a missing Box merely because an Auto panel opened", () => {
@@ -157,6 +182,23 @@ describe("local computer UI eligibility", () => {
       canUseCloud: true,
       autoLocal: true,
     })).toBe("ensure-box");
+  });
+
+  it("watches instead of provisioning while a turn owns the box", () => {
+    const cloud = { computer: "cloud" as const, configured: true, canUseCloud: true, autoLocal: true, busy: true };
+    // a ready box is shown as it is — its frames already stream in mid-turn
+    for (const boxState of ["ready", "idle", "running"]) {
+      expect(resolveBoxPanelAction({ ...cloud, boxState })).toBe("attach-ready-box");
+    }
+    // anything else is the turn's to create or wake; the panel waits
+    for (const boxState of ["archived", "stopped", "provisioning", null]) {
+      expect(resolveBoxPanelAction({ ...cloud, boxState })).toBe("busy-box");
+    }
+    // busy never unlocks the cloud when it is not available
+    expect(resolveBoxPanelAction({ ...cloud, boxState: "ready", canUseCloud: false })).toBe("auto-unavailable");
+    // and Auto stays observation-only regardless of busy
+    expect(resolveBoxPanelAction({ ...cloud, computer: undefined, boxState: "ready" })).toBe("show-ready-box");
+    expect(resolveBoxPanelAction({ ...cloud, computer: undefined, boxState: null, autoLocal: false })).toBe("auto-unavailable");
   });
 
   it("never gives the box-native engine a passive Auto creation exception", () => {

@@ -154,6 +154,27 @@ const makeBot = async (
   return { id, threadId: str(field(created.body, "bot", "threadId")) };
 };
 
+/** A Chief of Staff coordinator with managed sections. */
+const makeCoordinator = async (
+  name: string,
+  section: string,
+  managedSections: string[],
+  instanceId = "claude",
+): Promise<{ id: string; threadId: string }> => {
+  const created = await api("POST", "/api/bots");
+  const id = str(field(created.body, "bot", "id"));
+  const patched = await api("PATCH", `/api/bots/${id}`, {
+    name,
+    section,
+    chiefOfStaff: true,
+    managedSections,
+    acknowledgePeerScope: true,
+    modelSelection: { instanceId, model: "claude-sonnet-5" },
+  });
+  expect(patched.status).toBe(200);
+  return { id, threadId: str(field(created.body, "bot", "threadId")) };
+};
+
 const makeRoom = async (
   name: string,
   memberIds: string[],
@@ -341,7 +362,7 @@ describe("peer comms from a room turn", () => {
 });
 
 describe("a room turn and the teammates outside the room", () => {
-  it("tells the bot who its @mentions cannot reach, and shows a mention that missed", async () => {
+  it("routes room work through target discovery, keeps mentions local, and shows a mention that missed", async () => {
     const speaker = await makeBot("Room Speaker", "Reach", "mentioner");
     const inside = await makeBot("Room Inside", "Reach");
     const outside = await makeBot(OUTSIDE_BOT, "Reach");
@@ -358,11 +379,13 @@ describe("a room turn and the teammates outside the room", () => {
     // that shape fails the assertions below rather than the parse.
     const dump = JSON.parse(readFileSync(mentionerDump, "utf8")) as { systemPrompt?: string };
     const system = String(dump.systemPrompt ?? "");
-    // the room turn is told who an @mention cannot reach, and how to reach them
-    expect(system).toContain("An @mention only reaches the members of this room");
-    expect(system).toContain(`- ${OUTSIDE_BOT} — General assistant (available)`);
-    expect(system).toContain("ask_bot");
-    // room members are the @mention roster, not this one; other sections stay unseen
+    // Ordinary rooms have one coordination path. Discovery supplies eligible
+    // room IDs; a plain mention still cannot silently summon an outside bot.
+    expect(system).toContain("Plain @mentions are only for conversational replies in this room");
+    expect(system).toContain("list_room_targets");
+    expect(system).toContain("coordinate_bots");
+    expect(system).not.toContain("ask_bot");
+    // Do not duplicate the peer catalog in the prompt; other sections stay unseen.
     expect(system).not.toContain("- Room Inside — General assistant");
     expect(system).not.toContain("Elsewhere Bot");
 
@@ -544,6 +567,52 @@ describe("post_to_room", () => {
     const refused = await post(inside.id, inside.threadId, mixed.id, "hello other section");
     expect(refused.status).toBe(403);
     expect(str(refused.body.error)).toContain("outside your section");
+    expect(await messagesOf(mixed.threadId)).toHaveLength(0);
+  }, 40_000);
+
+  it.each(["Coordinators", ""])("allows a section bot to post to and list a room holding its supervising coordinator in section %j", async (section) => {
+    const member = await makeBot("Build Member", "Build");
+    const coordinator = await makeCoordinator("Build Chief", section, ["Build"]);
+    const room = await makeRoom("Build Room", [member.id, coordinator.id], "Build");
+
+    const listed = await internal("GET", `/api/internal/rooms?fromBotId=${member.id}&fromThreadId=${member.threadId}`);
+    expect(listed.status).toBe(200);
+    const rooms = Array.isArray(listed.body.rooms) ? listed.body.rooms : [];
+    expect(rooms.some((r) => field(r as Record<string, unknown>, "id") === room.id)).toBe(true);
+
+    const posted = await post(member.id, member.threadId, room.id, "ready for review");
+    expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+    const roomMessages = await messagesOf(room.threadId);
+    expect(roomMessages.some((m) => m.text === "ready for review" && m.from?.botId === member.id)).toBe(true);
+  }, 40_000);
+
+  it("refuses a section bot if the room includes a coordinator who does not manage its section", async () => {
+    await makeBot("Finance Bot", "Finance");
+    const member = await makeBot("Build Worker", "Build");
+    const coordinator = await makeCoordinator("Finance Chief", "Coordinators", ["Finance"]);
+    const room = await makeRoom("Unsupervised Room", [member.id, coordinator.id], "Build");
+
+    const listed = await internal("GET", `/api/internal/rooms?fromBotId=${member.id}&fromThreadId=${member.threadId}`);
+    expect(listed.status).toBe(200);
+    const rooms = Array.isArray(listed.body.rooms) ? listed.body.rooms : [];
+    expect(rooms.some((r) => field(r as Record<string, unknown>, "id") === room.id)).toBe(false);
+
+    const refused = await post(member.id, member.threadId, room.id, "hello");
+    expect(refused.status).toBe(403);
+    expect(str(refused.body.error)).toContain("outside your section");
+    expect(await messagesOf(room.threadId)).toHaveLength(0);
+  }, 40_000);
+
+  it("still refuses a room holding both a supervising coordinator and an outside bot", async () => {
+    const member = await makeBot("Team Member", "Build");
+    const coordinator = await makeCoordinator("Team Chief", "Coordinators", ["Build"]);
+    const stranger = await makeBot("Finance Stranger", "Finance");
+    const mixed = await makeRoom("Mixed Room", [member.id, coordinator.id, stranger.id], "Build");
+
+    const refused = await post(member.id, member.threadId, mixed.id, "hello everyone");
+    expect(refused.status).toBe(403);
+    expect(str(refused.body.error)).toContain("outside your section");
+    expect(str(refused.body.error)).toContain("@Finance Stranger");
     expect(await messagesOf(mixed.threadId)).toHaveLength(0);
   }, 40_000);
 

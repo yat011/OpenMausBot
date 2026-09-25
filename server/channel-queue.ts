@@ -8,6 +8,8 @@
 
 import { newId } from "./contracts.ts";
 import { chatFollowups, saveChatFollowup, settleChatFollowups } from "./message-db.ts";
+import type { ResolvedSender } from "../shared/wire.ts";
+import type { UsageTrigger } from "./usage-ledger.ts";
 
 interface ChannelQueueItem {
   id: string;
@@ -17,6 +19,10 @@ interface ChannelQueueItem {
   mode: "chat" | "goal";
   /** kept so the drain appends it with the same provenance it arrived with */
   via?: "api";
+  /** the person who sent it, so the drained line still names them */
+  sender?: ResolvedSender;
+  /** who the ledger books the room turn it starts to, captured when sent */
+  trigger?: UsageTrigger;
 }
 
 interface ChannelQueueEntry {
@@ -50,6 +56,8 @@ export function queueChannelMessage(
     sendId?: string;
     mode?: "chat" | "goal";
     via?: "api";
+    sender?: ResolvedSender;
+    trigger?: UsageTrigger;
   } = {},
 ): QueuedChannelMessage {
   const entry = queues.get(threadId) ?? { groupId, items: [] };
@@ -61,6 +69,8 @@ export function queueChannelMessage(
     sendId: options.sendId,
     mode: options.mode ?? "chat",
     via: options.via,
+    sender: options.sender,
+    trigger: options.trigger,
   };
   saveChatFollowup({ id: item.id, kind: "channel", ownerId: groupId, threadId, payload: item });
   entry.items.push(item);
@@ -91,6 +101,73 @@ export function cancelChannelMessage(groupId: string, queueId: string): boolean 
     return true;
   }
   return false;
+}
+
+/** A channel thread's queue lifted out of the map while a live steer is
+ * attempted against the room's running speaker. */
+export interface HeldChannelQueue {
+  groupId: string;
+  threadId: string;
+  items: ChannelQueueItem[];
+}
+
+/** Atomically lift a channel thread's whole queue out for a live steer. The
+ * entry leaves first so a room that settles while the adapter is still
+ * thinking can never also drain the same words as a follow-up turn. Only
+ * the HEAD can be lifted: the success path steers and settles items[0], so
+ * a request naming a later item must not lift the queue at all (it would
+ * steer and delete a different message's words). The caller must either
+ * restore the held queue or settle its head. */
+export function holdChannelQueue(groupId: string, threadId: string, queueId: string): HeldChannelQueue | null {
+  const entry = queues.get(threadId);
+  if (!entry || entry.groupId !== groupId || entry.items[0]?.id !== queueId) return null;
+  queues.delete(threadId);
+  return { groupId, threadId, items: entry.items };
+}
+
+/** Put a held queue back after the steer was refused. Words queued while the
+ * hold was open keep their place behind the restored items. */
+export function restoreHeldChannelQueue(held: HeldChannelQueue): void {
+  const existing = queues.get(held.threadId);
+  if (existing && existing.groupId !== held.groupId) throw new Error("queued task belongs to another channel");
+  queues.set(held.threadId, {
+    groupId: held.groupId,
+    items: existing ? [...held.items, ...existing.items] : held.items,
+  });
+}
+
+/** Resolve the held head's reply target through a caller-supplied resolver.
+ * The queue is already lifted out of the map here, so a target that cannot
+ * be resolved (missing, non-text, empty — state drift between queueing and
+ * the steer) must not strand the held words outside it until restart:
+ * restore first, then let the error propagate to the request. */
+export function resolveHeldReplyTarget<T>(
+  held: HeldChannelQueue,
+  resolve: (threadId: string, replyToId: string) => T,
+): T | undefined {
+  const head = held.items[0];
+  if (!head?.replyToId) return undefined;
+  try {
+    return resolve(held.threadId, head.replyToId);
+  } catch (error) {
+    restoreHeldChannelQueue(held);
+    throw error;
+  }
+}
+
+/** Mark a held queue's head delivered — its words were folded into the
+ * running turn — and re-queue the rest for the room's normal one-at-a-time
+ * drain. A restart must not replay the steered head as a fresh follow-up. */
+export function settleHeldChannelQueueHead(held: HeldChannelQueue): void {
+  const [head, ...rest] = held.items;
+  settleChatFollowups([head.id], null);
+  if (rest.length === 0) return;
+  const existing = queues.get(held.threadId);
+  if (existing && existing.groupId !== held.groupId) throw new Error("queued task belongs to another channel");
+  queues.set(held.threadId, {
+    groupId: held.groupId,
+    items: existing ? [...rest, ...existing.items] : rest,
+  });
 }
 
 /**

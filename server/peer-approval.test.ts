@@ -3,7 +3,7 @@
 // and the composer stays disabled behind it — so a gate that works
 // perfectly can still make a thread unusable. These tests pin the settle.
 import { rmSync } from "node:fs";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
@@ -42,6 +42,8 @@ describe("peer approval card lifecycle", () => {
   });
 
   afterEach(() => {
+    cancelPeerApprovalsFor(from.id);
+    vi.useRealTimers();
     closeMessageDb();
     rmSync(DATA_DIR, { recursive: true, force: true });
   });
@@ -68,6 +70,18 @@ describe("peer approval card lifecycle", () => {
     resolvePeerComms(bus, card.card!.requestId!, "deny");
     expect(await verdict).toBe("deny");
     expect(store.messagesFor(from.threadId).find((m) => m.id === card.id)?.card?.answered).toBe("deny");
+  });
+
+  it("expires without attributing a decision to the user, and rejects late answers", async () => {
+    vi.useFakeTimers();
+    const verdict = requestPeerApproval(bus, from, target, "ping", "delegate_bot");
+    const card = pendingCard(store, from)!;
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    expect(await verdict).toBe("expired");
+    expect(store.messagesFor(from.threadId).find(m => m.id === card.id)?.card)
+      .toMatchObject({ answered: "deny", dismissed: true });
+    expect(resolvePeerComms(bus, card.card!.requestId!, "allow")).toBe(false);
+    expect(pendingCard(store, from)).toBeUndefined();
   });
 
   // The card is the one bot-to-bot event that blocks on a person. Everything
@@ -138,7 +152,7 @@ describe("peer approval card lifecycle", () => {
     expect(store.messagesFor(taskB.threadId).find((message) => message.id === cardB.id)?.card?.answered).toBeUndefined();
 
     cancelPeerApprovalsForThread(taskB.threadId);
-    await expect(answerB).resolves.toBe("deny");
+    await expect(answerB).resolves.toBe("cancelled");
     expect(store.taskByThread(from.id, threadA)?.activity).toBe("working");
   });
 
@@ -151,6 +165,25 @@ describe("peer approval card lifecycle", () => {
     await expect(requestPeerApproval(bus, from, target, "ping", "ask_bot")).resolves.toBe("allow");
     expect(frames).toEqual([]);
     expect(store.bot(from.id)?.activity).toBe("working");
+  });
+
+  it("honors Full only for the exact source conversation without prompting or notifying", async () => {
+    const frames: Array<Notification | null> = [];
+    const fullThread = from.threadId;
+    const askThread = store.createTask(from.id, "Ask sibling")!.threadId;
+    store.patchBot(from.id, { approvalMode: "full" });
+    bus = { store, broadcast: () => {}, notify: frame => frames.push(frame),
+      autoApply: (botId, threadId) => botId === from.id && threadId === fullThread };
+    for (const action of ["ask_bot", "delegate_bot", "post_to_room"] as const) {
+      await expect(requestPeerApproval(bus, from, target, "ping", action, fullThread)).resolves.toBe("allow");
+    }
+    expect(store.messagesFor(fullThread).some(message => message.card?.requestId)).toBe(false);
+    expect(frames).toEqual([]);
+    const pending = requestPeerApproval(bus, from, target, "ask sibling", "ask_bot", askThread);
+    const card = store.messagesFor(askThread).find(message => message.card?.requestId)!.card!;
+    expect(card.answered).toBeUndefined();
+    resolvePeerComms(bus, card.requestId!, "deny");
+    await expect(pending).resolves.toBe("deny");
   });
 
   it("answers an unknown requestId as not-ours, so provider cards still route", () => {
@@ -170,28 +203,30 @@ describe("peer approval card lifecycle", () => {
     const card = pendingCard(store, from);
     expect(card).toBeTruthy();
     cancelPeerApprovalsFor(impostor.id);
-    await expect(verdict).resolves.toBe("deny");
+    await expect(verdict).resolves.toBe("cancelled");
   });
 
-  it("denies and settles when the bot on either side is deleted", async () => {
+  it.each(["from", "target"] as const)("cancels and settles when the %s bot is deleted", async (side) => {
     const verdict = requestPeerApproval(bus, from, target, "ping", "ask_bot");
     const card = pendingCard(store, from)!;
 
-    cancelPeerApprovalsFor(target.id);
+    cancelPeerApprovalsFor(side === "from" ? from.id : target.id);
 
-    expect(await verdict).toBe("deny");
+    expect(await verdict).toBe("cancelled");
+    expect(resolvePeerComms(bus, card.card!.requestId!, "allow")).toBe(false);
     const settled = store.messagesFor(from.threadId).find((m) => m.id === card.id);
     expect(settled?.card?.answered).toBe("deny");
     expect(settled?.card?.dismissed).toBe(true); // not the user's answer
   });
 
-  it("denies and settles approvals owned by an interrupted thread", async () => {
+  it("cancels and settles approvals owned by an interrupted thread", async () => {
     const verdict = requestPeerApproval(bus, from, target, "ping", "ask_bot");
     const card = pendingCard(store, from)!;
 
     cancelPeerApprovalsForThread(from.threadId);
 
-    expect(await verdict).toBe("deny");
+    expect(await verdict).toBe("cancelled");
+    expect(resolvePeerComms(bus, card.card!.requestId!, "allow")).toBe(false);
     const settled = store.messagesFor(from.threadId).find((m) => m.id === card.id);
     expect(settled?.card?.answered).toBe("deny");
     expect(settled?.card?.dismissed).toBe(true);

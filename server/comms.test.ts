@@ -1,8 +1,11 @@
-// Agent-to-agent comms, end to end: boots the real harness server with the
-// grokAgent driver pointed at the fake ACP CLI in ask-peer mode, then has
+// Legacy routine agent-to-agent comms, end to end: boots the real harness
+// server with the grokAgent driver pointed at the fake ACP CLI, then has
 // bot A's "agent" reach bot B through the injected agents proxy (list_bots →
 // ask_bot → B runs a real depth-1 turn → reply folds back into A's answer).
-// This exercises the whole chain the packaged app uses: startTurn →
+// Routines/webhooks retain this one-hop lifecycle; ordinary chat teamwork is
+// covered separately in direct-coordination.e2e.test.ts. Each legacy case
+// enters through an actual routine, not a private bypass of the new routing.
+// This exercises the whole chain the packaged app uses: routine → startTurn →
 // session/new mcpServers → agents-proxy → /api/internal/ask-bot →
 // askBotAndWait → bus fold. The internal endpoints' auth is pinned too.
 //
@@ -11,7 +14,7 @@
 // everywhere alongside the mention-resolution units.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,9 +50,15 @@ describe("mentionedBots", () => {
     expect(mentionedBots("mail milind@milind.dev please", peers)).toEqual([]);
     expect(mentionedBots("@Ghost around?", peers)).toEqual([]);
   });
+  it("routes Markdown- and punctuation-wrapped mentions", () => {
+    expect(mentionedBots("**@Milind** (@New Bot 2) 【@New Bot】", peers).map((bot) => bot.id))
+      .toEqual(["3", "2", "1"]);
+    expect(mentionedBots("user@Milind /@Milind", peers)).toEqual([]);
+  });
   it("requires a word boundary at the end of the name", () => {
     expect(mentionedBots("ask @New Bottle about it", peers)).toEqual([]);
     expect(mentionedBots("@Milindo is someone else", peers)).toEqual([]);
+    expect(mentionedBots("@Milind𐐀 is someone else", peers)).toEqual([]);
   });
 });
 
@@ -73,6 +82,15 @@ describe("roomResponders", () => {
     expect(roomResponders("@everyone hello", members, { kind: "mentions" })).toEqual(members);
   });
 
+  it("applies the shared mention boundaries to everyone", () => {
+    const mentionsOnly = { kind: "mentions" } as const;
+    expect(roomResponders("**@EVERYONE** hello", members, mentionsOnly)).toEqual(members);
+    expect(roomResponders("【@everyone】 hello", members, mentionsOnly)).toEqual(members);
+    expect(roomResponders("@everyone調査 hello", members, mentionsOnly)).toEqual([]);
+    expect(roomResponders("@everyone𐐀 hello", members, mentionsOnly)).toEqual([]);
+    expect(roomResponders("user@everyone /@everyone", members, mentionsOnly)).toEqual([]);
+  });
+
   it("keeps bot-to-bot channels on their last-speaker routing", () => {
     expect(normalizeGroupDefaultResponder({ kind: "everyone" }, members.map((member) => member.id), true)).toEqual({
       kind: "mentions",
@@ -80,7 +98,7 @@ describe("roomResponders", () => {
   });
 });
 
-describe("comms e2e (fake ACP fleet)", () => {
+describe("legacy routine comms e2e (fake ACP fleet)", () => {
   let child: ChildProcess;
   let home: string;
   let gateFile = "";
@@ -101,6 +119,28 @@ describe("comms e2e (fake ACP fleet)", () => {
       body: body ? JSON.stringify(body) : undefined,
     });
     return { status: res.status, body: await res.json() };
+  };
+
+  const startRoutine = async (botId: string, text: string) => {
+    const created = await api("POST", "/api/routines", {
+      name: "Legacy communication fixture",
+      prompt: text,
+      botId,
+      enabled: false,
+      schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 },
+    });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const started = await api("POST", `/api/routines/${created.body.routine.id}/run`);
+    expect(started.status, JSON.stringify(started.body)).toBe(201);
+    let run: any;
+    await waitUntil(async () => {
+      run = (await api("GET", "/api/routines")).body.runs.find((candidate: any) => candidate.id === started.body.run.id);
+      return Boolean(run?.threadId);
+    }, 15_000, "routine execution thread was not created");
+    // Navigation does not grant execution authority. Select this disposable
+    // execution thread so the visible-bot assertions below inspect its output.
+    expect((await api("POST", `/api/bots/${botId}/tasks/${run.threadId}`)).status).toBe(200);
+    return { status: started.status, body: { run } };
   };
 
   beforeAll(async () => {
@@ -164,6 +204,17 @@ describe("comms e2e (fake ACP fleet)", () => {
             environment: { FAKE_ACP_MODE: "delegate-peer" },
             config: { cli: FAKE_CLI, fullAuto: true },
           },
+          // the same asker on an agent that cannot load its earlier session
+          askerNoLoad: {
+            driver: "grokAgent",
+            environment: {
+              FAKE_ACP_MODE: "delegate-peer",
+              FAKE_ACP_LOAD_NULL: "1",
+              FAKE_ACP_DUMP: join(home, "asker-no-load.json"),
+              FAKE_ACP_DUMP_PROMPT: "1",
+            },
+            config: { cli: FAKE_CLI, fullAuto: true },
+          },
           // A Chief that delegates only on the first assignment prompt, then
           // answers ordinary follow-ups while the worker remains gated.
           chiefAsync: {
@@ -188,11 +239,12 @@ describe("comms e2e (fake ACP fleet)", () => {
             environment: { FAKE_ACP_MODE: "exit-early" },
             config: { cli: FAKE_CLI, fullAuto: true },
           },
-          // a successful peer turn that deliberately emits no assistant
-          // text — the channel still needs a positive terminal record.
-          helperEmpty: {
+          // a successful peer turn that deliberately emits no assistant text,
+          // only an image — the channel still needs a positive terminal
+          // record for output a person can see but not read.
+          helperImage: {
             driver: "grokAgent",
-            environment: { FAKE_ACP_MODE: "empty-reply" },
+            environment: { FAKE_ACP_MODE: "image" },
             config: { cli: FAKE_CLI, fullAuto: true },
           },
           // a turn that remains busy until provider reload disposes it.
@@ -217,9 +269,8 @@ describe("comms e2e (fake ACP fleet)", () => {
       HOME: home,
       USERPROFILE: home,
       OMB_PORT: String(PORT),
-      // e2e-friendly ask ceiling: the timeout-conversion test needs the
-      // synchronous wait to end while the gated peer turn is still open
-      OMB_ASK_BOT_TIMEOUT_MS: "8000",
+      // Keep the production ask budget: the gated-peer test verifies the
+      // caller is released promptly without a test-only timeout override.
     };
     if (process.env.PATH) env.PATH = process.env.PATH;
     // Without SystemRoot, winsock fails to initialize in the child.
@@ -257,6 +308,29 @@ describe("comms e2e (fake ACP fleet)", () => {
     expect(ask.status).toBe(401);
   });
 
+  it.each([
+    { instanceId: "grok", tool: "ask_bot", prefix: "peer error:" },
+    { instanceId: "askerDelegate", tool: "delegate_bot", prefix: "delegate error:" },
+  ])("reports the removed $tool fixture call in ordinary chat instead of an empty reply", async ({ instanceId, tool, prefix }) => {
+    const caller = (await api("POST", "/api/bots")).body.bot;
+    await api("PATCH", `/api/bots/${caller.id}`, {
+      name: "Outdated fixture",
+      section: "Fixture protocol regression",
+      modelSelection: { instanceId, model: "fake-model" },
+    });
+    expect((await api("POST", `/api/bots/${caller.id}/messages`, { text: "Try the old communication fixture." })).status).toBe(202);
+    let current: any;
+    await waitUntil(async () => {
+      current = (await api("GET", "/api/bots")).body.bots.find((bot: any) => bot.id === caller.id);
+      return !current.busy && current.messages.some((message: any) => message.text?.startsWith(prefix));
+    }, 15_000, "the fixture did not surface its protocol error");
+    const answer = current.messages.findLast((message: any) => message.role === "bot" && message.kind === "text");
+    expect(answer.text).toContain(`Unknown tool: ${tool}`);
+    expect(answer.text).toContain("Fixture MCP request failed");
+    expect(current.messages.some((message: any) => /^(peer says:|delegated:)\s*$/.test(message.text ?? ""))).toBe(false);
+    await api("PATCH", `/api/bots/${caller.id}`, { hidden: true });
+  }, 30_000);
+
   it(
     "carries a question from bot A through the agents proxy to bot B and back",
     async () => {
@@ -269,8 +343,8 @@ describe("comms e2e (fake ACP fleet)", () => {
       const asker = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${asker.id}`, { name: "Asker", modelSelection: selection });
 
-      const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper ping" });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(asker.id, "hey @Helper ping");
+      expect(send.status).toBe(201);
 
       // wait for A's turn to settle with the peer's reply folded in
       const deadline = Date.now() + 25_000;
@@ -347,10 +421,8 @@ describe("comms e2e (fake ACP fleet)", () => {
         modelSelection: { instanceId: "geminiAsker", model: "gemini-3.8-flash-high" },
       });
 
-      const send = await api("POST", `/api/bots/${asker.id}/messages`, {
-        text: "Ask the other bot for a status check.",
-      });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(asker.id, "Ask the other bot for a status check.");
+      expect(send.status).toBe(201);
 
       const deadline = Date.now() + 30_000;
       let state: any;
@@ -414,6 +486,7 @@ describe("comms e2e (fake ACP fleet)", () => {
     "lets a section Chief create a safe operator and delegate work to it",
     async () => {
       const chief = (await api("POST", "/api/bots")).body.bot;
+      const defaultSelection = chief.modelSelection;
       await api("PATCH", `/api/bots/${chief.id}`, {
         name: "Atlas",
         section: "Launch",
@@ -421,10 +494,8 @@ describe("comms e2e (fake ACP fleet)", () => {
         modelSelection: { instanceId: "chiefCreator", model: "fake-model" },
       });
 
-      const send = await api("POST", `/api/bots/${chief.id}/messages`, {
-        text: "Create the specialist team and start the design review.",
-      });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(chief.id, "Create the specialist team and start the design review.");
+      expect(send.status).toBe(201);
 
       const deadline = Date.now() + 30_000;
       let operator: any;
@@ -448,7 +519,7 @@ describe("comms e2e (fake ACP fleet)", () => {
         composio: false,
         autoApprove: false,
         approvePeerComms: false,
-        modelSelection: { instanceId: "chiefCreator", model: "fake-model" },
+        modelSelection: defaultSelection,
       });
       expect(operator.chiefOfStaff).toBeFalsy();
       expect(operator.messages.some((message: any) => message.text?.includes("Review the new onboarding flow."))).toBe(true);
@@ -475,8 +546,8 @@ describe("comms e2e (fake ACP fleet)", () => {
       const asker = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${asker.id}`, { name: "Asker", modelSelection: askerSelection });
 
-      const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper please pick this up" });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(asker.id, "hey @Helper please pick this up");
+      expect(send.status).toBe(201);
 
       // wait for A's turn to settle: it should NOT have a "peer says:" line
       // (delegate_bot doesn't return the peer's reply to A) and the channel
@@ -550,6 +621,9 @@ describe("comms e2e (fake ACP fleet)", () => {
       expect(helperInbound.text).toContain("[Delegated by @Asker");
       expect(helperInbound.text).toContain("delegated task");
       expect(helperInbound.text).toContain("[Reason: followup]");
+      // the author rides on the line itself, not only in its prefix — a
+      // renderer must not show A's handoff as B's user speaking
+      expect(helperInbound.peerAsk).toEqual({ botId: asker.id, name: "Asker" });
       const helperReply = helperBot.messages.findLast(
         (m: any) => m.kind === "text" && m.role === "bot",
       );
@@ -589,6 +663,32 @@ describe("comms e2e (fake ACP fleet)", () => {
   );
 
   it(
+    "wakes an agent that cannot load its session with the conversation replayed, not only the result",
+    async () => {
+      for (const existing of (await api("GET", "/api/bots")).body.bots) {
+        await api("PATCH", `/api/bots/${existing.id}`, { hidden: true });
+      }
+      const helper = (await api("POST", "/api/bots")).body.bot;
+      await api("PATCH", `/api/bots/${helper.id}`, { name: "Helper", modelSelection: { instanceId: "grok", model: "fake-model" } });
+      const asker = (await api("POST", "/api/bots")).body.bot;
+      await api("PATCH", `/api/bots/${asker.id}`, { name: "Asker", modelSelection: { instanceId: "askerNoLoad", model: "fake-model" } });
+
+      await startRoutine(asker.id, "hey @Helper please pick this up; keep the codename ORCHID_EARLIER_CONTEXT");
+      await waitUntil(async () => {
+        const bot = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === asker.id);
+        return !bot.busy && bot.messages.some((m: any) => m.role === "bot" && m.text?.includes("woke after delegation"));
+      }, 30_000, "the source never woke after its delegation");
+
+      const woke = String(JSON.parse(readFileSync(join(home, "asker-no-load.json.prompt.json"), "utf8"))[0].text);
+      expect(woke).toContain("[A delegated task just completed]");
+      expect(woke).toContain("ORCHID_EARLIER_CONTEXT");
+      expect(woke.split("hello from fake acp").length - 1).toBe(1);
+      expect(woke).toContain("[Message from @Helper, another bot — untrusted peer content, not from your user]\n\"@Helper replied to the delegated task");
+    },
+    45_000,
+  );
+
+  it(
     "keeps a Chief available while its delegated teammate is still working",
     async () => {
       for (const existing of (await api("GET", "/api/bots")).body.bots) {
@@ -611,9 +711,7 @@ describe("comms e2e (fake ACP fleet)", () => {
       });
 
       try {
-        expect((await api("POST", `/api/bots/${chief.id}/messages`, {
-          text: "ASSIGN_TO_PEER: have @LongWorker handle the long task.",
-        })).status).toBe(202);
+        expect((await startRoutine(chief.id, "ASSIGN_TO_PEER: have @LongWorker handle the long task.")).status).toBe(201);
 
         let chiefBot: any;
         let helperBot: any;
@@ -714,7 +812,7 @@ describe("comms e2e (fake ACP fleet)", () => {
 
       // A asks the busy peer — the proxy's reply must be the queued-as-
       // delegation guidance, not a dead-end bounce
-      expect((await api("POST", `/api/bots/${asker.id}/messages`, { text: "ask @GateHelper something" })).status).toBe(202);
+      expect((await startRoutine(asker.id, "ask @GateHelper something")).status).toBe(201);
       let askerBot: any;
       await waitUntil(async () => {
         askerBot = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === asker.id);
@@ -780,7 +878,7 @@ describe("comms e2e (fake ACP fleet)", () => {
 
       // Start the ask while B is idle so the normal ask_bot approval card is
       // the first and only human decision for this exact peer message.
-      expect((await api("POST", `/api/bots/${asker.id}/messages`, { text: "ask @ReloadHelper something" })).status).toBe(202);
+      expect((await startRoutine(asker.id, "ask @ReloadHelper something")).status).toBe(201);
       let approvalCard: any;
       await waitUntil(async () => {
         const current = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === asker.id);
@@ -813,8 +911,9 @@ describe("comms e2e (fake ACP fleet)", () => {
         return queued && waiting && !current.busy;
       }, 25_000, "approved ask was not retained as a waiting delegation");
 
-      // Provider reload releases B without turn.completed. The explicit idle
-      // retry must still pick up the waiting handoff on the rebuilt fleet.
+      // Provider reload releases B without turn.completed. A's routine is
+      // waiting, not executing on a provider being replaced: its accepted
+      // handoff must still run on the rebuilt fleet without another approval.
       expect((await api("PUT", "/api/config", { xai: { key: `xai_retry_${Date.now()}` } })).status).toBe(200);
       writeFileSync(gateFile, "go");
 
@@ -873,8 +972,8 @@ describe("comms e2e (fake ACP fleet)", () => {
       });
 
       // the ask starts the peer's gated turn, which stays open well past
-      // the 8s ceiling — the asker must get a claim ticket, not a drop
-      expect((await api("POST", `/api/bots/${asker.id}/messages`, { text: "ask @SlowHelper for the numbers" })).status).toBe(202);
+      // the production inline budget — the asker must get a claim ticket, not a drop
+      expect((await startRoutine(asker.id, "ask @SlowHelper for the numbers")).status).toBe(201);
       let askerBot: any;
       await waitUntil(async () => {
         askerBot = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === asker.id);
@@ -883,6 +982,8 @@ describe("comms e2e (fake ACP fleet)", () => {
       }, 30_000, "asker never got the timeout-conversion reply");
       const conversionReply = askerBot.messages.findLast((m: any) => m.kind === "text" && m.role === "bot");
       expect(conversionReply.text).toContain("Task id:");
+      expect(conversionReply.text).toContain("after 15 seconds");
+      expect((await api("GET", "/api/bots?messages=0")).body.bots.find((b: any) => b.id === helper.id).busy).toBe(true);
       expect(conversionReply.text).toContain("delivered to this conversation automatically");
       expect(conversionReply.text).not.toContain("wait_delegation");
       expect(askerBot.messages.some(
@@ -909,17 +1010,17 @@ describe("comms e2e (fake ACP fleet)", () => {
   // ── delegation terminal-state mirroring ─────────────────────────────
   // A delegated turn is fire-and-forget. Its result is returned to the
   // initiating chat and mirrored into the A⇄B channel. These tests pin a
-  // successful empty reply plus both non-happy terminal states: the
+  // successful reply without text plus both non-happy terminal states: the
   // delegated turn crashed, and the delegated turn never started.
   it(
-    "mirrors a successful delegated turn with no reply as a completed terminal chip",
+    "mirrors a successful delegated turn with no text reply as a completed terminal chip",
     async () => {
       const seeded = (await api("GET", "/api/bots")).body.bots[0];
       await api("PATCH", `/api/bots/${seeded.id}`, { hidden: true });
       const helper = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${helper.id}`, {
         name: "Helper",
-        modelSelection: { instanceId: "helperEmpty", model: "fake-model" },
+        modelSelection: { instanceId: "helperImage", model: "fake-model" },
       });
       const asker = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${asker.id}`, {
@@ -927,8 +1028,8 @@ describe("comms e2e (fake ACP fleet)", () => {
         modelSelection: { instanceId: "askerDelegate", model: "fake-model" },
       });
 
-      const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper please pick this up" });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(asker.id, "hey @Helper please pick this up");
+      expect(send.status).toBe(201);
 
       const deadline = Date.now() + 30_000;
       let channel: any;
@@ -977,8 +1078,8 @@ describe("comms e2e (fake ACP fleet)", () => {
         modelSelection: { instanceId: "askerDelegate", model: "fake-model" },
       });
 
-      const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper please pick this up" });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(asker.id, "hey @Helper please pick this up");
+      expect(send.status).toBe(201);
 
       let channelId: string | undefined;
       const busyDeadline = Date.now() + 30_000;
@@ -1041,8 +1142,8 @@ describe("comms e2e (fake ACP fleet)", () => {
         modelSelection: { instanceId: "askerDelegate", model: "fake-model" },
       });
 
-      const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper please pick this up" });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(asker.id, "hey @Helper please pick this up");
+      expect(send.status).toBe(201);
 
       // settle = the channel exists (request mirrored) and carries the
       // failed terminal chip (B's turn started and crashed at initialize)
@@ -1096,8 +1197,8 @@ describe("comms e2e (fake ACP fleet)", () => {
         modelSelection: { instanceId: "askerDelegate", model: "fake-model" },
       });
 
-      const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper please pick this up" });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(asker.id, "hey @Helper please pick this up");
+      expect(send.status).toBe(201);
 
       const deadline = Date.now() + 30_000;
       let channel: any;
@@ -1154,8 +1255,8 @@ describe("comms e2e (fake ACP fleet)", () => {
       expect(approval.status).toBe(200);
       expect(approval.body.bot.approvePeerComms).toBe(true);
 
-      const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper needs approval" });
-      expect(send.status).toBe(202);
+      const send = await startRoutine(asker.id, "hey @Helper needs approval");
+      expect(send.status).toBe(201);
 
       // Wait for the options card to appear on A's thread. While the card
       // is open, B MUST NOT have started: no inbound user message, not busy,
@@ -1242,8 +1343,8 @@ describe("comms e2e (fake ACP fleet)", () => {
       approvePeerComms: true,
     });
 
-    const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper do not allow" });
-    expect(send.status).toBe(202);
+    const send = await startRoutine(asker.id, "hey @Helper do not allow");
+    expect(send.status).toBe(201);
 
     let askerBot: any;
     let helperBot: any;
@@ -1331,8 +1432,8 @@ describe("comms e2e (fake ACP fleet)", () => {
     const asker = (await api("POST", "/api/bots")).body.bot;
     await api("PATCH", `/api/bots/${asker.id}`, { name: "Asker", modelSelection: askerSelection });
 
-    const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "delegate this to @Helper please" });
-    expect(send.status).toBe(202);
+    const send = await startRoutine(asker.id, "delegate this to @Helper please");
+    expect(send.status).toBe(201);
 
     // Wait for B's depth-1 turn to settle and write its reply
     const deadline = Date.now() + 30_000;

@@ -1,5 +1,5 @@
-// Setup mode: a blank bot, or a /setup message, turns on a coaching block
-// that makes the bot interview the user and configure itself through cards.
+// Setup mode: only a /setup message turns on a coaching block
+// that makes the bot clarify the job and use result-aware configuration tools.
 import { describe, expect, it } from "vitest";
 
 import {
@@ -38,13 +38,16 @@ describe("expandSetupTurnText", () => {
 });
 
 describe("setupModeActive", () => {
-  it("is on for a blank bot regardless of the message", () => {
-    expect(setupModeActive({ soul: "", description: "", text: "hello" })).toBe(true);
-    expect(setupModeActive({ soul: "  \n", description: undefined, text: "hello" })).toBe(true);
-    expect(setupModeActive({ text: "hello" })).toBe(true);
+  it("does not turn an ordinary request into onboarding for a blank bot", () => {
+    for (const text of ["hello", "Summarize this report", "Run the daily check", "A teammate asked you to review this diff"]) {
+      expect(setupModeActive({ soul: "", description: "", text })).toBe(false);
+      expect(setupModeActive({ soul: "  \n", description: undefined, text })).toBe(false);
+      expect(setupModeActive({ text })).toBe(false);
+    }
   });
 
-  it("is off once either field is set, unless the message is /setup", () => {
+  it("requires /setup whether or not the profile has been filled in", () => {
+    expect(setupModeActive({ text: "/setup" })).toBe(true);
     expect(setupModeActive({ soul: "Be brief.", description: "", text: "hello" })).toBe(false);
     expect(setupModeActive({ soul: "", description: "Files bugs.", text: "hello" })).toBe(false);
     expect(setupModeActive({ soul: "Be brief.", description: "Files bugs.", text: "/setup" })).toBe(true);
@@ -65,7 +68,7 @@ describe("setupSystemPrompt", () => {
       expect(SETUP_PROMPT).toContain(tool);
     }
     expect(SETUP_PROMPT).toContain("at most four questions");
-    expect(SETUP_PROMPT).toContain("Wait for a yes");
+    expect(SETUP_PROMPT).toContain("Ask for missing choices, not an extra yes");
   });
 
   it("never mentions skill_manage when active with skills off (or unspecified)", () => {
@@ -79,7 +82,7 @@ describe("setupSystemPrompt", () => {
   });
 });
 
-describe("setupSystemPrompt working-folder clause and card ordering", () => {
+describe("setupSystemPrompt working-folder clause and result ordering", () => {
   it("names the current folder and tells the bot to offer to keep it", () => {
     const text = setupSystemPrompt(true, { skills: true, cwd: "/Users/me/Projects/site" });
     expect(text).toContain("today that is /Users/me/Projects/site; offer to keep it");
@@ -93,10 +96,15 @@ describe("setupSystemPrompt working-folder clause and card ordering", () => {
     expect(text).not.toContain("skill_manage");
   });
 
-  it("requires the summary message before the cards, and only a short line after", () => {
+  it("explains the requested changes before tools and follows applied versus pending outcomes", () => {
     const text = setupSystemPrompt(true, {});
-    expect(text).toContain("first send one message that lists the cards you are about to raise, then make the tool calls");
-    expect(text).toContain("the cards must appear after that message, never before it");
-    expect(text).toContain("After the tool calls add at most one short line");
+    expect(text).toContain("First send one message describing the changes you are about to request, then make the tool calls");
+    expect(text).toContain("if applied, continue without another confirmation");
+    expect(text).toContain("if pending, end the turn and wait");
+    expect(text).toContain("Do not repeat the list or claim success from the permission mode alone");
+    expect(text).toContain("A credential request still needs the user's secure entry");
+    expect(text).toContain("Full Access does not supply answers, credentials, or broader permissions for another bot");
+    expect(text).not.toContain("each of which the user must confirm");
+    expect(text).not.toContain("propose it paused");
   });
 });

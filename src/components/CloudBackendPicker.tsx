@@ -2,7 +2,7 @@
 // picker whenever a bot can end up on a cloud computer. One component, two
 // homes (ComputerPanel and the bot settings dialog's Access section), so the copy and the disabled
 // rules can never drift apart.
-import type { CloudBackend } from "../../server/contracts.ts";
+import type { CloudBackend } from "../../shared/wire";
 import { cn } from "@/lib/cn";
 
 export function CloudBackendPicker({

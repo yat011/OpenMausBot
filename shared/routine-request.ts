@@ -8,6 +8,8 @@
  * app restart without asking the model to interpret the request again.
  */
 
+import type { RoutineCronSchedule } from "./routine-schedule.ts";
+
 export type RoutineRequestRunOn = "maus" | "cloud";
 
 export interface RoutineRequestIntervalWindow {
@@ -18,6 +20,7 @@ export interface RoutineRequestIntervalWindow {
 export type RoutineRequestSchedule =
   | { type: "once"; at: number }
   | { type: "daily"; time: string; weekdays: number[] }
+  | RoutineCronSchedule
   | {
     type: "interval";
     everyMinutes: number;
@@ -55,6 +58,8 @@ export interface RoutineRequestDefinition {
   timeoutMinutes?: number;
   /** Carry the previous run's report into the next run. */
   continuity?: boolean;
+  /** Skip by default, or keep at most one scheduled run waiting. */
+  overlap?: "skip" | "queue";
 }
 
 export type RoutineRequestChanges =

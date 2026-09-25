@@ -1,10 +1,10 @@
-import { ComposerTray } from "./ComposerTray";
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import { ArrowUp, BookOpen, Clock, Mic, Paperclip, Square, Target, Users, X } from "lucide-react";
 import { useStore, visibleMessages, currentTaskBot, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { activeLocale, t } from "@/lib/i18n";
+import { useOwnerOrAdmin } from "@/lib/use-owner-or-admin";
 import {
   draftRevision,
   appendDraftAttachments,
@@ -26,8 +26,10 @@ import { BotAvatar } from "./Avatar";
 import { MentionTextarea } from "./MentionTextarea";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
+import { PlaceChip } from "./PlaceChip";
 import { FullAccessWarning } from "./FullAccessWarning";
 import { ApprovalModeSelector } from "./ApprovalModeSelector";
+import { CommandAllowlistDialog } from "./CommandAllowlistDialog";
 import { approvalModeFor, type ApprovalMode } from "../../shared/approval-mode";
 import {
   appendPastedText,
@@ -35,6 +37,7 @@ import {
   clipboardHasImages,
   clipboardImageFiles,
   composeMessage,
+  composerShouldRefocus,
   imageAttachmentFromFile,
   intakeFiles,
   isLongPaste,
@@ -49,12 +52,16 @@ import { goalCoordinatorForComposer, groupComposerHint, roomRespondersForCompose
 import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "./PendingApproval";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ReplyQuote } from "./ReplyQuote";
+import { useThreadRefs } from "./ThreadRefs";
 import {
   QueuedComposerMessages,
   composerCanSteerQueuedMessages,
+  doubleEnterSteerWindowExpiresAt,
+  doubleEnterSteersQueue,
 } from "./ComposerQueuedMessages";
 import { skillAuthoringEnabled } from "@/lib/feature-flags";
 import { mentionChoicesForQuery } from "@/lib/mentions";
+import { serializeThreadRefs, threadTokenFromPaste, threadTokenSpacing } from "@/lib/thread-refs";
 import {
   composerSlashTrigger,
   goalTextFromComposer,
@@ -90,7 +97,7 @@ export function Composer({
   onClearReply,
   onConsumeReply,
   onRestoreReply,
-  locked = false,
+  locked: setupLocked = false,
 }: {
   bot?: Bot;
   group?: Group;
@@ -104,7 +111,10 @@ export function Composer({
   locked?: boolean;
 }) {
   const bot = profile ? currentTaskBot(profile) : undefined;
+  const locked = setupLocked || Boolean(bot?.awaitingThreadSnapshot);
   const { state, dispatch } = useStore();
+  const ownerOrAdmin = useOwnerOrAdmin();
+  const { threads, currentBotId } = useThreadRefs();
   const { capabilities } = useDesktopCapabilities();
   const remoteClient = window.ogb?.remoteClient?.active === true;
   // Unified target: a 1:1 bot thread or a room. In a room the @ picker
@@ -112,11 +122,18 @@ export function Composer({
   // configured default responder.
   const busy = group ? Boolean(group.working || group.busyBotId) : Boolean(bot?.busy);
   // an engine with a live session takes a message INTO the running turn;
-  // for those the composer never locks — the server steers instead of 409
+  // for those the composer never locks — the server steers instead of 409.
+  // A room steers through its busy speaker's engine, mirroring how the
+  // server's queue-steer route resolves the running turn.
+  const steerInstanceId = group
+    ? members?.find((member) => member.id === group.busyBotId)?.modelSelection.instanceId
+    : bot?.modelSelection.instanceId;
   const canSteer =
-    !group && Boolean(bot) && state.instances.find((i) => i.instanceId === bot!.modelSelection.instanceId)?.capabilities?.queueing === true;
+    state.instances.find((i) => i.instanceId === steerInstanceId)?.capabilities?.queueing === true;
   // a pending approval blocks the prompt until it is answered
   const threadId = group?.threadId ?? bot?.threadId ?? "";
+  // The conversation's own place, when pinned; the chip reads it next to the bot default.
+  const composerTask = profile?.tasks?.find((task) => task.threadId === threadId);
   // the VISIBLE branch only — an approval left on a branch you edited away
   // from must not keep blocking the composer
   const approvals = pendingApprovals(group ? group.messages : bot ? visibleMessages(bot) : []);
@@ -203,6 +220,19 @@ export function Composer({
   const [dismissedAt, setDismissedAt] = useState<number | null>(null); // Esc'd this @
   const [dismissedSlashAt, setDismissedSlashAt] = useState<number | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // the latest caret, readable from callbacks without re-creating them
+  const caretRef = useRef(0);
+  caretRef.current = caret;
+  /** Returns keyboard focus to the draft, keeping the caret where it was. */
+  const refocusInput = useCallback(() => {
+    requestAnimationFrame(() => {
+      const input = inputRef.current;
+      if (!input || input.disabled || !composerShouldRefocus(document.activeElement, input)) return;
+      const at = Math.min(caretRef.current, input.value.length);
+      input.focus();
+      input.setSelectionRange(at, at);
+    });
+  }, []);
   const mentionListRef = useRef<HTMLDivElement>(null);
   // what was typed before the mic went on — partials append after it
   const baseText = useRef("");
@@ -346,17 +376,48 @@ export function Composer({
     if (group) dispatch({ type: "interruptGroup", groupId: group.id, threadId });
     else if (bot) dispatch({ type: "interrupt", botId: bot.id, threadId });
   };
+  const queueHeadId = queuedMessages[0]?.queueId;
   const steerQueued = () => {
+    if (!queueHeadId) return;
     setSteering(true);
+    const settle = () => setSteering(false);
+    if (group && canSteer) {
+      // A steer-capable room folds the queued head into the running turn
+      // through the server; it never interrupts the turn to do it.
+      dispatch({ type: "steerGroupQueued", groupId: group.id, threadId, queueId: queueHeadId, onError: settle, onSettled: settle });
+    } else if (group) {
+      // A room whose running engine cannot steer keeps the old behavior:
+      // Steer ends the running turn so the next queued message starts.
+      dispatch({ type: "interruptGroup", groupId: group.id, threadId, onError: settle });
+    } else if (bot && canSteer) {
+      // A steer-capable engine folds the queued words into the running turn
+      // through the server; it never interrupts the turn to do it.
+      dispatch({ type: "steerQueued", botId: bot.id, threadId, queueId: queueHeadId, onError: settle, onSettled: settle });
+    } else if (bot) {
     // Unlike the general Stop control, Steer belongs to this exact queue.
     // Scoping prevents a 1:1 queue from interrupting the same bot in a room
     // (or a routine) whose work is unrelated to the words shown here.
-    const onError = () => setSteering(false);
-    if (group) dispatch({ type: "interruptGroup", groupId: group.id, threadId, onError });
-    else if (bot) dispatch({ type: "interrupt", botId: bot.id, threadId, onError });
+      dispatch({ type: "interrupt", botId: bot.id, threadId, onError: settle });
+    }
   };
-  const queueHeadId = queuedMessages[0]?.queueId;
   useEffect(() => setSteering(false), [threadId, queueHeadId]);
+  // Double-Enter gesture: when a send lands as a queued chip on a busy
+  // steer-capable thread (live steer lost its race, an attachment, an
+  // older CLI), a second Enter within a short window pulls that queue into
+  // the running turn. Plain sends never consult the window, so they keep
+  // their normal latency.
+  const steerAgainUntilRef = useRef(0);
+  const prevPendingCountRef = useRef(pendingCount);
+  useEffect(() => {
+    const expiresAt = doubleEnterSteerWindowExpiresAt(
+      prevPendingCountRef.current,
+      pendingCount,
+      busy,
+      canSteer,
+    );
+    if (expiresAt !== null) steerAgainUntilRef.current = expiresAt;
+    prevPendingCountRef.current = pendingCount;
+  }, [pendingCount, busy, canSteer]);
   // Most engines acknowledge interruption quickly, but a lost response must
   // not leave a control claiming to steer forever. Queue drain or turn end
   // clears it immediately; twenty seconds is the final recovery floor.
@@ -375,16 +436,14 @@ export function Composer({
     botId: string;
     threadId: string;
   } | null>(null);
-  const [applyingThreadAccess, setApplyingThreadAccess] = useState(false);
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
+  const [commandAllowlistTarget, setCommandAllowlistTarget] = useState<{ botId: string; botName: string; threadId: string } | null>(null);
   // Approval mode belongs to one bot; a room has several, each with its own.
   const modeBot = group ? undefined : bot;
   const approvalEngine = modeBot
     ? state.instances.find((instance) => instance.instanceId === modeBot.modelSelection.instanceId)
     : undefined;
-  const canApplyBotFullAccess = Boolean(modeBot && profile && !remoteClient && window.ogb?.approvals && capabilities.host.packaged &&
-    approvalModeFor(profile) === "full" && approvalModeFor(modeBot) !== "full" &&
-    approvalEngine?.driverKind === state.instances.find((instance) => instance.instanceId === profile.modelSelection.instanceId)?.driverKind);
+  const trustedThreadAccess = Boolean(!remoteClient && window.ogb?.approvals && capabilities.host.packaged);
   const uploadImage = useCallback(async (file: File): Promise<Attachment | null> => {
     const optimistic = optimisticImageAttachment(file);
     if (!optimistic) return null;
@@ -424,10 +483,17 @@ export function Composer({
     } finally {
       changeDraftAttachmentPending(draftId, false);
     }
+    // the file dialog leaves focus on the paperclip button; typing should
+    // continue in the draft without another click
+    refocusInput();
   };
   const setApprovalMode = (mode: ApprovalMode) => {
     if (!modeBot || modeBot.busy || mode === approvalModeFor(modeBot)) return;
-    if (mode === "full" || mode === "custom") return;
+    if ((mode === "full" || mode === "custom") && !trustedThreadAccess) return;
+    if (mode === "full") {
+      setApprovalWarning({ mode, botId: modeBot.id, threadId: modeBot.threadId });
+      return;
+    }
     // Safe Auto still needs its dedicated warning when it can drive the host.
     if (mode === "auto" && modeBot.computer === "local") {
       setApprovalWarning({ mode: "auto", botId: modeBot.id, threadId: modeBot.threadId });
@@ -476,7 +542,9 @@ export function Composer({
       return;
     }
     // named `body`, not `t` — that name belongs to the catalog lookup now
-    const body = composeMessage(effectiveText, attachments);
+    // resolvable "#Title" runs leave as canonical links, so the thread id
+    // stays machine-readable in the stored send and the model's context
+    const body = composeMessage(serializeThreadRefs(effectiveText, threads, currentBotId), attachments);
     if (!body) return;
     const sentDraft: ComposerDraftSnapshot = {
       draftId,
@@ -565,8 +633,29 @@ export function Composer({
         return;
       }
     }
-    // a wall of text becomes a chip instead of burying the input
     const pasted = e.clipboardData.getData("text/plain");
+    // a pasted thread reference — canonical link, its markdown shape, or a
+    // raw UUID — becomes the token the composer holds when it names a
+    // thread the person can see; anything else stays ordinary text
+    const reference = threadTokenFromPaste(pasted, threads, currentBotId);
+    if (reference) {
+      e.preventDefault();
+      const start = e.currentTarget.selectionStart ?? text.length;
+      const end = e.currentTarget.selectionEnd ?? start;
+      // "#Title" only links at a word boundary, so keep the token clear of
+      // the words it may land between
+      const { lead, trail } = threadTokenSpacing(text, start, end);
+      const token = lead + reference.token + trail;
+      editText(text.slice(0, start) + token + text.slice(end));
+      const at = start + token.length;
+      setCaret(at);
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+        inputRef.current?.setSelectionRange(at, at);
+      });
+      return;
+    }
+    // a wall of text becomes a chip instead of burying the input
     if (!isLongPaste(pasted)) return;
     e.preventDefault();
     // Preserve native paste replacement semantics: if text was
@@ -781,6 +870,7 @@ export function Composer({
         <QueuedComposerMessages
           items={queuedMessages}
           onSteer={canSteerQueued ? steerQueued : undefined}
+          steerInterrupts={!canSteer}
           steerMode={group ? "next" : "all"}
           steering={steering}
           onCancel={(queueId) => {
@@ -800,19 +890,6 @@ export function Composer({
             className="pointer-events-none absolute -left-5 -right-5 -bottom-3 top-1/2 bg-app"
           />
         <div data-tour="composer" className="relative z-[1] rounded-3xl bg-composer px-2 py-1.5 ring-1 ring-composer-ring">
-        {canApplyBotFullAccess && modeBot && !locked && (
-          <button
-            type="button"
-            disabled={Boolean(profile?.busy || modeBot.busy || applyingThreadAccess)}
-            onClick={() => setApprovalWarning({ mode: "full", botId: modeBot.id, threadId: modeBot.threadId })}
-            className="block max-w-full px-3 pb-2 pt-1 text-left text-[12px] text-ink-secondary hover:text-ink disabled:opacity-50"
-            title={profile?.busy || modeBot.busy
-              ? "Stop this bot’s current work before changing this thread’s access"
-              : "Other existing threads keep their current approval levels"}
-          >
-            Use bot’s Full access for this thread
-          </button>
-        )}
         <div className="flex items-end gap-1">
           <input
             ref={fileInput}
@@ -876,8 +953,17 @@ export function Composer({
                   driverKind={approvalEngine.driverKind}
                   onSelect={setApprovalMode}
                   disabled={Boolean(modeBot.busy)}
-                  trustedModesAvailable={false}
-                  trustedModesNotice={t("approvalMode.threadTrustedNotice")}
+                  trustedModesAvailable={trustedThreadAccess}
+                  onManageCommandAllowlist={ownerOrAdmin === true ? () => setCommandAllowlistTarget({ botId: modeBot.id, botName: modeBot.name, threadId: modeBot.threadId }) : undefined}
+                />
+              )}
+              {modeBot && !remoteClient && (
+                <PlaceChip
+                  bot={modeBot}
+                  task={composerTask}
+                  live={Boolean(modeBot.busy)}
+                  disabled={Boolean(modeBot.busy)}
+                  onPin={(surface) => dispatch({ type: "updateTask", botId: modeBot.id, threadId: modeBot.threadId, patch: { surface } })}
                 />
               )}
             </div>
@@ -947,13 +1033,29 @@ export function Composer({
             // Shift+Enter inserts a newline; plain Enter sends
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
+              // The second Enter of the gesture: the chip above is waiting,
+              // the composer is empty, and the window is open — steer the
+              // queue into the running turn instead of waiting it out.
+              if (
+                canSteer &&
+                doubleEnterSteersQueue(steerAgainUntilRef.current, Date.now(), pendingCount, hasContent)
+              ) {
+                steerAgainUntilRef.current = 0;
+                steerQueued();
+                return;
+              }
               send();
             }
             if (e.key === "Escape" && recording) setRecording(false);
           }}
-          disabled={Boolean(approval) || locked || attachmentPending}
+          // an upload in flight must not disable the box: a disabled element
+          // drops keyboard focus and never gets it back, so the writer had to
+          // click the input again after every pasted image (#1014). send()
+          // already refuses while an attachment is pending.
+          disabled={Boolean(approval) || locked}
+          aria-busy={bot?.awaitingThreadSnapshot || undefined}
           placeholder={
-            locked
+            setupLocked
               ? t("composer.placeholder.locked")
               : approval
               ? t("composer.placeholder.approval")
@@ -962,7 +1064,9 @@ export function Composer({
               : recording
               ? t("composer.placeholder.listening")
               : busy && canSteer
-                ? t("composer.placeholder.steer", { name: busyName })
+                ? pendingCount > 0
+                  ? t("composer.placeholder.steerQueued", { name: busyName })
+                  : t("composer.placeholder.steer", { name: busyName })
               : busy
                 ? group
                   ? t("composer.placeholder.queueGroup", { name: busyName })
@@ -1037,11 +1141,15 @@ export function Composer({
           )}
           </div>
         </div>
-        {bot && !group && !remoteClient && !locked && <ComposerTray bot={bot} />}
         </div>
         </div>
       </div>
       <div className="pointer-events-auto">
+      {commandAllowlistTarget && <CommandAllowlistDialog
+        key={`${commandAllowlistTarget.botId}:${commandAllowlistTarget.threadId}`}
+        {...commandAllowlistTarget}
+        onClose={() => setCommandAllowlistTarget(null)}
+      />}
       <FullAccessWarning
         open={approvalWarning?.mode === "full"}
         scope="thread"
@@ -1049,13 +1157,9 @@ export function Composer({
         onConfirm={() => {
           const target = approvalWarning;
           setApprovalWarning(null);
-          if (target?.mode !== "full" || !window.ogb?.approvals || applyingThreadAccess) return;
-          setApplyingThreadAccess(true);
-          // The private reply predates commit. SSE supplies the final task;
-          // applying that early reply here could overwrite its new mode.
-          void window.ogb.approvals.setMode(target.botId, "full", { threadId: target.threadId })
-            .catch((error) => dispatch({ type: "error", message: error instanceof Error ? error.message : String(error) }))
-            .finally(() => setApplyingThreadAccess(false));
+          if (target?.mode !== "full" || !trustedThreadAccess) return;
+          dispatch({ type: "updateTask", botId: target.botId, threadId: target.threadId,
+            patch: { approvalMode: "full", confirmFullAccess: true } });
         }}
       />
       <LocalComputerAutoWarning

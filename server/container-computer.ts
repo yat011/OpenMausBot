@@ -364,6 +364,14 @@ export function localVmRecreatableOnDemand(
     && status.create_supported;
 }
 
+/** Whether Auto may attach this Local VM without a person choosing it: the
+ * desktop is ready, or its image is prepared and the container can simply be
+ * recreated after idling away. Anything else — no runtime, daemon down, image
+ * never prepared, an unmanaged or unsafe container — stays the person's call. */
+export function autoLocalVmAttachable(status: ContainerComputerStatus): boolean {
+  return status.ready === true || localVmRecreatableOnDemand(status);
+}
+
 function statusProblem(status: ContainerComputerStatus): string | null {
   if (!status.runtime) return "Install a supported container runtime first";
   if (!status.daemonUp) return `Start ${status.runtime} first`;
@@ -376,7 +384,7 @@ function statusProblem(status: ContainerComputerStatus): string | null {
   if (!status.managed) return "The existing container was not created by OpenMausBot; recreate it";
   if (status.network === "unsafe") return "The existing Local VM exposes its viewer publicly; recreate it";
   if (status.security === "unsafe") return "The existing Local VM is missing safety limits; recreate it";
-  if (status.persistence === "unsafe") return "The existing Local VM is missing its durable workspace; recreate it";
+  if (status.persistence === "unsafe") return "The existing Local VM is missing its durable folder; recreate it";
   if (status.container === "stopped") return "This desktop image cannot safely resume; recreate the Local VM";
   if (status.desktop_error) return `The Local VM desktop failed to start: ${status.desktop_error}`;
   if (!status.desktopReady) return "The Local VM started, but Cua Driver is not ready yet";
@@ -1200,17 +1208,3 @@ export function setupCommands(
   };
 }
 
-/** Cloud boxes still use OpenMausBot's high-latency REST adapter. Local VMs
- * bypass it and mount Cua Driver's official MCP server through
- * containerComputerMcp(). */
-export function computerProxyEnv(
-  computer: { boxId?: string; token?: string; control?: { url: string; token: string } },
-): NodeJS.ProcessEnv {
-  return {
-    OGB_BOX_ID: computer.boxId ?? "",
-    OGB_BOX_TOKEN: computer.token ?? "",
-    ...(computer.control
-      ? { OMB_CONTROL_URL: computer.control.url, OMB_CONTROL_TOKEN: computer.control.token }
-      : {}),
-  };
-}

@@ -37,15 +37,16 @@ extension CompanionState {
         }
 
         for bot in bots where bot.hidden != true {
-            for task in bot.threadGroups().flatMap(\.tasks) {
+            for task in bot.attentionOrderedTasks(queuedThreadIds: queuedThreadIds) {
                 guard let projected = bot.projected(forThread: task.threadId) else { continue }
                 let chat = Chat.bot(projected)
                 guard seen.insert(chat.conversationID).inserted else { continue }
                 if task.activity == "waiting-on-you" {
                     out.append(ChatUpdate(chat: chat, kind: .needsYou, line: "Waiting on you", card: nil))
-                } else if task.activity == "queued" || projected.busy == true {
-                    out.append(ChatUpdate(chat: chat, kind: .working,
-                        line: task.activity == "queued" ? "Queued — waiting for an available slot" : workingLine(threadId: task.threadId), card: nil))
+                } else if let held = pendingQueued[task.threadId], !held.isEmpty {
+                    out.append(ChatUpdate(chat: chat, kind: .working, line: queuedLine(for: held), card: nil))
+                } else if projected.busy == true {
+                    out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(threadId: task.threadId), card: nil))
                 } else if projected.unread {
                     out.append(ChatUpdate(chat: chat, kind: .toReview, line: lastLine(threadId: task.threadId), card: nil))
                 }
@@ -54,7 +55,10 @@ extension CompanionState {
         for room in rooms {
             let chat = Chat.room(room)
             guard !seen.contains(chat.conversationID) else { continue }
-            if room.busyBotId != nil {
+            if let held = pendingQueued[room.threadId], !held.isEmpty {
+                seen.insert(chat.conversationID)
+                out.append(ChatUpdate(chat: chat, kind: .working, line: queuedLine(for: held), card: nil))
+            } else if room.busyBotId != nil {
                 seen.insert(chat.conversationID)
                 out.append(ChatUpdate(chat: chat, kind: .working, line: workingLine(threadId: room.threadId), card: nil))
             } else if room.unread {
@@ -71,6 +75,18 @@ extension CompanionState {
         return nil
     }
 
+    /// One line for a thread's held sends. Only a capacity hold waits for a
+    /// free slot; a hold behind the running turn is simply queued, and the
+    /// pill must not promise a slot it is not waiting for.
+    private func queuedLine(for held: [QueuedSend]) -> String {
+        if held.count == 1 {
+            return held[0].reason == "capacity"
+                ? "Queued — waiting for an available slot"
+                : "Queued"
+        }
+        return "\(held.count) messages queued"
+    }
+
     private func workingLine(threadId: String) -> String {
         if let live = streaming[threadId], !live.isEmpty {
             return String(live.suffix(120)).replacingOccurrences(of: "\n", with: " ")
@@ -82,13 +98,15 @@ extension CompanionState {
     }
 
     private func lastLine(threadId: String) -> String {
-        guard let last = visibleTranscript(forThread: threadId).last else { return "" }
+        guard let last = visibleTranscript(forThread: threadId).last(where: { $0.kind != .digest }) else { return "" }
         switch last.kind {
         case .text, .unknown: return last.text ?? ""
         case .options: return last.card?.title ?? ""
         case .secret: return last.secret?.label ?? last.text ?? "Credential required"
         case .activity: return last.tool?.name ?? ""
         case .screen: return "Screenshot"
+        case .digest: return ""
+        case .compaction: return last.compaction?.chipText ?? last.text ?? ""
         }
     }
 }

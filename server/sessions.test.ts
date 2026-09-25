@@ -1,12 +1,15 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "./atomic.ts";
 
 import {
   EXCHANGE_REPLAY_MS,
   formatPairingCode,
   generatePairingCode,
+  generatePairingCredential,
+  isPairingCredential,
   LOCKOUT,
   normalizePairingCode,
   PAIRING_CODE_ALPHABET,
@@ -29,7 +32,71 @@ beforeEach(() => {
   clock = 1_700_000_000_000;
   registry = new SessionRegistry({ file: file(), now: () => clock });
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
+
+describe("the native-app encoding of a pairing window", () => {
+  it("redeems the same window as the typed code, and consumes it", () => {
+    const { code, credential } = registry.openPairing({ label: "Pixel" });
+    // The shape the Android companion's parser demands: the 9-character
+    // prefix plus exactly 43 base64url characters (Connection.kt).
+    expect(credential.startsWith("omb_pair_")).toBe(true);
+    expect(credential.length).toBe(52);
+    expect(credential.slice("omb_pair_".length)).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    const paired = registry.exchange({ code: credential, label: "Pixel", source: "10.0.0.9" });
+    expect(paired.ok).toBe(true);
+    // One window, not two: the code cannot redeem it a second time.
+    expect(registry.exchange({ code, label: "again", source: "10.0.0.9" }).ok).toBe(false);
+    expect(registry.openPairings()).toEqual([]);
+  });
+
+  it("never normalizes a credential", () => {
+    // normalizePairingCode folds 0 to O and 1 to I and strips underscores
+    // and dashes. Running it over a base64url secret would both destroy the
+    // secret and map distinct secrets onto one digest, so a credential must
+    // be hashed exactly as presented. This is the trap the fix exists to
+    // avoid, so pin it with a credential that contains every folded symbol.
+    const trap = "omb_pair_0123456789-_abcdefghijklmnopqrstuvwxyzABCDE";
+    expect(trap.length).toBe(52);
+    expect(normalizePairingCode(trap)).not.toBe(trap);
+    expect(isPairingCredential(trap)).toBe(true);
+
+    const { credential } = registry.openPairing();
+    // A different credential that normalizes to the same thing must not open
+    // someone else's window.
+    expect(registry.exchange({ code: trap, label: "", source: "attacker" }).ok).toBe(false);
+    expect(registry.exchange({ code: credential, label: "", source: "friend" }).ok).toBe(true);
+  });
+
+  it("keeps two live windows apart", () => {
+    const first = registry.openPairing({ label: "one" });
+    const second = registry.openPairing({ label: "two" });
+    const paired = registry.exchange({ code: second.credential, label: "", source: "10.0.0.4" });
+    if (!paired.ok) throw new Error(paired.error);
+    expect(paired.session.label).toBe("two");
+    // The first window is untouched and still redeemable by its own code.
+    expect(registry.exchange({ code: first.code, label: "", source: "10.0.0.4" }).ok).toBe(true);
+  });
+
+  it("expires with its window and is counted by the same lockout", () => {
+    const { credential } = registry.openPairing();
+    clock += PAIRING_CODE_TTL_MS + 1;
+    expect(registry.exchange({ code: credential, label: "", source: "b" }).ok).toBe(false);
+
+    for (let attempt = 0; attempt < LOCKOUT.failures; attempt += 1) {
+      registry.exchange({ code: generatePairingCredential(), label: "", source: "attacker" });
+    }
+    const locked = registry.exchange({ code: registry.openPairing().credential, label: "", source: "attacker" });
+    expect(locked.ok).toBe(false);
+    if (locked.ok) throw new Error("expected a lockout");
+    expect(locked.status).toBe(429);
+  });
+
+  it("mints a fresh credential for every window", () => {
+    const seen = new Set([...Array(20)].map(() => registry.openPairing().credential));
+    expect(seen.size).toBe(20);
+  });
+});
 
 function pair(label = "MacBook", source = "10.0.0.2") {
   const { code } = registry.openPairing();
@@ -134,6 +201,200 @@ describe("pairing codes", () => {
 });
 
 describe("sessions", () => {
+  it("delegates membership only for internally marked portal grants, never ordinary email or a userId prefix", () => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => null, portalMembership: true });
+    const portal = registry.issuePortal({ email: "person@example.test", grant: "g".repeat(43), scopes: ["client"] });
+    const injected = { label: "ordinary", email: "person@example.test", userId: `portal:${"g".repeat(43)}`, scopes: ["client" as const], membershipAuthority: "portal" };
+    const ordinary = registry.issue(injected);
+    const paired = pair();
+    expect(registry.authenticate(portal.token)?.membershipAuthority).toBe("portal");
+    expect(portal.session).not.toHaveProperty("membershipAuthority");
+    expect(registry.authenticate(ordinary.token)).toBeNull();
+    expect(registry.authenticate(paired.token)?.membershipAuthority).toBeUndefined();
+    expect(registry.authenticate(paired.token)?.id).toBe(paired.session.id);
+    registry.close();
+    const reloaded = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => null, portalMembership: true });
+    expect(reloaded.authenticate(portal.token)?.id).toBe(portal.session.id);
+    reloaded.close();
+    const localAgain = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => null });
+    expect(localAgain.authenticate(portal.token)).toBeNull();
+    expect(localAgain.authenticate(paired.token)?.id).toBe(paired.session.id);
+  });
+
+  it("keeps portal grants locally narrowed by default and validates stored authority markers", () => {
+    const portal = registry.issuePortal({ email: "person@example.test", grant: "g".repeat(43), scopes: ["client"] });
+    expect(registry.authenticate(portal.token)).toBeNull();
+    registry = new SessionRegistry({ file: file(), now: () => clock, portalMembership: true });
+    const next = registry.issuePortal({ email: "person@example.test", grant: "h".repeat(43), scopes: ["client"] });
+    const saved = JSON.parse(readFileSync(file(), "utf8"));
+    saved.sessions[0].membershipAuthority = { untrusted: true };
+    writeFileSync(file(), JSON.stringify(saved));
+    const loaded = new SessionRegistry({ file: file(), now: () => clock, portalMembership: true });
+    expect(loaded.authenticate(next.token)).toBeNull();
+    expect(() => registry.issuePortal({ email: "person@example.test", grant: "bad", scopes: ["client"] })).toThrow("verified portal identity");
+  });
+
+  it("revokes every over-scoped email device and its tickets on demotion, but not paired devices", () => {
+    let scopes: Array<"admin" | "client"> | null = ["admin", "client"];
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => scopes });
+    const paired = pair();
+    const first = registry.issue({ label: "browser", email: "person@example.test", scopes: ["admin", "client"] });
+    const second = registry.issue({ label: "phone", email: "person@example.test", scopes: ["admin", "client"] });
+    const member = registry.issue({ label: "member", email: "person@example.test", scopes: ["client"] });
+    const tickets = [first, second].map(({ session }) => registry.issueStreamTicket(session.id).ticket);
+    const revoked: string[] = [];
+    registry.onSessionRevoked((id) => revoked.push(id));
+    scopes = ["client"];
+    expect(registry.authenticate(first.token)).toBeNull();
+    expect(registry.isLive(second.session.id)).toBe(false);
+    expect(tickets.map((ticket) => registry.redeemStreamTicket(ticket))).toEqual([null, null]);
+    expect(revoked).toEqual([first.session.id, second.session.id]);
+    expect(registry.authenticate(paired.token)?.scopes).toEqual(["admin", "client"]);
+    expect(registry.authenticate(member.token)?.scopes).toEqual(["client"]);
+    scopes = ["admin", "client"]; // promotion never widens or revives a token
+    expect(registry.authenticate(member.token)?.scopes).toEqual(["client"]);
+    expect(registry.authenticate(first.token)).toBeNull();
+    scopes = null;
+    expect(registry.renew(member.session.id)).toBe(false);
+    expect(registry.list().map((session) => session.id)).toEqual([paired.session.id]);
+    const loaded = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["admin", "client"] });
+    expect(loaded.authenticate(first.token)).toBeNull();
+  });
+
+  it.each([undefined, () => { throw new Error("membership unavailable"); }])("fails closed when email membership cannot be checked (%s)", (emailScopes) => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes });
+    const paired = pair();
+    const email = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    expect(registry.authenticate(email.token)).toBeNull();
+    expect(registry.authenticate(paired.token)?.id).toBe(paired.session.id);
+  });
+
+  it("rechecks membership when a stream ticket is the first use after removal", () => {
+    let allowed = true;
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => allowed ? ["client"] : null });
+    const email = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const { ticket } = registry.issueStreamTicket(email.session.id);
+    allowed = false;
+    expect(registry.redeemStreamTicket(ticket)).toBeNull();
+    expect(registry.isLive(email.session.id)).toBe(false);
+  });
+
+  it("builds one membership resolver per pass and skips snapshots with no eligible account sessions", () => {
+    const resolve = vi.fn((_email: string) => ["client" as const]);
+    const snapshot = vi.fn(() => resolve);
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopesSnapshot: snapshot, portalMembership: true });
+    pair();
+    const portal = registry.issuePortal({ email: "portal@example.test", grant: "g".repeat(43), scopes: ["client"] });
+    registry.revalidateEmailSessions();
+    expect(snapshot).not.toHaveBeenCalled();
+    registry.issue({ label: "first", email: "one@example.test", scopes: ["client"] });
+    registry.issue({ label: "second", email: "two@example.test", scopes: ["client"] });
+    snapshot.mockClear(); resolve.mockClear();
+    registry.revalidateEmailSessions();
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(resolve.mock.calls.map(([email]) => email)).toEqual(["one@example.test", "two@example.test"]);
+    expect(registry.authenticate(portal.token)?.membershipAuthority).toBe("portal");
+  });
+
+  it("fails closed for every eligible account when a snapshot fails, without using the fallback", () => {
+    let unavailable = false;
+    const fallback = vi.fn(() => ["admin" as const, "client" as const]);
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: fallback,
+      emailScopesSnapshot: () => { if (unavailable) throw new Error("private membership failure"); return () => ["client"]; },
+    });
+    const paired = pair();
+    const first = registry.issue({ label: "first", email: "one@example.test", scopes: ["client"] });
+    const second = registry.issue({ label: "second", email: "two@example.test", scopes: ["client"] });
+    unavailable = true;
+    registry.revalidateEmailSessions();
+    expect(registry.authenticate(first.token)).toBeNull();
+    expect(registry.authenticate(second.token)).toBeNull();
+    expect(registry.authenticate(paired.token)?.id).toBe(paired.session.id);
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it("restores valid email and paired sessions after clean shutdown, and rechecks one snapshot during load", () => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    const email = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const paired = pair();
+    expect(existsSync(`${file()}.open`)).toBe(true);
+    if (process.platform !== "win32") expect(statSync(`${file()}.open`).mode & 0o777).toBe(0o600);
+    registry.close(); registry.close();
+    expect(existsSync(`${file()}.open`)).toBe(false);
+    expect(() => registry.authenticate(email.token)).toThrow("closed");
+    const snapshot = vi.fn(() => () => ["client" as const]);
+    const loaded = new SessionRegistry({ file: file(), now: () => clock, emailScopesSnapshot: snapshot });
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(loaded.authenticate(email.token)?.id).toBe(email.session.id);
+    expect(loaded.authenticate(paired.token)?.id).toBe(paired.session.id);
+    loaded.close();
+  });
+
+  it("revokes restored email sessions if the constructor membership snapshot fails", () => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    const email = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const paired = pair(); registry.close();
+    const unavailable = new SessionRegistry({ file: file(), now: () => clock, emailScopesSnapshot: () => { throw new Error("unavailable"); } });
+    expect(unavailable.authenticate(email.token)).toBeNull();
+    unavailable.close();
+    const restored = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    expect(restored.authenticate(email.token)).toBeNull();
+    expect(restored.authenticate(paired.token)?.id).toBe(paired.session.id);
+    restored.close();
+  });
+
+  it("never revives revoked email bearers after persistence failure, unclean restart, and membership restoration", () => {
+    let allowed = true;
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => allowed ? ["client"] : null });
+    const paired = pair();
+    const email = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const { ticket } = registry.issueStreamTicket(email.session.id);
+    const saved = readFileSync(file(), "utf8");
+    const logger = vi.spyOn(console, "error").mockImplementation(() => {});
+    // The real pre-failure session file and boot marker remain on disk. Every
+    // attempted atomic write now fails, including any attempted clean close.
+    const writes = vi.spyOn(atomic, "writeFileAtomic").mockImplementation(() => { throw new Error("EIO: private-path-and-token"); });
+    allowed = false;
+    registry.revalidateEmailSessions();
+    expect(registry.authenticate(email.token)).toBeNull();
+    expect(registry.redeemStreamTicket(ticket)).toBeNull();
+    expect(readFileSync(file(), "utf8")).toBe(saved);
+    expect(existsSync(`${file()}.open`)).toBe(true);
+    expect(() => registry.close()).toThrow("Could not safely close session storage.");
+    expect(() => new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] })).toThrow("Could not establish safe session storage.");
+    expect(logger.mock.calls.flat().join(" ")).not.toContain("private-path-and-token");
+    writes.mockRestore(); allowed = true;
+    const restarted = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    expect(restarted.authenticate(email.token)).toBeNull();
+    expect(restarted.authenticate(paired.token)?.id).toBe(paired.session.id);
+    restarted.close();
+    const cleanRestart = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    expect(cleanRestart.authenticate(email.token)).toBeNull();
+    expect(cleanRestart.authenticate(paired.token)?.id).toBe(paired.session.id);
+    cleanRestart.close();
+  });
+
+  it("drops account and portal sessions but preserves paired phones after any unclean restart", () => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"], portalMembership: true });
+    const paired = pair();
+    const account = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const portal = registry.issuePortal({ email: "person@example.test", grant: "g".repeat(43), scopes: ["client"] });
+    const restarted = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"], portalMembership: true });
+    expect(restarted.authenticate(account.token)).toBeNull();
+    expect(restarted.authenticate(portal.token)).toBeNull();
+    expect(restarted.authenticate(paired.token)?.id).toBe(paired.session.id);
+    restarted.close();
+  });
+
+  it("refuses to load persisted sessions when the marker cannot be established on the real filesystem", () => {
+    const blocked = join(dir, "blocked.json");
+    const paired = pair();
+    writeFileSync(blocked, readFileSync(file(), "utf8"));
+    mkdirSync(`${blocked}.open`); // An atomic file replace cannot overwrite a directory, even as root.
+    expect(() => new SessionRegistry({ file: blocked, now: () => clock })).toThrow("Could not establish safe session storage.");
+    expect(readFileSync(blocked, "utf8")).toContain(paired.session.id);
+  });
+
   it("stores only a hash, owner-only, and reloads from disk", () => {
     const { token, session } = pair();
     const onDisk = readFileSync(file(), "utf8");

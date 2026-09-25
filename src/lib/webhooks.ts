@@ -1,61 +1,17 @@
-import type { RoutineRunOn } from "@/lib/routines";
+import type { WebhookTrigger, WebhookTriggerInput } from "../../shared/webhooks";
 
-export interface WebhookTrigger {
-  id: string;
-  endpointId: string;
-  name: string;
-  prompt: string;
-  botId: string;
-  runOn: RoutineRunOn;
-  enabled: boolean;
-  createdAt: number;
-  updatedAt: number;
-  lastReceivedAt?: number;
-  lastRunId?: string;
-  deliveryCount: number;
-  verificationPending?: boolean;
-  verifiedAt?: number;
-  verificationSample?: WebhookVerificationSample;
-  eventTypes?: string[];
-}
-
-export interface WebhookTriggerInput {
-  name: string;
-  prompt: string;
-  botId: string;
-  runOn?: RoutineRunOn;
-  enabled?: boolean;
-  verificationPending?: boolean;
-  eventTypes?: string[];
-}
-
-export interface WebhookVerificationSample {
-  receivedAt: number;
-  eventName?: string;
-  contentType?: string;
-  preview: string;
-}
-
-export type WebhookAttemptOutcome = "accepted" | "captured" | "duplicate" | "ignored" | "rejected";
-
-export interface WebhookAttempt {
-  id: string;
-  webhookId: string;
-  receivedAt: number;
-  outcome: WebhookAttemptOutcome;
-  statusCode: number;
-  eventName?: string;
-  preview?: string;
-  deliveryId?: string;
-  runId?: string;
-  reason?: string;
-}
-
-export interface WebhookIngressStatus {
-  available: boolean;
-  baseUrl: string;
-  error?: string;
-}
+/** Webhook wire shapes — triggers and delivery attempts as they ride the REST
+ * snapshot and the `webhook` / `webhook.attempt` live frames — live in
+ * shared/webhooks.ts now (part of the wire model); re-exported here so
+ * existing client imports keep working. */
+export type {
+  WebhookTrigger,
+  WebhookTriggerInput,
+  WebhookVerificationSample,
+  WebhookAttemptOutcome,
+  WebhookAttempt,
+  WebhookIngressStatus,
+} from "../../shared/webhooks";
 
 export interface WebhookCredential {
   endpointUrl: string;

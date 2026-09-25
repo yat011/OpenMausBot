@@ -23,7 +23,10 @@ export function localComputerSelectable({
 }): boolean {
   if (!providerSupportsLocal) return false;
   if (capabilities.localComputer.available) return true;
-  return capabilities.host.platform === "darwin";
+  // macOS and Windows both keep the destination clickable before the driver
+  // is live, so the user can pick it and then finish the permission/setup
+  // step instead of hunting for why the button is greyed out.
+  return capabilities.host.platform === "darwin" || capabilities.host.platform === "win32";
 }
 
 export function localComputerDisabledReason({
@@ -52,6 +55,9 @@ export function localComputerDisabledReason({
   if (capabilities.host.label === "Browser") {
     return "Local computer control requires the desktop app.";
   }
+  if (capabilities.host.platform === "win32") {
+    return "The bundled Cua Driver could not start. Restart OpenMausBot and check Diagnostics if it still fails.";
+  }
   return "CUA Driver is not ready for local computer control.";
 }
 
@@ -61,6 +67,9 @@ export function linuxAutoDescription(): string {
 
 export type BoxPanelAction =
   | "ensure-box"
+  | "attach-ready-box"
+  | "busy-box"
+  | "team-box"
   | "show-ready-box"
   | "show-sleeping-box"
   | "show-pending-box"
@@ -69,6 +78,11 @@ export type BoxPanelAction =
   | "auto-unavailable";
 
 const READY_BOX_STATES = new Set(["idle", "ready", "running"]);
+
+/** A Box state the panel can attach to and poll. */
+export function isReadyBoxState(state: string | null | undefined): boolean {
+  return typeof state === "string" && READY_BOX_STATES.has(state);
+}
 const SLEEPING_BOX_STATES = new Set(["archived", "stopped"]);
 
 /** Mirror the turn router's Box choice without letting a passive panel open
@@ -82,20 +96,36 @@ export function resolveBoxPanelAction({
   boxState,
   canUseCloud,
   autoLocal,
+  teamComputer = false,
+  busy = false,
 }: {
   computer: Bot["computer"];
   configured: boolean;
   boxState: string | null;
   canUseCloud: boolean;
   autoLocal: boolean;
+  teamComputer?: boolean;
+  /** A turn is running on this bot: the server refuses provision/sleep
+   * with 409 while the turn owns the box, and the turn itself creates or
+   * wakes the box it needs. */
+  busy?: boolean;
 }): BoxPanelAction {
+  // A team's explicit grant wins over Auto's private-Box/local fallback.
+  // This panel reports it; paid lifecycle and shared access stay in Team map.
+  if (computer === undefined && teamComputer) return "team-box";
   const explicitCloud = computer === "cloud";
 
   if (!configured) {
     if (explicitCloud) return "unconfigured";
     return autoLocal ? "local" : "auto-unavailable";
   }
-  if (explicitCloud) return canUseCloud ? "ensure-box" : "auto-unavailable";
+  if (explicitCloud) {
+    if (!canUseCloud) return "auto-unavailable";
+    // Mid-turn the panel only watches: a ready box is shown as-is (its
+    // frames already stream in), anything else is left to the turn.
+    if (busy) return boxState && READY_BOX_STATES.has(boxState) ? "attach-ready-box" : "busy-box";
+    return "ensure-box";
+  }
   if (canUseCloud && boxState) {
     if (READY_BOX_STATES.has(boxState)) return "show-ready-box";
     if (SLEEPING_BOX_STATES.has(boxState)) return "show-sleeping-box";

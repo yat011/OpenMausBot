@@ -12,6 +12,8 @@
 //                        whole-message frame, plus subagent noise to drop)
 //                      | not-logged-in (the frames a signed-out CLI really
 //                        sends, captured from 2.1.263)
+//                      | api-error (the CLI reports a non-auth API error as
+//                        assistant text, then an error result; no model output)
 //   FAKE_CLAUDE_DUMP   path to write {argv, env, prompt, systemPrompt,
 //                      mcpConfig} as JSON,
 //                      so the test can assert on argv shape and env hygiene.
@@ -19,6 +21,16 @@
 //                      way the real CLI reads it — the driver writes it to a
 //                      private temp file and deletes it when the turn settles,
 //                      so a test cannot open it after the fact.
+//   FAKE_CLAUDE_TEXT_FILE path whose contents are the one-shot text mode's
+//                      reply, read fresh each run so a suite sharing one
+//                      server can vary it per test. A missing file, or a body
+//                      of exactly __FAIL__, makes the call fail outright —
+//                      the shape a caller's fallback path has to survive.
+//   FAKE_CLAUDE_TEXT_DUMP like FAKE_CLAUDE_DUMP, but for one-shot text runs,
+//                      so they never overwrite a turn's dump mid-test.
+//   FAKE_CLAUDE_TEXT_HANG when set, the one-shot text mode never replies —
+//                      the caller's abort signal is the only way it ends,
+//                      which is exactly what its tests need to prove.
 //   FAKE_CLAUDE_REPLIES JSON array of strings (or string arrays for multiple
 //                      assistant items) used in order across turns. This makes
 //                      bounded multi-turn orchestration deterministic.
@@ -29,6 +41,21 @@
 //                      one tool_use (fresh id, that name and input) followed
 //                      by its tool_result (is_error unless ok, default true).
 //                      Unset, a turn makes the single default Bash call.
+//   FAKE_CLAUDE_HOOKS  1: honour the `hooks` block of the --settings file the
+//                      way the real CLI does — after each tool_result run
+//                      every PostToolUse command with the event JSON on
+//                      stdin (synchronously, inheriting this env), and once
+//                      at the end run the Stop commands.
+//   FAKE_CLAUDE_COMPACT 1: on this process's second and later turns, play a
+//                      compaction the way the CLI does — run the PreCompact
+//                      hooks (trigger auto), then the SessionStart hooks with
+//                      source "compact", and treat whatever SessionStart's
+//                      stdout said as context by echoing it into the reply.
+//   FAKE_CLAUDE_TURN_STATE path of a counter file shared by fresh CLI
+//                      processes, so FAKE_CLAUDE_COMPACT's "second turn"
+//                      survives a respawn between turns.
+//   FAKE_CLAUDE_CONTEXT_TOKENS report this latest-prompt size in a scripted
+//                      room-plan reply, for automatic compaction fixtures.
 //   FAKE_CLAUDE_AUTH   in (default) | out | unsupported | malformed |
 //                      inherited-api-key — what `auth status` reports
 //   FAKE_CLAUDE_AUTO_UNAVAILABLE_MODELS comma-separated --model values for
@@ -37,7 +64,9 @@
 //                      Sonnet 4.5: init reports the mode it actually runs in.
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
+import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { runRoomHandoffAgent } from "./room-handoff-agent.ts";
 
 const mode = process.env.FAKE_CLAUDE_MODE ?? "happy";
 const scriptedReplies = (() => {
@@ -51,7 +80,7 @@ const scriptedReplies = (() => {
     return [];
   }
 })();
-type ScriptedToolCall = { name: string; input: Record<string, unknown>; ok: boolean };
+type ScriptedToolCall = { name: string; id?: string; input: Record<string, unknown>; ok: boolean; output?: unknown };
 // null = unset (or unparseable): keep the single default Bash call.
 const scriptedToolCalls: ScriptedToolCall[] | null = (() => {
   const raw = process.env.FAKE_CLAUDE_TOOL_CALLS;
@@ -60,11 +89,13 @@ const scriptedToolCalls: ScriptedToolCall[] | null = (() => {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return null;
     return parsed
-      .filter((call): call is { name: string; input?: unknown; ok?: unknown } => typeof call?.name === "string")
+      .filter((call): call is { name: string; id?: unknown; input?: unknown; ok?: unknown; output?: unknown } => typeof call?.name === "string")
       .map((call) => ({
         name: call.name,
+        ...(typeof call.id === "string" ? { id: call.id } : {}),
         input: call.input && typeof call.input === "object" && !Array.isArray(call.input) ? call.input as Record<string, unknown> : {},
         ok: call.ok !== false,
+        output: call.output,
       }));
   } catch {
     return null;
@@ -88,6 +119,38 @@ const nextScriptedReply = (): string[] => {
 };
 
 const argv = process.argv.slice(2);
+const settingsHooks: Record<string, Array<{ hooks?: Array<{ type?: string; command?: string; timeout?: number }> }>> = (() => {
+  if (process.env.FAKE_CLAUDE_HOOKS !== "1") return {};
+  const i = argv.indexOf("--settings");
+  if (i === -1) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(argv[i + 1]!, "utf8"));
+    return parsed && typeof parsed.hooks === "object" ? parsed.hooks : {};
+  } catch {
+    return {};
+  }
+})();
+/** Run every command hook registered for `event`, like the real CLI: JSON on
+ * stdin, wait for exit (bounded), ignore its output except to a dump. */
+function runHooks(event: string, payload: Record<string, unknown>): string {
+  let stdout = "";
+  for (const entry of settingsHooks[event] ?? []) {
+    for (const hook of entry.hooks ?? []) {
+      if (hook.type !== "command" || !hook.command) continue;
+      const result = spawnSync(hook.command, {
+        shell: true,
+        input: JSON.stringify({ hook_event_name: event, session_id: "fake-session", cwd: process.cwd(), ...payload }),
+        env: process.env,
+        timeout: ((hook.timeout ?? 5) + 1) * 1000,
+        stdio: ["pipe", "pipe", "pipe"],
+        encoding: "utf8",
+      });
+      stdout += result.stdout ?? "";
+    }
+  }
+  return stdout;
+}
+let turnsPlayed = 0;
 const argAfter = (flag: string): string | null => {
   const i = argv.indexOf(flag);
   return i === -1 ? null : (argv[i + 1] ?? null);
@@ -139,11 +202,27 @@ if (argAfter("--output-format") === "text") {
     process.stdin.on("data", (chunk) => { input += chunk; });
     process.stdin.on("end", () => resolve(input));
   });
-  if (process.env.FAKE_CLAUDE_DUMP) {
+  const oneShotDump = process.env.FAKE_CLAUDE_TEXT_DUMP ?? process.env.FAKE_CLAUDE_DUMP;
+  if (oneShotDump) {
     writeFileSync(
-      process.env.FAKE_CLAUDE_DUMP,
+      oneShotDump,
       JSON.stringify({ pid: process.pid, argv, env: process.env, prompt, mcpConfig: null }, null, 2),
     );
+  }
+  if (process.env.FAKE_CLAUDE_TEXT_HANG) {
+    // a repeating timer keeps the loop alive without settling the
+    // top-level await, which Node would otherwise treat as fatal
+    await new Promise(() => setInterval(() => {}, 1 << 30));
+  }
+  if (process.env.FAKE_CLAUDE_TEXT_FILE) {
+    const file = process.env.FAKE_CLAUDE_TEXT_FILE;
+    const reply = existsSync(file) ? readFileSync(file, "utf8") : "__FAIL__";
+    if (reply.trim() === "__FAIL__") {
+      process.stderr.write("fake one-shot text failed\n");
+      process.exit(1);
+    }
+    process.stdout.write(reply);
+    process.exit(0);
   }
   process.stdout.write("fake generated text\n");
   process.exit(0);
@@ -278,6 +357,28 @@ const playTurn = (prompt: JsonValue) => {
     process.exit(3);
   }
 
+  if (mode === "api-error") {
+    const text = "API Error: 529 Overloaded. This is a server-side issue, usually temporary.";
+    out({ type: "assistant", message: { model: "<synthetic>", content: [{ type: "text", text }] }, error: "unknown", is_api_error_message: true });
+    out({ type: "result", is_error: true, stop_reason: "stop_sequence", terminal_reason: "api_error", result: text });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (process.env.FAKE_CLAUDE_ROOM_PLAN) {
+    const progress = (text: string) => out({ type: "assistant", message: { content: [{ type: "text", text }] } });
+    void runRoomHandoffAgent(argv, process.env.FAKE_CLAUDE_ROOM_PLAN, prompt, undefined, progress).then(text => {
+      const contextTokens = Number(process.env.FAKE_CLAUDE_CONTEXT_TOKENS);
+      const usage = Number.isSafeInteger(contextTokens) && contextTokens > 0 ? { input_tokens: contextTokens, output_tokens: 5 } : undefined;
+      out({ type: "assistant", message: { content: [{ type: "text", text }], ...(usage ? { usage } : {}) } });
+      out({ type: "result", is_error: false, stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 } });
+    }).catch(error => {
+      out({ type: "result", is_error: true, result: String(error), stop_reason: "error" });
+    }).finally(() => { turnRunning = false; finishIfDone(); });
+    return;
+  }
+
   if (mode === "hang") {
     // stay alive until killed — lets tests exercise interrupt + the
     // permission broker while a turn is officially in flight
@@ -324,14 +425,30 @@ const playTurn = (prompt: JsonValue) => {
     });
   }
 
-  const replyParts = nextScriptedReply();
+  let replyParts = nextScriptedReply();
+  const defaultToolId = `tu-${process.pid}-${++toolUseCount}`;
+  // FAKE_CLAUDE_TURN_STATE: a counter file so "second turn" survives a
+  // respawn between turns (the harness may relaunch the CLI legitimately)
+  if (process.env.FAKE_CLAUDE_TURN_STATE) {
+    let n = 0;
+    try { n = Number(readFileSync(process.env.FAKE_CLAUDE_TURN_STATE, "utf8")) || 0; } catch {}
+    turnsPlayed = n;
+    writeFileSync(process.env.FAKE_CLAUDE_TURN_STATE, String(n + 1));
+  }
+  turnsPlayed += 1;
+  if (process.env.FAKE_CLAUDE_COMPACT === "1" && turnsPlayed >= 2) {
+    runHooks("PreCompact", { trigger: "auto" });
+    const context = runHooks("SessionStart", { source: "compact" });
+    if (context.trim()) replyParts = [`${context.trim()}\n\n${replyParts[0] ?? ""}`, ...replyParts.slice(1)];
+  }
   const usage = { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 };
   if (scriptedToolCalls) {
     // scripted calls come first, each settled before the reply text
     for (const call of scriptedToolCalls) {
-      const id = `tu-${++toolUseCount}`;
+      const id = call.id ?? `tu-${process.pid}-${++toolUseCount}`;
       out({ type: "assistant", message: { content: [{ type: "tool_use", id, name: call.name, input: call.input }], usage } });
-      out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: !call.ok }] } });
+      out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: !call.ok, content: call.output }] } });
+      runHooks("PostToolUse", { tool_name: call.name, tool_input: call.input, tool_response: call.output, tool_use_id: id });
     }
     for (const text of replyParts) out({ type: "assistant", message: { content: [{ type: "text", text }], usage } });
   } else {
@@ -339,13 +456,15 @@ const playTurn = (prompt: JsonValue) => {
       const content: Array<
         { type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
       > = [{ type: "text", text }];
-      if (index === replyParts.length - 1) content.push({ type: "tool_use", id: "tu-1", name: "Bash", input: { command: "echo hi" } });
+      if (index === replyParts.length - 1) content.push({ type: "tool_use", id: defaultToolId, name: "Bash", input: { command: "echo hi" } });
       out({ type: "assistant", message: { content, usage } });
     });
-    out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu-1", is_error: false }] } });
+    out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: defaultToolId, is_error: false, content: [{ type: "text", text: "hi" }] }] } });
+    runHooks("PostToolUse", { tool_name: "Bash", tool_input: { command: "echo hi" }, tool_response: "hi", tool_use_id: defaultToolId });
   }
 
   const finish = () => {
+    runHooks("Stop", { stop_hook_active: false });
     out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01, usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 } });
     turnRunning = false;
     finishIfDone();
@@ -376,7 +495,13 @@ const playTurn = (prompt: JsonValue) => {
       const poll = setInterval(() => {
         if (!existsSync(finishGate)) return;
         clearInterval(poll);
-        finishSlowTurn();
+        // The steer is already in our stdin pipe when the gate appears — the
+        // server flushes it before answering the request that lets the test
+        // drop the gate. But this is a timer, and timers run BEFORE the poll
+        // phase that reads the pipe, so finishing here can close the turn
+        // with the steer unread; it would then open a second turn. Hand off
+        // to the check phase, which runs after the read.
+        setImmediate(finishSlowTurn);
       }, 10);
     } else {
       setTimeout(finishSlowTurn, 800);
@@ -400,8 +525,10 @@ process.stdin.on("data", (c) => {
     } catch {
       continue;
     }
-    if (turnRunning) steered.push(promptText(prompt));
-    else {
+    if (turnRunning) {
+      steered.push(promptText(prompt));
+      if (process.env.FAKE_CLAUDE_STEER_RECEIVED) writeFileSync(process.env.FAKE_CLAUDE_STEER_RECEIVED, "received");
+    } else {
       playTurn(prompt);
       armSteerGate();
     }

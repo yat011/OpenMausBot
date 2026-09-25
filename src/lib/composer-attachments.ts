@@ -750,6 +750,14 @@ export function attachmentImageUrl(path: string): string | null {
   return `/api/attachments/${encodeURIComponent(name)}`;
 }
 
+/** Voice notes park as bare generated .mp3 filenames; anything else stays
+ * out of an <audio> src rather than 404ing on a private path. */
+export function attachmentAudioUrl(path: string): string | null {
+  const name = attachmentBasename(path);
+  if (!/^[A-Za-z0-9-]+\.mp3$/.test(name)) return null;
+  return `/api/attachments/${encodeURIComponent(name)}`;
+}
+
 /** One intake path for files arriving by drop OR by the composer's attach
  * button, so a picked file and a dropped one can never behave differently.
  * Uploaders are injected for deterministic tests: callers own the network,
@@ -814,4 +822,27 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
     attachments,
     notice: pathless && failed ? `${pathless} (${failed})` : (pathless ?? failed),
   };
+}
+
+/**
+ * Whether the composer may pull keyboard focus back into its textarea after an
+ * attachment lands. The draft was the writer's place when focus is still there,
+ * has fallen to the page (a disabled element drops it), or sits on a control
+ * inside the composer such as the paperclip button after the file dialog. A
+ * focused control elsewhere — a dialog, the thread list — is left alone.
+ */
+export function composerShouldRefocus(active: FocusNode | null, input: ComposerInputNode): boolean {
+  if (!active || active === input) return true;
+  const root = input.ownerDocument;
+  if (active === root.body || active === root.documentElement) return true;
+  const composer = input.closest("[data-tour=composer]");
+  return Boolean(composer?.contains(active));
+}
+
+// This file is also compiled for the server, which has no DOM types; the rule
+// only needs these members of the real elements.
+type FocusNode = object;
+interface ComposerInputNode {
+  ownerDocument: { body: FocusNode | null; documentElement: FocusNode | null };
+  closest(selector: string): { contains(node: FocusNode | null): boolean } | null;
 }

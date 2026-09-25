@@ -13,8 +13,11 @@ describe("thread resource ownership", () => {
     expect(leases.claim("computer:host", a)).toBe(true);
     expect(leases.claim("computer:host", a)).toBe(true);
     expect(leases.claim("computer:host", b)).toBe(false);
+    expect(leases.blocker("computer:host", b)).toEqual(a);
+    expect(leases.blocker("computer:host", a)).toBeUndefined();
     expect(leases.claim("browser:other", b)).toBe(true);
     leases.release(a);
+    expect(leases.blocker("computer:host", b)).toBeUndefined();
     expect(leases.claim("computer:host", b)).toBe(true);
     leases.release(a);
     expect(leases.owns("computer:host", b)).toBe(true);
@@ -29,6 +32,19 @@ describe("thread resource ownership", () => {
     expect(leases.claim("browser:one", next)).toBe(true);
     leases.release(a);
     expect(leases.owns("browser:one", next)).toBe(true);
+  });
+
+  it("releases one resource early without dropping the owner's others", () => {
+    const leases = new TurnResources();
+    expect(leases.claim("computer:vm:shared", a)).toBe(true);
+    expect(leases.claim("browser:one", a)).toBe(true);
+    leases.releaseOne("computer:vm:shared", a);
+    expect(leases.owns("computer:vm:shared", a)).toBe(false);
+    expect(leases.claim("computer:vm:shared", b)).toBe(true);
+    expect(leases.owns("browser:one", a)).toBe(true);
+    // Only the exact owner may drop it: a stale generation is a no-op.
+    leases.releaseOne("computer:vm:shared", { ...b, generation: "stale" });
+    expect(leases.owns("computer:vm:shared", b)).toBe(true);
   });
 
   it("prevents parent/child project overlap and symlink aliases, not sibling folders", () => {

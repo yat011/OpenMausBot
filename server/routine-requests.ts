@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod";
 
+import { cronScheduleLabel } from "../shared/cron-label.ts";
+import { normalizeCronSchedule, nextCronRuns } from "../shared/routine-schedule.ts";
 import { newId } from "./contracts.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
@@ -56,6 +59,7 @@ const toolIntervalWindowSchema = z.object({
 }).strict();
 
 const routineToolScheduleSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("cron"), expression: z.string().max(256), timeZone: z.string().max(128) }).strict(),
   z.object({ type: z.literal("once"), at: z.string().max(64) }).strict(),
   z.object({
     type: z.literal("weekly"),
@@ -80,6 +84,7 @@ const routineToolDefinitionSchema = z.object({
   durationMinutes: z.number().optional(),
   timeoutMinutes: z.number().nullable().optional(),
   continuity: z.boolean().optional(),
+  overlap: z.enum(["skip", "queue"]).optional(),
 }).strict();
 
 const routineToolChangesSchema = routineToolDefinitionSchema
@@ -118,7 +123,17 @@ const storedIntervalWindowSchema = z.object({
   ({ start, end }) => start < end,
   "Stored interval window must end later on the same day",
 );
+const storedCronScheduleSchema = z.object({
+  type: z.literal("cron"), expression: z.string().max(256), timeZone: z.string().max(128),
+}).strict().superRefine((schedule, context) => {
+  try {
+    normalizeCronSchedule(schedule);
+  } catch (error) {
+    context.addIssue({ code: "custom", message: error instanceof Error ? error.message : "Invalid stored cron schedule" });
+  }
+});
 const storedScheduleSchema = z.discriminatedUnion("type", [
+  storedCronScheduleSchema,
   z.object({ type: z.literal("once"), at: z.number().int().nonnegative() }).strict(),
   z.object({
     type: z.literal("daily"),
@@ -151,6 +166,7 @@ const storedScheduleSchema = z.discriminatedUnion("type", [
   }
 });
 const storedScheduleChangesSchema = z.discriminatedUnion("type", [
+  storedCronScheduleSchema,
   z.object({ type: z.literal("once"), at: z.number().int().nonnegative() }).strict(),
   z.object({
     type: z.literal("daily"),
@@ -195,6 +211,7 @@ const storedDefinitionSchema = z.object({
   durationMinutes: z.number().int().min(5).max(240),
   timeoutMinutes: z.number().int().min(5).max(240).optional(),
   continuity: z.boolean().optional(),
+  overlap: z.enum(["skip", "queue"]).optional(),
 }).strict();
 const storedChangesSchema = storedDefinitionSchema
   .omit({ schedule: true, timeoutMinutes: true })
@@ -278,8 +295,10 @@ export interface RoutineRequestServiceOptions {
   routines: RoutineManager;
   now?: () => number;
   timeZone?: () => string;
+  /** Server-owned effective mode of the source conversation, never request input. */
+  autoApply?: (botId: string, threadId: string) => boolean;
   /** Harness-owned readiness check for proposals that would execute in cloud. */
-  cloudReady?: () => Promise<{ ready: boolean; reason?: string }>;
+  cloudReady?: (botId: string) => Promise<{ ready: boolean; reason?: string }>;
   /** Revalidates conversation ownership and capacity synchronously, directly
    * before the card append. This closes races across an async cloud probe. */
   canPersist?: (
@@ -341,6 +360,8 @@ export type ResolveRoutineRequestResult =
       state: "applied";
       action: RoutineRequestOperation["action"];
       resultId: string;
+      settlementPending?: true;
+      message?: string;
     };
 
 export class RoutineRequestError extends Error {
@@ -450,6 +471,13 @@ function rfc3339Instant(value: string, offsetMessage: string): number {
 }
 
 function normalizeSchedule(schedule: RoutineToolScheduleInput, now: number): RoutineRequestSchedule {
+  if (schedule.type === "cron") {
+    try {
+      return normalizeCronSchedule(schedule, now);
+    } catch (error) {
+      throw new RoutineRequestError(error instanceof Error ? error.message : "Invalid cron schedule");
+    }
+  }
   if (schedule.type === "once") {
     const at = rfc3339Instant(
       schedule.at,
@@ -532,6 +560,7 @@ function normalizeDefinition(input: RoutineToolDefinitionInput, now: number): Ro
     durationMinutes: duration(input.durationMinutes),
     ...(timeoutMinutes == null ? {} : { timeoutMinutes }),
     ...(input.continuity === true ? { continuity: true } : {}),
+    ...(input.overlap === "queue" ? { overlap: "queue" as const } : {}),
   };
 }
 
@@ -544,6 +573,7 @@ function normalizeChanges(input: RoutineToolChangesInput, now: number): RoutineR
   if (input.durationMinutes !== undefined) changes.durationMinutes = duration(input.durationMinutes);
   if (input.timeoutMinutes !== undefined) changes.timeoutMinutes = timeout(input.timeoutMinutes);
   if (input.continuity !== undefined) changes.continuity = input.continuity === true;
+  if (input.overlap !== undefined) changes.overlap = input.overlap;
   return changes;
 }
 
@@ -598,6 +628,7 @@ function normalizedOperation(
 }
 
 function asSchedule(schedule: RoutineRequestSchedule, now: number): RoutineSchedule {
+  if (schedule.type === "cron") return { ...schedule };
   if (schedule.type === "once") return { type: "once", at: schedule.at };
   if (schedule.type === "interval") {
     return {
@@ -636,6 +667,7 @@ function effectiveSchedule(
   current: RoutineRequestSchedule,
   incoming: RoutineRequestScheduleChanges,
 ): RoutineRequestSchedule {
+  if (incoming.type === "cron") return { ...incoming };
   if (incoming.type !== "interval") {
     return incoming.type === "once"
       ? { type: "once", at: incoming.at }
@@ -698,6 +730,7 @@ function intervalHasRestrictions(
 }
 
 export function scheduleText(schedule: RoutineRequestSchedule, timeZone: string): string {
+  if (schedule.type === "cron") return `${cronScheduleLabel(schedule)} · Cron: ${schedule.expression}`;
   if (schedule.type === "once") return `${formatInstant(schedule.at, timeZone)} (${timeZone})`;
   if (schedule.type === "interval") {
     const restricted = intervalHasRestrictions(schedule);
@@ -726,6 +759,7 @@ export function consequenceLine(schedule: RoutineRequestSchedule, continuity = f
   // over is the previous run's report, so say that rather than contradict
   // the Continuity line above it.
   const session = continuity ? "each run starts a fresh session with the previous run's report" : "each run starts a fresh session";
+  if (schedule.type === "cron") return `Will run at matching calendar times in ${schedule.timeZone}; ${session}.`;
   if (schedule.type === "once") return "Will run once; that run starts a fresh session.";
   if (schedule.type === "interval") {
     if (intervalHasRestrictions(schedule)) {
@@ -760,6 +794,7 @@ function effectiveDefinition(operation: RoutineRequestOperation, manager: Routin
     durationMinutes: existing.durationMinutes,
     ...(existing.timeoutMinutes === undefined ? {} : { timeoutMinutes: existing.timeoutMinutes }),
     ...(existing.continuity ? { continuity: true } : {}),
+    ...(existing.overlap ? { overlap: existing.overlap } : {}),
   };
   if (operation.action !== "update") return base;
   const { schedule, timeoutMinutes, ...changes } = operation.changes;
@@ -796,8 +831,9 @@ function cardCopy(
     };
   }
   const nextRunAt = nextForOperation(operation, manager, now);
+  const scheduleTimeZone = definition.schedule.type === "cron" ? definition.schedule.timeZone : timeZone;
   const when = operation.action === "run_now" ? "Now" : scheduleText(definition.schedule, timeZone);
-  const destination = definition.runOn === "cloud" ? "Cloud VM" : "This OpenMausBot setup";
+  const destination = definition.runOn === "cloud" ? "Box-hosted agent" : "Bot’s current model and configured computer";
   const current = operation.action === "create"
     ? null
     : manager.listRoutines().find((routine) => routine.id === operation.routineId) ?? null;
@@ -813,7 +849,7 @@ function cardCopy(
         ? `Next allowed time after confirmation (${timeZone})`
         : "One interval after confirmation"
       : nextRunAt !== null
-        ? formatInstant(nextRunAt, timeZone)
+        ? formatInstant(nextRunAt, scheduleTimeZone)
         : operation.action === "pause"
           ? "None — this routine will be paused"
           : operation.action === "delete"
@@ -836,9 +872,13 @@ function cardCopy(
       ...(forBot ? [`For: @${redactSecretsInText(forBot.name)} — each run uses that bot's engine and permissions`] : []),
       `Schedule: ${when}`,
       `Next run: ${nextDescription}`,
+      ...(definition.schedule.type === "cron" && nextRunAt !== null && operation.action !== "run_now"
+        ? [`Next 3 runs (${scheduleTimeZone}): ${nextCronRuns(definition.schedule, now, 3).map((at) => formatInstant(at, scheduleTimeZone)).join(" · ")}`]
+        : []),
       `Runs on: ${destination}`,
       `Run limit: ${definition.timeoutMinutes === undefined ? "No limit" : `${definition.timeoutMinutes} minutes`}`,
       `Continuity: ${definition.continuity ? "Carries the previous run's report into the next run" : "Each run starts fresh"}`,
+      `While busy: ${definition.overlap === "queue" ? "Queue one scheduled run; skip further occurrences until it starts" : "Skip overlapping scheduled occurrences"}`,
       // Last before the instructions: the one sentence that says what
       // confirming actually does, in the reader's terms.
       ...(operation.action === "create" || operation.action === "update"
@@ -864,6 +904,7 @@ function inputFromDefinition(definition: RoutineRequestDefinition, botId: string
     durationMinutes: definition.durationMinutes,
     ...(definition.timeoutMinutes === undefined ? {} : { timeoutMinutes: definition.timeoutMinutes }),
     ...(definition.continuity ? { continuity: true } : {}),
+    ...(definition.overlap === "queue" ? { overlap: "queue" as const } : {}),
   };
 }
 
@@ -880,6 +921,7 @@ function updateFromChanges(
   if (changes.durationMinutes !== undefined) patch.durationMinutes = changes.durationMinutes;
   if (changes.timeoutMinutes !== undefined) patch.timeoutMinutes = changes.timeoutMinutes;
   if (changes.continuity !== undefined) patch.continuity = changes.continuity;
+  if (changes.overlap !== undefined) patch.overlap = changes.overlap;
   return patch;
 }
 
@@ -943,6 +985,35 @@ function requestCommit(payload: RoutineRequestCardData, messageId: string): Rout
 }
 
 function revalidateOperation(operation: RoutineRequestOperation, manager: RoutineManager, botId: string, now: number): void {
+  if (operation.action === "create") {
+    const definition = operation.routine;
+    const owner = operation.forBot?.botId ?? botId;
+    const schedule = asSchedule(definition.schedule, now);
+    const duplicate = manager.listRoutines().find((routine) => {
+      if (!routine.enabled || routine.target !== "bot" || routine.botId !== owner
+        || routine.runOn !== definition.runOn || routine.prompt !== definition.instructions
+        || routine.durationMinutes !== definition.durationMinutes
+        || routine.timeoutMinutes !== definition.timeoutMinutes
+        || Boolean(routine.continuity) !== Boolean(definition.continuity)
+        || (routine.overlap ?? "skip") !== (definition.overlap ?? "skip")
+        || (routine.attachments?.length ?? 0) > 0) return false;
+      // An omitted start means "every N minutes", not a new phase each time
+      // the model retries. Explicit starts and all other constraints stay exact.
+      const candidate = schedule.type === "interval" && routine.schedule.type === "interval"
+        && definition.schedule.type === "interval" && definition.schedule.anchorAt === undefined
+        ? { ...schedule, anchorAt: routine.schedule.anchorAt }
+        : schedule;
+      return isDeepStrictEqual(candidate, routine.schedule);
+    });
+    if (duplicate) {
+      // The tool cannot choose a result destination. Return the existing ID,
+      // without moving its reports or treating a renamed request as new work.
+      throw new RoutineRequestError(
+        `An enabled routine with the same instructions and execution settings already exists (${duplicate.id}). Use list_routines to review it, then update or run that routine instead.`,
+        409,
+      );
+    }
+  }
   const current = operation.action === "create"
     ? null
     : verifyManageSnapshot(operation, manager, botId);
@@ -951,6 +1022,13 @@ function revalidateOperation(operation: RoutineRequestOperation, manager: Routin
     : operation.action === "update"
       ? operation.changes.schedule
       : undefined;
+  if (schedule?.type === "cron") {
+    try {
+      normalizeCronSchedule(schedule, now);
+    } catch (error) {
+      throw new RoutineRequestError(error instanceof Error ? error.message : "Invalid cron schedule", 409);
+    }
+  }
   if (schedule?.type === "once" && schedule.at <= now) {
     throw new RoutineRequestError("That one-time schedule is now in the past. Ask the bot to propose a new time.", 409);
   }
@@ -998,10 +1076,11 @@ export class RoutineRequestService {
   private readonly routines: RoutineManager;
   private readonly now: () => number;
   private readonly timeZone: () => string;
-  private readonly cloudReady?: () => Promise<{ ready: boolean; reason?: string }>;
+  private readonly cloudReady?: (botId: string) => Promise<{ ready: boolean; reason?: string }>;
   private readonly canPersist?: RoutineRequestServiceOptions["canPersist"];
   private readonly validateTarget?: RoutineRequestServiceOptions["validateTarget"];
   private readonly autoConfirm?: () => boolean;
+  private readonly autoApply?: RoutineRequestServiceOptions["autoApply"];
 
   constructor(options: RoutineRequestServiceOptions) {
     this.store = options.store;
@@ -1012,9 +1091,21 @@ export class RoutineRequestService {
     this.canPersist = options.canPersist;
     this.validateTarget = options.validateTarget;
     this.autoConfirm = options.autoConfirm;
+    this.autoApply = options.autoApply;
   }
 
   async propose(args: ProposeRoutineRequestArgs): Promise<RoutineProposalResult> {
+    return this.prepare(args);
+  }
+
+  async submit(args: ProposeRoutineRequestArgs) {
+    const proposal = await this.prepare(args, true);
+    return { ...proposal, state: proposal.result ? "applied" as const : "pending" as const };
+  }
+
+  private async prepare(args: ProposeRoutineRequestArgs, submitted = false): Promise<RoutineProposalResult & {
+    result?: Extract<ResolveRoutineRequestResult, { state: "applied" }>;
+  }> {
     const botId = text(args.botId, "botId", 128);
     const threadId = text(args.threadId, "threadId", 128);
     const at = this.now();
@@ -1027,7 +1118,7 @@ export class RoutineRequestService {
       const refusal = this.validateTarget(botId, operation.forBot);
       if (refusal) throw new RoutineRequestError(refusal, 403);
     }
-    await this.requireCloudReadiness(operation);
+    await this.requireCloudReadiness(operation, botId);
     // The readiness probe is asynchronous. Another request can edit or
     // delete the routine while it is in flight, so re-check the captured
     // revision before rendering and persisting the confirmation snapshot.
@@ -1042,7 +1133,8 @@ export class RoutineRequestService {
       createdAt: cardAt,
       operation,
     };
-    const timeZone = this.timeZone();
+    const definition = effectiveDefinition(operation, this.routines);
+    const timeZone = definition?.schedule.type === "cron" ? definition.schedule.timeZone : this.timeZone();
     const copy = cardCopy(operation, this.routines, timeZone, cardAt);
     const messageInput: Parameters<RoutineRequestStore["appendMessage"]>[1] = {
       role: "bot",
@@ -1067,8 +1159,14 @@ export class RoutineRequestService {
     if (args.canCommit && !args.canCommit()) {
       throw new RoutineRequestError("The requesting turn ended before this proposal could be saved", 401);
     }
+    // Resolve the current source-thread grant after the asynchronous probe.
+    const automatic = submitted && this.autoApply?.(botId, threadId) === true;
+    if (automatic) {
+      messageInput.card.options = [];
+      messageInput.card.dismissed = true;
+    }
     const message = this.store.appendMessage(threadId, messageInput);
-    const result: RoutineProposalResult = {
+    const proposal: RoutineProposalResult & { result?: Extract<ResolveRoutineRequestResult, { state: "applied" }> } = {
       requestId,
       messageId: message.id,
       title: copy.title,
@@ -1085,21 +1183,46 @@ export class RoutineRequestService {
         behavior: "allow",
       });
       if (resolved.claimed && resolved.state === "applied") {
-        result.applied = true;
-        result.resultId = resolved.resultId;
-        result.action = resolved.action;
+        proposal.applied = true;
+        proposal.resultId = resolved.resultId;
+        proposal.action = resolved.action;
+        proposal.result = resolved;
       }
+      return proposal;
     }
-    return result;
+    if (!automatic) return proposal;
+    // Persist a hidden receipt first, then use the existing validated,
+    // idempotent commit path without exposing a pending confirmation.
+    let result: ResolveRoutineRequestResult;
+    try {
+      result = this.resolve({ botId, threadId, requestId, behavior: "allow" });
+    } catch (error) {
+      result = { claimed: true, state: "invalid", error: error instanceof Error ? error.message : String(error), status: error instanceof RoutineRequestError ? error.status : 400 };
+    }
+    if (result.state === "applied") return { ...proposal, result };
+    // The scheduler commit can succeed even if settling its transcript
+    // fails. Report that exact result; a retry only finishes the receipt.
+    const receipt = this.routines.routineRequestReceipt(requestId);
+    if (receipt && receipt.botId === botId && receipt.threadId === threadId && receipt.messageId === message.id &&
+      receipt.fingerprintVersion === ROUTINE_REQUEST_FINGERPRINT_VERSION && receipt.fingerprint === routineRequestFingerprint(payload, message.id)) {
+      return { ...proposal, result: {
+        claimed: true, state: "applied", action: receipt.action, resultId: receipt.resultId,
+        settlementPending: true, message: "Routine change applied. Recording the operation receipt could not finish; the change will not be applied again.",
+      } };
+    }
+    throw new RoutineRequestError(result.state === "invalid" ? result.error : "The routine change could not be applied", result.state === "invalid" ? result.status : 409);
   }
 
-  private async requireCloudReadiness(operation: RoutineRequestOperation): Promise<void> {
+  private async requireCloudReadiness(operation: RoutineRequestOperation, proposerBotId: string): Promise<void> {
     if (!this.cloudReady || operation.action === "pause" || operation.action === "delete") return;
     const definition = effectiveDefinition(operation, this.routines);
     if (definition?.runOn !== "cloud") return;
     let readiness: { ready: boolean; reason?: string };
     try {
-      readiness = await this.cloudReady();
+      const targetBotId = operation.action === "create"
+        ? operation.forBot?.botId ?? proposerBotId
+        : this.routines.listRoutines().find(routine => routine.id === operation.routineId)?.botId ?? proposerBotId;
+      readiness = await this.cloudReady(targetBotId);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new RoutineRequestError(`Could not verify cloud readiness: ${detail}`, 503);

@@ -9,11 +9,15 @@ export function FullAccessWarning({
   onCancel,
   onConfirm,
   scope = "bot",
+  allThreads,
+  onAllThreadsChange,
 }: {
   open: boolean;
   onCancel: () => void;
   onConfirm: () => void;
   scope?: "bot" | "thread";
+  allThreads?: boolean;
+  onAllThreadsChange?: (value: boolean) => void;
 }) {
   const cancelRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -70,11 +74,18 @@ export function FullAccessWarning({
             </h2>
             <p id="full-access-warning-body" className="mt-1.5 text-[13px] leading-relaxed text-ink-secondary">
               {scope === "thread"
-                ? "Apply this bot's Full access to this thread only, including work delegated here. It can read, edit and delete files, use the internet, and control its selected computer without asking—even for destructive or sensitive actions. Other existing threads keep their approval levels. Provider safety restrictions, questions and separate OpenMausBot confirmations still apply."
+                ? "Enable Full access for this thread only, including work delegated here. It can read, edit and delete files, use the internet, and control its selected computer without asking—even for destructive or sensitive actions. The bot default and other threads keep their approval levels. Provider safety restrictions, questions and separate OpenMausBot confirmations still apply."
                 : FULL_ACCESS_WARNING}
             </p>
           </div>
         </div>
+        {scope === "bot" && onAllThreadsChange && <label className="mt-4 flex items-start gap-2 text-[13px] text-ink">
+          <input type="checkbox" className="mt-0.5 accent-accent" checked={Boolean(allThreads)}
+            onChange={event => onAllThreadsChange(event.target.checked)} />
+          <span>Apply to all existing and future threads
+            <span className="mt-1 block text-ink-secondary">Includes archived threads. Other bots keep their settings.</span>
+          </span>
+        </label>}
         <div className="mt-5 flex justify-end gap-2">
           <button
             ref={cancelRef}

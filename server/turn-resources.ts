@@ -1,7 +1,15 @@
 import { realpathSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 
-export type TurnOwner = { threadId: string; generation: string };
+export type TurnOwner = {
+  threadId: string;
+  generation: string;
+  /** Set when a lazy computer-claim rejection was already reported for this
+   * generation; the turn.completed fold checks it so that failure settles as
+   * one incident, not two (Claude settles the follow-up interrupt as
+   * exit_before_result, which reads there like a fresh failure). */
+  lazyClaimFailureReported?: boolean;
+};
 
 /** One harness owns the data directory. Claims are synchronous and last for
  * the whole turn, not just a click: a screenshot and its following click
@@ -10,10 +18,15 @@ export type TurnOwner = { threadId: string; generation: string };
 export class TurnResources {
   private readonly owners = new Map<string, TurnOwner>();
 
-  claim(resource: string, owner: TurnOwner): boolean {
+  blocker(resource: string, owner: TurnOwner): TurnOwner | undefined {
     for (const [key, current] of this.owners) {
-      if (overlaps(key, resource) && !sameOwner(current, owner)) return false;
+      if (overlaps(key, resource) && !sameOwner(current, owner)) return current;
     }
+    return undefined;
+  }
+
+  claim(resource: string, owner: TurnOwner): boolean {
+    if (this.blocker(resource, owner)) return false;
     this.owners.set(resource, owner);
     return true;
   }
@@ -27,6 +40,12 @@ export class TurnResources {
     for (const [key, current] of this.owners) {
       if (sameOwner(current, owner)) this.owners.delete(key);
     }
+  }
+
+  /** Drop one of an owner's claims early, when the sequence that took it
+   * could not finish. The owner's other claims stand until settle. */
+  releaseOne(resource: string, owner: TurnOwner): void {
+    if (this.owns(resource, owner)) this.owners.delete(resource);
   }
 }
 

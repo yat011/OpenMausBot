@@ -325,51 +325,18 @@ export interface VerificationServer {
   close(): Promise<void>;
 }
 
-/** Start one foreground-owned, fake-engine server with no access to user data. */
-export async function launchVerificationServer(
-  parentEnv: NodeJS.ProcessEnv = process.env,
-  signal?: AbortSignal,
-  localVm?: { binDir: string; host: string; sshKey: string; staticDir: string },
-  browser?: { binaryPath: string; executablePath: string },
-  /** A stand-in enterprise layer (the folder shape core loads) and the key
-   * it should accept, so a recipe can prove entitled behaviour offline. */
-  enterprise?: { dir: string; licenseKey: string },
-): Promise<VerificationServer> {
-  if (localVm) {
-    const endpoint = new URL(localVm.host);
-    if (endpoint.protocol !== "ssh:" || endpoint.hostname !== "127.0.0.1" || endpoint.password) {
-      throw new ControlOmbError("Local VM verification requires an explicit loopback Podman machine");
-    }
-  }
-  const port = await freePortBlock([0, 1]);
-  if (signal?.aborted) throw new ControlOmbError("verification launch cancelled");
-  const url = `http://127.0.0.1:${port}`;
-  // Native browser daemons use UNIX sockets; a macOS temp home can exceed
-  // their path limit. This is still an owned, randomly named fixture only.
-  const dataDir = mkdtempSync(join(browser && process.platform !== "win32" ? "/tmp" : tmpdir(), "openmausbot-verify-data-"));
-  const fixtureTemp = join(dataDir, "tmp");
-  const fixtureDumpPath = join(dataDir, "fake-claude-dump.json");
-  mkdirSync(fixtureTemp, { recursive: true });
-  const evidenceDir = join(tmpdir(), "openmausbot-verification-evidence");
-  mkdirSync(evidenceDir, { recursive: true });
-  const logPath = join(evidenceDir, `server-${Date.now()}-${process.pid}.log`);
-  writeFileSync(join(dataDir, "config.json"), JSON.stringify({
-    instances: {
-      claude: {
-        driver: "claudeAgent",
-        displayName: "Verification fixture",
-        config: { cli: FAKE_CLI },
-      },
-    },
-  }, null, 2));
-
-  const log = openSync(logPath, "a", 0o600);
+/** The environment of a verification server child: a temporary home in
+ * `dataDir`, the fake engine's knobs from `parentEnv`, node on PATH, and
+ * nothing else from the parent shell. A test that restarts its own fixture
+ * server on the same data uses this too. */
+export function verificationServerEnvironment(parentEnv: NodeJS.ProcessEnv, dataDir: string, port: number): NodeJS.ProcessEnv {
   const childEnv: NodeJS.ProcessEnv = {};
   const platformKeys = new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_ALL", "TZ"]);
   for (const [key, value] of Object.entries(parentEnv)) {
     const normalized = key.toUpperCase();
     if (value && platformKeys.has(normalized)) childEnv[normalized] = value;
   }
+  const fixtureTemp = join(dataDir, "tmp");
   Object.assign(childEnv, {
     HOME: dataDir,
     USERPROFILE: dataDir,
@@ -390,7 +357,7 @@ export async function launchVerificationServer(
     // failure paths (exit-early, dead-session, hang...) through the real
     // server. Nothing else from the parent shell reaches the fixture.
     FAKE_CLAUDE_MODE: parentEnv.FAKE_CLAUDE_MODE || "happy",
-    FAKE_CLAUDE_DUMP: fixtureDumpPath,
+    FAKE_CLAUDE_DUMP: join(dataDir, "fake-claude-dump.json"),
     // Keep the environment hermetic while allowing POSIX to resolve the
     // fake CLI's `#!/usr/bin/env node` shebang. Windows resolves that same
     // fixture through spawnCli without a shell.
@@ -402,6 +369,72 @@ export async function launchVerificationServer(
     // FAKE_CLAUDE_DUMP stays the launcher's: assertions read fixtureDumpPath.
     if (key.startsWith("FAKE_CLAUDE_") && key !== "FAKE_CLAUDE_DUMP" && value) childEnv[key] = value;
   }
+  // A test's key for relaying an organization library into the fixture
+  // (POST /api/testing/org-library); the route does not exist without it.
+  if (parentEnv.OMB_TEST_ORG_LIBRARY_KEY) childEnv.OMB_TEST_ORG_LIBRARY_KEY = parentEnv.OMB_TEST_ORG_LIBRARY_KEY;
+  return childEnv;
+}
+
+/** Start one foreground-owned, fake-engine server with no access to user data. */
+export async function launchVerificationServer(
+  parentEnv: NodeJS.ProcessEnv = process.env,
+  signal?: AbortSignal,
+  localVm?: { binDir: string; host: string; sshKey: string; staticDir: string },
+  browser?: { binaryPath: string; executablePath: string },
+  /** A stand-in enterprise layer (the folder shape core loads) and the key
+   * it should accept, so a recipe can prove entitled behaviour offline. */
+  enterprise?: { dir: string; licenseKey: string },
+  room?: { scripted: boolean },
+  /** Optional repository-owned fake providers for multi-engine setup checks. */
+  extraProviders: Array<"codex"> = [],
+  /** Programmatic tests only: an owned loopback Box provider, never a live account. */
+  boxFixtureApi?: string,
+): Promise<VerificationServer> {
+  if (boxFixtureApi) {
+    if (!/^http:\/\/127\.0\.0\.1:[1-9]\d{0,4}$/.test(boxFixtureApi)) {
+      throw new ControlOmbError("Box verification requires an explicit loopback HTTP provider");
+    }
+    try { new URL(boxFixtureApi); }
+    catch { throw new ControlOmbError("Box verification requires a valid loopback port"); }
+  }
+  if (localVm) {
+    const endpoint = new URL(localVm.host);
+    if (endpoint.protocol !== "ssh:" || endpoint.hostname !== "127.0.0.1" || endpoint.password) {
+      throw new ControlOmbError("Local VM verification requires an explicit loopback Podman machine");
+    }
+  }
+  const port = await freePortBlock([0, 1]);
+  if (signal?.aborted) throw new ControlOmbError("verification launch cancelled");
+  const url = `http://127.0.0.1:${port}`;
+  // Native browser daemons use UNIX sockets; a macOS temp home can exceed
+  // their path limit. This is still an owned, randomly named fixture only.
+  const dataDir = mkdtempSync(join(browser && process.platform !== "win32" ? "/tmp" : tmpdir(), "openmausbot-verify-data-"));
+  const fixtureTemp = join(dataDir, "tmp");
+  const fixtureDumpPath = join(dataDir, "fake-claude-dump.json");
+  mkdirSync(fixtureTemp, { recursive: true });
+  const evidenceDir = join(tmpdir(), "openmausbot-verification-evidence");
+  mkdirSync(evidenceDir, { recursive: true });
+  const logPath = join(evidenceDir, `server-${Date.now()}-${process.pid}.log`);
+  writeFileSync(join(dataDir, "config.json"), JSON.stringify({
+    ...(boxFixtureApi ? { box: { token: "box_verification_fixture" } } : {}),
+    instances: {
+      // The synthetic map omits the default computer engine. Register it
+      // only when an owned Box provider backs this fixture's cloud panel.
+      ...(boxFixtureApi ? { computer: { driver: "boxAgent" } } : {}),
+      ...(extraProviders.includes("codex") ? { codex: {
+        driver: "codex", displayName: "Verification Codex", config: { cli: fileURLToPath(new URL("../server/testing/fake-codex-app-server.ts", import.meta.url)) },
+      } } : {}),
+      claude: {
+        driver: "claudeAgent",
+        displayName: "Verification fixture",
+        config: { cli: FAKE_CLI },
+        ...(room?.scripted ? { environment: { FAKE_CLAUDE_ROOM_PLAN: join(dataDir, "room-plan.json") } } : {}),
+      },
+    },
+  }, null, 2));
+
+  const log = openSync(logPath, "a", 0o600);
+  const childEnv = verificationServerEnvironment(parentEnv, dataDir, port);
   // Opt-in live Local VM fixture: keep the temporary home and fake engine,
   // granting only the explicitly selected machine connection and static UI.
   if (localVm) Object.assign(childEnv, {
@@ -415,6 +448,7 @@ export async function launchVerificationServer(
     OMB_AGENT_BROWSER_PATH: browser.binaryPath,
     AGENT_BROWSER_EXECUTABLE_PATH: browser.executablePath,
   });
+  if (boxFixtureApi) childEnv.OMB_BOX_API = boxFixtureApi;
   const child = spawn(process.execPath, ["--experimental-strip-types", join(ROOT, "server", "index.ts")], {
     cwd: ROOT,
     env: childEnv,

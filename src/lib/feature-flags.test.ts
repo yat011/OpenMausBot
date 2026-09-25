@@ -5,6 +5,7 @@ import {
   autoConfirmRoutineProposalsEnabled,
   autoConfirmSkillProposalsEnabled,
   builtInBrowserEnabled,
+  sharedComputersEnabled,
   showToolCallsEnabled,
   skillAuthoringEnabled,
 } from "./feature-flags";
@@ -57,5 +58,13 @@ describe("experimental feature flags", () => {
     expect(autoConfirmSkillProposalsEnabled({})).toBe(false);
     expect(autoConfirmSkillProposalsEnabled({ features: { autoConfirmSkillProposals: false } })).toBe(false);
     expect(autoConfirmSkillProposalsEnabled({ features: { autoConfirmSkillProposals: true } })).toBe(true);
+  });
+
+  it("keeps computer sharing off unless the server says it is on", () => {
+    expect(sharedComputersEnabled(null)).toBe(false);
+    expect(sharedComputersEnabled({})).toBe(false);
+    expect(sharedComputersEnabled({ features: {} })).toBe(false);
+    expect(sharedComputersEnabled({ features: { sharedComputers: false } })).toBe(false);
+    expect(sharedComputersEnabled({ features: { sharedComputers: true } })).toBe(true);
   });
 });

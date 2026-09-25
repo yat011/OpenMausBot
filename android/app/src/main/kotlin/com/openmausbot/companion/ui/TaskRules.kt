@@ -3,6 +3,12 @@ package com.openmausbot.companion.ui
 import com.openmausbot.companion.core.Bot
 import com.openmausbot.companion.core.BotTask
 import com.openmausbot.companion.core.Chat
+import com.openmausbot.companion.core.demandsAttention
+import com.openmausbot.companion.core.isClosed
+import com.openmausbot.companion.core.isArchived
+import com.openmausbot.companion.core.displayTitle
+import com.openmausbot.companion.core.listedThreads
+import com.openmausbot.companion.core.threadGroups
 
 /**
  * Separate contexts for an agent or a channel — the rules behind
@@ -26,15 +32,50 @@ object TaskRules {
         is Chat.RoomChat -> "Group threads"
     }
 
-    /** Filter navigation only; full task state still resolves run logs and approvals. */
-    fun tasks(bot: Bot): List<BotTask> = bot.tasks.orEmpty().filter { it.routineRunId == null }
+    /**
+     * Filter navigation only; full task state still resolves run logs and approvals.
+     * The sheet is the phone's only thread list, so threads a bot closed stay in
+     * it — but after every open thread, in their own server order, so a pile of
+     * closed helper threads never buries the person's own, and archived
+     * threads fold to the very tail. A folded thread that is running, unread,
+     * or the current one is treated as open.
+     *
+     * Inside each band, order is pin, then newest update. Equal stamps keep
+     * stored order. Attention does not move a row.
+     */
+    fun tasks(bot: Bot, queuedThreadIds: Set<String> = emptySet()): List<BotTask> {
+        val navigable = bot.threadGroups(includingClosed = true).flatMap { it.tasks }
+        val (pinned, rest) = navigable.partition { it.pinned == true }
+        val (surfaced, folded) = rest.partition {
+            (!it.isClosed && !it.isArchived) ||
+                demandsAttention(it, queued = it.threadId in queuedThreadIds) ||
+                isCurrent(it, bot)
+        }
+        val (closed, archived) = folded.partition { !it.isArchived }
+        return listedThreads(pinned) +
+            listedThreads(surfaced) +
+            listedThreads(closed) +
+            listedThreads(archived)
+    }
+
+    /** Running, needing the person, holding a queued send, or holding
+     * something they have not read. */
+    fun demandsAttention(task: BotTask, queued: Boolean = false): Boolean =
+        task.demandsAttention(queued)
+
+    /**
+     * Working is activity or flag: the wire can carry either alone, so the
+     * snooze presets ask the same question the desktop's disabled snooze
+     * buttons ask (`isWorking` in `SidebarThreadRow.tsx`).
+     */
+    fun isWorking(task: BotTask): Boolean = task.activity == "working" || task.busy == true
 
     fun tasks(chat: Chat): List<BotTask> = when (chat) {
         is Chat.BotChat -> tasks(chat.bot)
-        is Chat.RoomChat -> chat.room.tasks.orEmpty()
+        is Chat.RoomChat -> listedThreads(chat.room.tasks.orEmpty())
     }
 
-    fun title(task: BotTask): String = task.title.ifEmpty { UNTITLED }
+    fun title(task: BotTask): String = task.displayTitle
 
     fun isCurrent(task: BotTask, bot: Bot): Boolean = task.threadId == bot.threadId
 
@@ -62,14 +103,27 @@ object TaskRules {
     }
 
     /** Already being on a task is not a switch; legacy desktops still serialize. */
-    fun canSwitch(task: BotTask, bot: Bot): Boolean = canCreate(bot) && !isCurrent(task, bot)
+    fun canSwitch(task: BotTask, bot: Bot): Boolean = tasks(bot).any { it.threadId == task.threadId } && !isCurrent(task, bot)
 
-    fun canSwitch(task: BotTask, chat: Chat): Boolean = canCreate(chat) && !isCurrent(task, chat)
+    fun canSwitch(task: BotTask, chat: Chat): Boolean = when (chat) {
+        is Chat.BotChat -> canSwitch(task, chat.bot)
+        is Chat.RoomChat -> canCreate(chat) && !isCurrent(task, chat)
+    }
 
     /** Renaming is allowed while busy: it touches the label, not the thread. */
     fun canRename(bot: Bot): Boolean = true
 
     fun canRename(chat: Chat): Boolean = true
+
+    /** Archiving mid-turn would race the work, as with delete: wait for it. */
+    fun canArchive(task: BotTask, bot: Bot): Boolean =
+        task.activity !in setOf("working", "running") &&
+            if (independent(bot)) task.busy != true else bot.busy != true
+
+    fun canArchive(task: BotTask, chat: Chat): Boolean = when (chat) {
+        is Chat.BotChat -> canArchive(task, chat.bot)
+        is Chat.RoomChat -> task.activity !in setOf("working", "running") && task.busy != true
+    }
 }
 
 /**

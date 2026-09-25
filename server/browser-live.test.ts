@@ -96,7 +96,9 @@ describe("browser viewer protocol boundary", () => {
   });
   it("projects frames and tab/status fields, never engine extras or raw error messages", () => {
     expect(normalizeBrowserLiveMessage({ ...frame, password: "secret" })).toEqual({ type: "frame", seq: 1, data: "/9j/AAAA", format: "jpeg", metadata: { ...frame.metadata, scrollOffsetX: 0, scrollOffsetY: 0 } });
-    expect(normalizeBrowserLiveMessage({ type: "error", message: "secret arguments" })).not.toHaveProperty("message", "secret arguments");
+    expect(normalizeBrowserLiveMessage({ type: "error", message: "secret arguments" })).toEqual({
+      type: "error", retryable: true, message: "The browser stream was interrupted.",
+    });
     expect(normalizeBrowserLiveMessage({ type: "tabs", tabs: [{ tabId: "t1", title: "Page", url: "https://user:secret@example.com/", active: true, targetId: "private" }] })).toEqual({ type: "tabs", tabs: [{ tabId: "t1", title: "Page", url: "https://example.com/", active: true }] });
     expect(normalizeBrowserLiveMessage({ type: "status", connected: true, engine: "private" })).not.toHaveProperty("engine");
   });
@@ -124,6 +126,29 @@ describe("browser viewer protocol boundary", () => {
 });
 
 describe("authenticated browser viewer relay", () => {
+  it("fences a late stream startup when that owner is closed during discovery", async () => {
+    let finish!: (value: ReturnType<typeof output>) => void;
+    execute.mockImplementationOnce(() => new Promise((resolve) => finish = resolve));
+    const opening = open();
+    const rejected = expect(opening).rejects.toThrow();
+    await expect.poll(() => execute.mock.calls.length).toBe(1);
+    live.closeForOwner("admin-a");
+    finish(output(ready));
+    await rejected;
+    expect(SocketFixture.instances).toHaveLength(0);
+  });
+  it("closes every stream and upstream socket for a revoked owner without touching other owners", async () => {
+    const a = await open();
+    const b = await open({ botId: "bot-b", session: "profile-b" });
+    const other = await open({ owner: "other" });
+    live.closeForOwner("admin-a");
+    expect(a.res.writableEnded).toBe(true);
+    expect(b.res.writableEnded).toBe(true);
+    expect(a.socket.readyState).toBe(3);
+    expect(b.socket.readyState).toBe(3);
+    expect(other.res.writableEnded).toBe(false);
+    expect(other.socket.readyState).toBe(1);
+  });
   it("keeps opening status, tabs and the seed frame even if they arrive immediately with the WebSocket upgrade", async () => {
     SocketFixture.initialMessages = [{ type: "status", connected: true }, { type: "tabs", tabs: [] }, frame];
     const a = await open();

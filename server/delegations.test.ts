@@ -13,14 +13,17 @@ import type { ModelSelection } from "./contracts.ts";
 import {
   buildDelegationFailurePrompt,
   buildDelegationRevivalPrompt,
+  busyHoldCapText,
+  DELEGATION_BUSY_HOLD_MAX_MS,
+  DELEGATION_TTL_MS,
   DELEGATION_WAKE_MAX_PER_WINDOW,
   DELEGATION_WAKE_WINDOW_MS,
   DelegationWakeBudget,
   discardDelegations,
   drainDelegations,
+  expireStaleDelegations,
   findDelegationReceipt,
   formatDelegationElapsed,
-  MAX_BUSY_ATTEMPTS,
   pendingDelegationInfo,
   pendingDelegationSnapshot,
   queueDelegation,
@@ -30,7 +33,7 @@ import {
   threadsWaitingOn,
   _pendingCount,
 } from "./delegations.ts";
-import { peerAllowKey, resolvePeerComms } from "./peer-approval.ts";
+import { cancelPeerApprovalsForThread, peerAllowKey, resolvePeerComms } from "./peer-approval.ts";
 import { Store, type BotRecord, type GroupRecord } from "./store.ts";
 
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "fake-model" });
@@ -60,16 +63,26 @@ function setupBuses(store: Store): BusPair {
 
 /** Poll until `predicate` returns a truthy value or `timeout` elapses.
  * drainDelegations is fire-and-forget (processOne runs as a Promise) so
- * tests need to wait for its async steps to land. */
+ * tests need to wait for its async steps to land. The deadline is computed
+ * from `performance.now()`, not `Date.now()`: `vi.useFakeTimers({ toFake:
+ * ["Date"] })` freezes Date but not performance.now(), so a regression fails
+ * this timeout instead of hanging until Vitest's own test timeout. */
 async function waitFor<T>(predicate: () => T | undefined | false, timeout = 2_000): Promise<T> {
-  const deadline = Date.now() + timeout;
+  const deadline = performance.now() + timeout;
   for (;;) {
     const v = predicate();
     if (v) return v as T;
-    if (Date.now() > deadline) throw new Error("waitFor: timed out");
+    if (performance.now() > deadline) throw new Error("waitFor: timed out");
     await new Promise((r) => setTimeout(r, 25));
   }
 }
+
+it.each([
+  [1_000, "1 minute"], [60_000, "1 minute"], [120_000, "2 minutes"],
+  [3_600_000, "1 hour"], [5_400_000, "90 minutes"], [7_200_000, "2 hours"],
+])("formats the configured busy-hold cap %s as %s", (duration, label) => {
+  expect(busyHoldCapText(duration as number)).toBe(label);
+});
 
 describe("queueDelegation", () => {
   let store: Store;
@@ -431,7 +444,7 @@ describe("drainDelegations", () => {
         .messagesFor(from.threadId)
         .find((m) => m.kind === "activity" && (m.tool?.name ?? "").includes("waiting — they're busy")),
     );
-    expect(chip.tool?.name).toBe("Delegation to @Helper waiting — they're busy (retry 1/3 when they finish)");
+    expect(chip.tool?.name).toBe("Delegation to @Helper waiting — they're busy; it'll go through when they're free");
     expect(runTargetCalls).toEqual([]);
     // retained for the retry drain the target's settling turn triggers
     expect(_pendingCount(from.threadId)).toBe(1);
@@ -498,6 +511,46 @@ describe("drainDelegations", () => {
     expect(runTarget).not.toHaveBeenCalled();
   });
 
+  it.each(["deny", "expired", "cancelled"] as const)("records %s approval outcomes without dispatch or a late revival", async (outcome) => {
+    vi.useFakeTimers();
+    try {
+      store.patchBot(from.id, { approvePeerComms: true });
+      const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
+      const runTarget = vi.fn();
+      const settled = vi.fn();
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget, settled);
+      await vi.advanceTimersByTimeAsync(0);
+      const card = store.messagesFor(from.threadId).find(m => m.card?.requestId)!;
+      expect(card).toBeDefined();
+      if (outcome === "expired") await vi.advanceTimersByTimeAsync(15 * 60_000);
+      else if (outcome === "cancelled") cancelPeerApprovalsForThread(from.threadId);
+      else resolvePeerComms(approvalBus, card.card!.requestId!, "deny");
+      await vi.advanceTimersByTimeAsync(0);
+      const receipt = findDelegationReceipt(queued.id!)!;
+      expect(receipt).toMatchObject({
+        status: outcome === "deny" ? "denied" : outcome,
+        approvalOutcome: outcome,
+        approvalSource: outcome === "deny" ? "user" : "system",
+      });
+      expect(receipt.result).toBe(outcome === "deny" ? "the user denied this handoff"
+        : outcome === "expired" ? "the approval card expired without an answer" : "the approval was cancelled before a decision");
+      expect(settled).toHaveBeenCalledTimes(1);
+      expect(_pendingCount(from.threadId)).toBe(0);
+      expect(runTarget).not.toHaveBeenCalled();
+      expect(resolvePeerComms(approvalBus, card.card!.requestId!, "allow")).toBe(false);
+      if (outcome !== "deny") {
+        expect(store.messagesFor(from.threadId).some(m => m.tool?.name?.includes("denied by user"))).toBe(false);
+        expect(buildDelegationFailurePrompt(target.name, receipt.result!)).not.toContain("user denied");
+      }
+      _resetPending();
+      _loadPending();
+      expect(findDelegationReceipt(queued.id!)).toEqual(receipt);
+    } finally {
+      cancelPeerApprovalsForThread(from.threadId);
+      vi.useRealTimers();
+    }
+  });
+
   it("does not revive discarded work when an already-open approval is allowed", async () => {
     store.patchBot(from.id, { approvePeerComms: true });
     const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
@@ -521,7 +574,7 @@ describe("drainDelegations", () => {
     const card = await waitFor(() => store.messagesFor(from.threadId).find((m) => m.card?.requestId));
     store.patchBot(target.id, { busy: true });
     resolvePeerComms(approvalBus, card.card!.requestId!, "allow");
-    await waitFor(() => pendingDelegationInfo(queued.id!)?.attempts === 1);
+    await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
     store.patchBot(target.id, { busy: false });
     releaseDelegationsWaitingOn(target.id);
     drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
@@ -543,7 +596,7 @@ describe("drainDelegations", () => {
       const card = await waitFor(() => store.messagesFor(sourceThreadId).find((m) => m.card?.requestId));
       store.patchBot(target.id, { busy: true });
       resolvePeerComms(approvalBus, card.card!.requestId!, "allow");
-      await waitFor(() => pendingDelegationInfo(queued.id!)?.attempts === 1);
+      await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
 
       if (group) store.patchGroup(group.id, { memberIds: [target.id] });
       else expect(store.deleteTask(from.id, sourceThreadId)).not.toBeNull();
@@ -685,6 +738,7 @@ describe("delegations survive a restart", () => {
       toBotId: target.id,
       message: "do this",
       approvalAlreadyGranted: true,
+      queuedAt: expect.any(Number),
     });
 
     discardDelegations(buses.commsBus, from.threadId);
@@ -769,9 +823,157 @@ describe("delegations survive a restart", () => {
     _loadPending();
     expect(pendingThreads()).toEqual([]);
   });
+
+  it("restores an over-age backlog without expiring the second job when the first occupies its target", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const first = queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "first", depth: 0 }, 1);
+      const second = queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "second", depth: 0 }, 1);
+      vi.setSystemTime(Date.now() + 2 * DELEGATION_TTL_MS);
+      _resetPending();
+      _loadPending();
+      const renewedAt = pendingDelegationInfo(second.id!)!.queuedAt;
+      expect(renewedAt).toBe(Date.now());
+      // The repaired deadline is already durable; restarting again does
+      // not grant another window while this one is still valid.
+      vi.setSystemTime(Date.now() + 60_000);
+      _resetPending();
+      _loadPending();
+      expect(pendingDelegationInfo(second.id!)?.queuedAt).toBe(renewedAt);
+      const ran: string[] = [];
+      const runTarget = (_to: string, message: string) => {
+        ran.push(message);
+        store.patchBot(target.id, { busy: true });
+      };
+      drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, runTarget);
+      await waitFor(() => ran.length === 1 && pendingDelegationInfo(first.id!) === null);
+      expect(findDelegationReceipt(second.id!)).toBeNull();
+      expect(pendingDelegationInfo(second.id!)?.waiting).toBe(true);
+
+      store.patchBot(target.id, { busy: false });
+      releaseDelegationsWaitingOn(target.id);
+      drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, runTarget);
+      await waitFor(() => ran.length === 2 && pendingThreads().length === 0);
+      expect(ran[1]).toContain("second");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives a handoff saved before queuedAt existed a fresh 24-hour window, marks it already-announced, and persists the backfill", () => {
+    const { mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(file(), JSON.stringify({
+      [from.threadId]: [
+        { id: "legacy-1", sourceBotId: from.id, toBotId: target.id, message: "old", depth: 0, attempts: 2 },
+      ],
+    }));
+    const before = Date.now();
+    _loadPending();
+    expect(pendingDelegationInfo("legacy-1")?.queuedAt).toBeGreaterThanOrEqual(before);
+    // attempts >= 1 means the old "retry n/3" chip already posted — loading
+    // it must not let it post a second waiting chip on the next drain.
+    const onDisk = JSON.parse(readFileSync(file(), "utf8")) as Record<string, Array<{ id: string; waitAnnounced?: boolean; queuedAt?: number }>>;
+    const loaded = onDisk[from.threadId]!.find((entry) => entry.id === "legacy-1")!;
+    expect(loaded.waitAnnounced).toBe(true);
+    // the backfilled queuedAt is written back immediately, so a restart loop
+    // does not keep restarting the 24-hour window on every boot.
+    expect(loaded.queuedAt).toBeGreaterThanOrEqual(before);
+  });
+
+  it("renews an elapsed busy window on restart without extending a still-valid one", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      store.patchBot(target.id, { busy: true });
+      queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "held", depth: 0 }, 1);
+      drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, vi.fn());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const heldAt = Date.now();
+      const readBusySince = (): number => JSON.parse(readFileSync(file(), "utf8"))[from.threadId][0].busySince;
+      expect(readBusySince()).toBe(heldAt);
+
+      vi.setSystemTime(heldAt + DELEGATION_BUSY_HOLD_MAX_MS);
+      _loadPending();
+      const renewedAt = Date.now();
+      expect(readBusySince()).toBe(renewedAt);
+      expect(expireStaleDelegations(buses.commsBus, Date.now())).toBe(0);
+
+      vi.setSystemTime(renewedAt + 60_000);
+      _loadPending();
+      expect(readBusySince()).toBe(renewedAt);
+      vi.setSystemTime(renewedAt + DELEGATION_BUSY_HOLD_MAX_MS);
+      expect(expireStaleDelegations(buses.commsBus, Date.now())).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clamps a future queuedAt (clock moved back, hand-edited file) to now instead of making it un-expirable", () => {
+    const { mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+    mkdirSync(DATA_DIR, { recursive: true });
+    const future = Date.now() + 10 * 24 * 60 * 60 * 1000;
+    writeFileSync(file(), JSON.stringify({
+      [from.threadId]: [
+        { id: "future-1", sourceBotId: from.id, toBotId: target.id, message: "old", depth: 0, queuedAt: future },
+      ],
+    }));
+    const before = Date.now();
+    _loadPending();
+    const info = pendingDelegationInfo("future-1");
+    expect(info?.queuedAt).toBeGreaterThanOrEqual(before);
+    expect(info?.queuedAt).toBeLessThan(future);
+    const onDisk = JSON.parse(readFileSync(file(), "utf8")) as Record<string, Array<{ id: string; queuedAt?: number }>>;
+    expect(onDisk[from.threadId]!.find((entry) => entry.id === "future-1")!.queuedAt).toBeLessThan(future);
+  });
+
+  it("expireStaleDelegations expires due handoffs across threads, keeps fresh ones, and reports each once", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // Target stays busy for the whole test: expiry only fires for a
+      // handoff that still cannot be delivered, so age alone must not expire it.
+      store.patchBot(target.id, { busy: true });
+      const other = store.createTask(from.id, "Other", false)!.threadId;
+      const stale = queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "stale", depth: 0 }, 1);
+      const staleOther = queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "stale too", depth: 0 }, 1, other);
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_TTL_MS - 1));
+      const fresh = queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "fresh", depth: 0 }, 1);
+      vi.setSystemTime(new Date(Date.now() + 1));
+
+      const settled: string[] = [];
+      expect(expireStaleDelegations(buses.commsBus, Date.now(), (receipt) => void settled.push(receipt.id))).toBe(2);
+      expect(settled.sort()).toEqual([stale.id!, staleOther.id!].sort());
+      expect(findDelegationReceipt(stale.id!)).toMatchObject({ status: "expired" });
+      expect(pendingDelegationInfo(fresh.id!)).not.toBeNull();
+      expect(JSON.parse(readFileSync(file(), "utf8"))[other]).toBeUndefined();
+      // nothing left to do on a second pass
+      expect(expireStaleDelegations(buses.commsBus, Date.now())).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("expireStaleDelegations leaves a thread mid-drain to the drain that owns it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      store.patchBot(from.id, { approvePeerComms: true });
+      const queued = queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "held", depth: 0 }, 1);
+      drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, vi.fn());
+      // the drain is now parked on the approval card
+      const card = await waitFor(() => store.messagesFor(from.threadId).find((m) => m.card?.requestId));
+
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_TTL_MS));
+      expect(expireStaleDelegations(buses.commsBus, Date.now())).toBe(0);
+      expect(pendingDelegationInfo(queued.id!)).not.toBeNull();
+
+      resolvePeerComms(buses.approvalBus, card.card!.requestId!, "deny");
+      await waitFor(() => pendingThreads().length === 0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
-describe("busy retries and receipts", () => {
+describe("busy waits and expiry", () => {
   let store: Store;
   let from: BotRecord;
   let target: BotRecord;
@@ -780,6 +982,7 @@ describe("busy retries and receipts", () => {
 
   beforeEach(() => {
     rmSync(DATA_DIR, { recursive: true, force: true });
+    _resetPending();
     store = new Store(selection);
     from = store.createBot();
     target = store.createBot();
@@ -802,12 +1005,12 @@ describe("busy retries and receipts", () => {
     const runTarget = (...args: unknown[]) => void dispatched.push(args);
 
     drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
-    await waitFor(() => chipCount("waiting — they're busy (retry 1/") === 1);
+    await waitFor(() => chipCount("waiting — they're busy;") === 1);
     expect(dispatched).toHaveLength(0);
     expect(_pendingCount(from.threadId)).toBe(1);
     // this is the set a settling target turn re-drains
     expect(threadsWaitingOn(target.id)).toEqual([from.threadId]);
-    expect(pendingDelegationInfo(taskId)).toMatchObject({ toBotId: target.id, attempts: 1 });
+    expect(pendingDelegationInfo(taskId)).toMatchObject({ toBotId: target.id, waiting: true });
 
     store.patchBot(target.id, { busy: false });
     drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
@@ -818,50 +1021,97 @@ describe("busy retries and receipts", () => {
     expect(pendingDelegationInfo(taskId)).toBeNull();
   });
 
-  it("gives up after the bounded retries, with a receipt the delegator can read", async () => {
+  it("waits through any number of busy periods and still delivers", async () => {
     store.patchBot(target.id, { busy: true });
     const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "later", depth: 0 }, 1);
-    const taskId = queued.id!;
-    const runTarget = () => undefined;
-    for (let round = 1; round < MAX_BUSY_ATTEMPTS; round++) {
+    const runTarget = vi.fn();
+    for (let period = 0; period < 5; period++) {
       drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
-      await waitFor(() => chipCount(`retry ${round}/`) === 1);
-      // One retry is charged per distinct busy period. Releasing the wait
-      // models that turn settling before another turn claims the target.
+      await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
+      // the target's turn settles, and another turn claims it straight away
       expect(releaseDelegationsWaitingOn(target.id)).toEqual([from.threadId]);
     }
+    expect(findDelegationReceipt(queued.id!)).toBeNull();
+    expect(chipCount("waiting — they're busy;")).toBe(1);
+
+    store.patchBot(target.id, { busy: false });
     drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
-    await waitFor(() => _pendingCount(from.threadId) === 0);
-    expect(chipCount("canceled — still busy after")).toBe(1);
-    expect(findDelegationReceipt(taskId)).toMatchObject({
-      status: "busy_gave_up",
-      toBotName: "Helper",
-      sourceThreadId: from.threadId,
-    });
+    await waitFor(() => runTarget.mock.calls.length === 1);
+    expect(_pendingCount(from.threadId)).toBe(0);
   });
 
-  it("does not burn busy retries when an unrelated drain is requested", async () => {
+  it("dispatches a classic handoff while another thread keeps the bot busy, when the standing thread and a slot are free", async () => {
+    // One working thread no longer blocks a classic handoff: admission is
+    // the same test startTurn applies to a direct turn on the standing
+    // thread — the thread free, a slot free, no group turn — never
+    // whole-bot idleness.
+    const asked: Array<[string, string]> = [];
+    const admitBus: CommsBus = {
+      ...commsBus,
+      canAdmitDirectTurn: (botId, threadId) => {
+        asked.push([botId, threadId]);
+        return true;
+      },
+    };
+    store.patchBot(target.id, { busy: true });
+    const queued = queueDelegation(admitBus, from, { toBotId: target.id, message: "now please", depth: 0 }, 1);
+    const runTarget = vi.fn();
+    drainDelegations(admitBus, approvalBus, from.threadId, runTarget);
+    await waitFor(() => runTarget.mock.calls.length === 1 && _pendingCount(from.threadId) === 0);
+
+    expect(asked).toContainEqual([target.id, target.threadId]);
+    expect(runTarget.mock.calls[0][0]).toBe(target.id);
+    expect(chipCount("waiting")).toBe(0);
+    expect(findDelegationReceipt(queued.id!)).toBeNull();
+  });
+
+  it("holds a classic handoff while admission refuses the standing thread, then delivers when it frees", async () => {
+    // The refusal covers every reason startTurn refuses a direct turn: the
+    // standing thread busy, the bot at capacity, or a live group turn.
+    let admit = false;
+    const holdBus: CommsBus = { ...commsBus, canAdmitDirectTurn: () => admit };
+    store.patchBot(target.id, { busy: true });
+    queueDelegation(holdBus, from, { toBotId: target.id, message: "when you can", depth: 0 }, 1);
+    const runTarget = vi.fn();
+    drainDelegations(holdBus, approvalBus, from.threadId, runTarget);
+    await waitFor(() => chipCount("waiting — they're busy;") === 1);
+    expect(runTarget).not.toHaveBeenCalled();
+
+    admit = true;
+    drainDelegations(holdBus, approvalBus, from.threadId, runTarget);
+    await waitFor(() => runTarget.mock.calls.length === 1 && _pendingCount(from.threadId) === 0);
+    expect(chipCount("waiting — they're busy;")).toBe(1);
+  });
+
+  it("posts one waiting chip per handoff, however many drains run while the target is busy", async () => {
     store.patchBot(target.id, { busy: true });
     const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "later", depth: 0 }, 1);
-    const taskId = queued.id!;
     const runTarget = vi.fn();
 
     drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
-    await waitFor(() => chipCount("retry 1/") === 1);
-
-    // A source-thread redrain can happen while an approval for another
-    // item settles. It must not count the same continuously busy turn again.
-    for (let index = 0; index < MAX_BUSY_ATTEMPTS + 1; index++) {
+    await waitFor(() => chipCount("waiting — they're busy;") === 1);
+    // A source-thread redrain can happen while an approval for another item
+    // settles. It must not re-announce the same wait.
+    for (let index = 0; index < 4; index++) {
       drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(pendingDelegationInfo(taskId)?.attempts).toBe(1);
-    expect(chipCount("canceled — still busy after")).toBe(0);
+    expect(chipCount("waiting — they're busy;")).toBe(1);
+    expect(pendingDelegationInfo(queued.id!)).toMatchObject({ waiting: true });
 
     store.patchBot(target.id, { busy: false });
     expect(releaseDelegationsWaitingOn(target.id)).toEqual([from.threadId]);
     drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
     await waitFor(() => runTarget.mock.calls.length === 1);
+  });
+
+  it("says the target is waiting on you when it is parked on an approval", async () => {
+    store.patchBot(target.id, { busy: true, activity: "waiting-on-you" });
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "later", depth: 0 }, 1);
+    drainDelegations(commsBus, approvalBus, from.threadId, vi.fn());
+    await waitFor(() => chipCount("who's waiting on you") === 1);
+    expect(chipCount("Waiting for @Helper, who's waiting on you — it'll go through after you answer")).toBe(1);
+    expect(chipCount("they're busy")).toBe(0);
   });
 
   it("persists receipts across a restart and prunes the drawer by count", () => {
@@ -896,6 +1146,213 @@ describe("busy retries and receipts", () => {
     discardDelegations(commsBus, from.threadId);
     expect(_pendingCount(from.threadId)).toBe(0);
     expect(findDelegationReceipt(queued.id!)).toMatchObject({ status: "dropped" });
+  });
+
+  it("expires a handoff nobody could take within 24 hours, and wakes the delegator", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      store.patchBot(target.id, { busy: true });
+      const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "later", depth: 0 }, 1);
+      const runTarget = vi.fn();
+      const settled: string[] = [];
+      const onSettled = (receipt: { status: string }) => void settled.push(receipt.status);
+
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget, onSettled);
+      await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
+
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_TTL_MS));
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget, onSettled);
+      await waitFor(() => _pendingCount(from.threadId) === 0);
+
+      expect(runTarget).not.toHaveBeenCalled();
+      expect(findDelegationReceipt(queued.id!)).toMatchObject({
+        status: "expired",
+        toBotName: "Helper",
+        result: "@Helper was not free to take this for 24 hours",
+      });
+      expect(chipCount("Delegation to @Helper expired — not picked up within 24 hours")).toBe(1);
+      expect(settled).toEqual(["expired"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("expires a busy hold at the cap — hours, not the 24-hour TTL — and wakes the delegator", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      store.patchBot(target.id, { busy: true });
+      const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "later", depth: 0 }, 1);
+      const runTarget = vi.fn();
+      const settled: string[] = [];
+      const onSettled = (receipt: { status: string }) => void settled.push(receipt.status);
+
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget, onSettled);
+      await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
+
+      // far short of the 24-hour delivery window, past the busy-hold cap
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_BUSY_HOLD_MAX_MS));
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget, onSettled);
+      await waitFor(() => _pendingCount(from.threadId) === 0);
+
+      expect(runTarget).not.toHaveBeenCalled();
+      expect(findDelegationReceipt(queued.id!)).toMatchObject({
+        status: "expired",
+        toBotName: "Helper",
+        result: "@Helper was still busy after 2 hours",
+      });
+      expect(chipCount("Delegation to @Helper expired — still busy after 2 hours")).toBe(1);
+      expect(chipCount("Delegation to @Helper expired — not picked up within 24 hours")).toBe(0);
+      expect(settled).toEqual(["expired"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps holding a busy handoff that has not reached the busy-hold cap", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      store.patchBot(target.id, { busy: true });
+      const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "later", depth: 0 }, 1);
+      const runTarget = vi.fn();
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
+      await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
+
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_BUSY_HOLD_MAX_MS - 1_000));
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
+      await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
+
+      expect(runTarget).not.toHaveBeenCalled();
+      expect(_pendingCount(from.threadId)).toBe(1);
+      expect(findDelegationReceipt(queued.id!)).toBeNull();
+      // the pending map is module-level: clear the held item so the next
+      // test's sweep does not inherit it
+      discardDelegations(commsBus, from.threadId);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sweeps a past-cap busy hold and keeps under-cap ones queued", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      store.patchBot(target.id, { busy: true });
+      const stale = queueDelegation(commsBus, from, { toBotId: target.id, message: "stale", depth: 0 }, 1);
+      drainDelegations(commsBus, approvalBus, from.threadId, vi.fn());
+      await waitFor(() => pendingDelegationInfo(stale.id!)?.waiting === true);
+      // The marker is set synchronously, before the fire-and-forget drain's
+      // finally releases ownership. A sweep must run after that release.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_BUSY_HOLD_MAX_MS));
+      const fresh = queueDelegation(commsBus, from, { toBotId: target.id, message: "fresh", depth: 0 }, 1);
+
+      const settled: string[] = [];
+      const expired = expireStaleDelegations(commsBus, Date.now(), (receipt) => void settled.push(receipt.status));
+
+      expect(expired).toBe(1);
+      expect(_pendingCount(from.threadId)).toBe(1);
+      expect(pendingDelegationInfo(fresh.id!)).not.toBeNull();
+      expect(findDelegationReceipt(stale.id!)).toMatchObject({
+        status: "expired",
+        result: "@Helper was still busy after 2 hours",
+      });
+      expect(chipCount("Delegation to @Helper expired — still busy after 2 hours")).toBe(1);
+      expect(settled).toEqual(["expired"]);
+      // the pending map is module-level: clear the kept item so the next
+      // test's sweep does not inherit it
+      discardDelegations(commsBus, from.threadId);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not count source work or a previous busy period toward a fresh busy hold", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "later", depth: 0 }, 1);
+      vi.setSystemTime(Date.now() + DELEGATION_BUSY_HOLD_MAX_MS);
+      store.patchBot(target.id, { busy: true });
+      const runTarget = vi.fn();
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
+      await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
+      expect(findDelegationReceipt(queued.id!)).toBeNull();
+      vi.setSystemTime(Date.now() + DELEGATION_BUSY_HOLD_MAX_MS - 1000);
+      releaseDelegationsWaitingOn(target.id);
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
+      await waitFor(() => pendingDelegationInfo(queued.id!)?.waiting === true);
+      vi.setSystemTime(Date.now() + 2000);
+      expect(expireStaleDelegations(commsBus, Date.now())).toBe(0);
+      expect(findDelegationReceipt(queued.id!)).toBeNull();
+      expect(runTarget).not.toHaveBeenCalled();
+    } finally {
+      discardDelegations(commsBus, from.threadId);
+      vi.useRealTimers();
+    }
+  });
+
+  it("expires a fresh-thread handoff that never gets a free slot", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const slotBus: CommsBus = { ...commsBus, threadSlotFree: () => false };
+      const opened = store.createTask(target.id, "QA", false)!;
+      const queued = queueDelegation(
+        slotBus,
+        from,
+        { toBotId: target.id, message: "check", depth: 0, targetThreadId: opened.threadId },
+        1,
+      );
+      const runTarget = vi.fn();
+      drainDelegations(slotBus, approvalBus, from.threadId, runTarget);
+      await waitFor(() => chipCount("waiting for a free slot") === 1);
+      releaseDelegationsWaitingOn(target.id);
+
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_TTL_MS));
+      drainDelegations(slotBus, approvalBus, from.threadId, runTarget);
+      await waitFor(() => _pendingCount(from.threadId) === 0);
+
+      expect(runTarget).not.toHaveBeenCalled();
+      expect(findDelegationReceipt(queued.id!)).toMatchObject({ status: "expired" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dispatches an over-age item whose target is idle instead of expiring it — boot-drain case", async () => {
+    // "quit Friday, open Monday": the handoff sat queued past DELEGATION_TTL_MS
+    // while the app was closed. On boot, store.ts resets every bot to idle —
+    // the target is free right now, so downtime must not count against it.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      store.patchBot(target.id, { busy: true });
+      const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "leftover", depth: 0 }, 1);
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_TTL_MS + 1));
+      // simulate boot: the store reloads every bot as idle
+      store.patchBot(target.id, { busy: false });
+
+      const runTarget = vi.fn();
+      drainDelegations(commsBus, approvalBus, from.threadId, runTarget);
+      await waitFor(() => runTarget.mock.calls.length === 1 && _pendingCount(from.threadId) === 0);
+
+      expect(findDelegationReceipt(queued.id!)).toBeNull();
+      expect(_pendingCount(from.threadId)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("expireStaleDelegations does not expire an over-age item whose target is idle, and still returns 0", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      store.patchBot(target.id, { busy: true });
+      const queued = queueDelegation(commsBus, from, { toBotId: target.id, message: "leftover", depth: 0 }, 1);
+      vi.setSystemTime(new Date(Date.now() + DELEGATION_TTL_MS + 1));
+      store.patchBot(target.id, { busy: false });
+
+      expect(expireStaleDelegations(commsBus, Date.now())).toBe(0);
+      expect(findDelegationReceipt(queued.id!)).toBeNull();
+      expect(pendingDelegationInfo(queued.id!)).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

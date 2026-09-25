@@ -57,6 +57,13 @@ public struct OptionCard: Codable, Hashable, Sendable {
     /// Learned skills must show their complete reviewed contents before an
     /// approval button is offered on a compact companion surface.
     public var skillRequest: SkillRequestCardData? = nil
+    /// The model's own questions and options (Claude's `AskUserQuestion`).
+    /// Present only on a structured ask; every other card leaves it nil.
+    public var questionRequest: QuestionRequestCardData? = nil
+    /// What an answered question was answered WITH. `answered` only records
+    /// the behavior once the harness settles a live ask, so without this a
+    /// settled question card would read "answer" instead of the reply.
+    public var answeredText: String? = nil
 
     /// A card is actionable while it is unanswered and still has a request
     /// behind it. Everything else is transcript.
@@ -66,6 +73,14 @@ public struct OptionCard: Codable, Hashable, Sendable {
 
     /// Permission cards carry a tool; questions do not.
     public var isPermission: Bool { tool != nil }
+
+    /// A structured ask draws its own card: the model posed real questions
+    /// with real options, and a flat row of buttons cannot say which
+    /// question a tap answered.
+    public var questions: [AskQuestion] {
+        guard let questionRequest, !questionRequest.questions.isEmpty else { return [] }
+        return questionRequest.questions
+    }
 
     /// The wire API accepts an approval behavior rather than the button's
     /// display text. Treat the one refusal as deny and every other offered
@@ -104,6 +119,22 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var spoken: String?
     /// Marks an error fixed by installing something, not by retrying.
     public var setup: Bool?
+}
+
+/// A compaction record: from this message on, rebuilds of the thread's
+/// context carry `summary` instead of the earlier messages.
+public struct Compaction: Codable, Hashable, Sendable {
+    public var summary: String
+    public var tokensBefore: Int
+    public init(summary: String, tokensBefore: Int) {
+        self.summary = summary
+        self.tokensBefore = tokensBefore
+    }
+
+    public var chipText: String {
+        let tokens = NumberFormatter.localizedString(from: NSNumber(value: tokensBefore), number: .decimal)
+        return "Context compacted · \(tokens) tokens summarised"
+    }
 }
 
 /// The thread an activity chip opened — "Opened thread #Title on Scout" —
@@ -155,6 +186,13 @@ public struct CommChip: Codable, Hashable, Sendable {
 public struct Message: Codable, Hashable, Identifiable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case text, options, activity, screen, secret
+        /// The harness's receipt of a settled turn: "[digest] · tools: … ·
+        /// reply: …". Desktop shows it only behind "show tool calls"; it is
+        /// a log line, not something anyone said, so the phone never draws,
+        /// previews, or speaks it. Named so it cannot fall into `unknown`,
+        /// which draws whatever text a message carries.
+        case digest
+        case compaction
         /// A kind this build has never heard of.
         ///
         /// Not decorative. `kind` is not optional, so without this a single
@@ -190,13 +228,23 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     public var kind: Kind
     public var at: Double
     public var text: String?
+    /// Provider turn markers let clients fold settled narration while keeping
+    /// the final answer visible. Older servers may omit both fields.
+    public var turnId: String?
+    public var turnTerminal: Bool?
     public var card: OptionCard?
     public var secret: SecretRequestCardData?
     public var tool: ToolActivity?
     public var threadRef: ThreadRef?
+    /// `kind == .compaction`: the record itself.
+    public var compaction: Compaction?
     /// The message this one follows; nil at the thread root. Two messages
     /// sharing a parent are a fork.
     public var parentId: String?
+    /// Set when this line began as a queued send: the id the harness quoted
+    /// when it held the message, echoed back on the line that finally landed.
+    /// Clients match it against their held-send rows to retire them.
+    public var queueId: String?
     /// Rooms: which member said this.
     public var from: Sender?
     public var reactions: [Reaction]?
@@ -207,6 +255,8 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     /// Screen messages in the full shape: base64 pixels, inline.
     public var png: String?
     public var mime: String?
+    /// Agent-generated images carried on a text reply, including late message patches.
+    public var attachments: [MessageImageAttachment]?
 
     public var date: Date { Date(timeIntervalSince1970: at / 1000) }
 }
@@ -236,6 +286,15 @@ public struct ThreadOpener: Codable, Hashable, Sendable {
     public var at: Double
 }
 
+/// The bot that closed a thread with close_thread, once its result was
+/// read. Absent means the thread is open; the computer clears it the moment
+/// a new turn starts there, so a reopened thread simply loses the stamp.
+public struct ThreadCloser: Codable, Hashable, Sendable {
+    public var botId: String
+    public var name: String
+    public var at: Double
+}
+
 /// A folder within one bot, in the order saved by the desktop.
 public struct BotProject: Codable, Hashable, Identifiable, Sendable {
     public var id: String
@@ -252,18 +311,138 @@ public struct BotTask: Codable, Hashable, Sendable {
     /// Runtime state from newer computers; used to recover approvals in
     /// background threads without downloading every conversation.
     public var activity: String?
+    /// This thread's own turn is done and a dispatched teammate has not
+    /// settled yet (#1223): a wait, not work. Newer computers send it while
+    /// leaving busy/activity idle, so older builds simply see the thread
+    /// idle instead of spinning a work glyph for the whole teammate run.
+    public var waitingOnTeammate: Bool?
     public var unread: Bool?
     public var approvalMode: String?
     public var autoApprove: Bool?
     public var alwaysAllow: [String]?
     public var projectId: String?
     public var openedBy: ThreadOpener?
+    public var closedBy: ThreadCloser?
+    /// Asleep until: 0 is the "until new activity" sentinel and sleeps until
+    /// the thread does anything again, a timestamp sleeps until that moment,
+    /// and nil means awake. Expired time snoozes heal server-side on read,
+    /// so snapshots are authoritative; the sentinel wakes server-side on the
+    /// first activity too.
+    public var snoozedUntil: Double?
+
+    /// When the person put this thread away, in epoch milliseconds. The
+    /// field's presence — not its value — marks the thread archived: the
+    /// task API accepts any epoch number, so a thread persisted with
+    /// archivedAt: 0 is archived. Absent means it was never put away.
+    public var archivedAt: Double?
     /// Bot-only internal execution. Keep it addressable, but out of thread pickers.
     public var routineRunId: String?
+    /// The person pinned this thread above the update-ordered list.
+    public var pinned: Bool? = nil
+    /// Newest message time. Absent on older computers; the list uses createdAt.
+    public var updatedAt: Double? = nil
+
+    /// The time the thread list sorts and stamps by.
+    public var listStamp: Double { updatedAt ?? createdAt }
 
     /// The thread list's quiet second line, worded as the desktop words it.
     public var openedByLabel: String? {
         openedBy.map { "opened by \($0.name)" }
+    }
+
+    /// A bot closed this thread and nothing has happened there since.
+    public var isClosed: Bool { closedBy != nil }
+
+    /// Archived means the field is present, not nonzero: the task API
+    /// accepts any epoch number, so a thread persisted with
+    /// archivedAt: 0 is archived.
+    public var isArchived: Bool { archivedAt != nil }
+
+    /// Working is activity or flag: the wire can carry either alone, so the
+    /// archive action's busy gate and the working status ask the same
+    /// question. A run counts as work here exactly as its row already
+    /// labels it Working.
+    public var isWorking: Bool { activity == "working" || activity == "running" || busy == true }
+
+    /// The one line under a title: who closed it once a bot has, "Archived"
+    /// once the person put it away, "Snoozed" while it sleeps, otherwise who
+    /// opened it, otherwise nothing. Closed wins because it is the newer
+    /// fact; archived and snoozed win over the opener because they explain
+    /// why the row sits where it does.
+    public var bylineLabel: String? {
+        if let closedBy { return "closed by \(closedBy.name)" }
+        if isArchived { return "Archived" }
+        if isSnoozed() { return "Snoozed" }
+        return openedByLabel
+    }
+
+    /// Snoozed means asleep right now: 0 is the "until new activity"
+    /// sentinel and sleeps until woken, while a timestamp sleeps only until
+    /// it passes. The server drops expired snoozes from snapshots, but a
+    /// live event never refreshes one, so the clock is checked too.
+    public func isSnoozed(now: Date = Date()) -> Bool {
+        guard let until = snoozedUntil else { return false }
+        return until == 0 || until > now.timeIntervalSince1970 * 1_000
+    }
+
+    /// Waiting on a dispatched teammate: the thread's own turn is done and
+    /// a teammate has not settled. Flag-only, matching Android: the live
+    /// #1228 wire paints busy, working, and this flag together during a
+    /// coordination wait, so the flag alone decides — a quiet wait, never
+    /// the work spinner.
+    public var isWaitingOnTeammate: Bool { waitingOnTeammate == true }
+
+    /// Whether the row must stay in the list regardless of closed state:
+    /// it is working, waiting on someone, has something they have not read,
+    /// or is holding a queued send. Queued is client state the harness
+    /// reports out-of-band, so it arrives as an input rather than living on
+    /// the wire-decoded task.
+    public func demandsAttention(queued: Bool = false) -> Bool {
+        if isWorking || isWaitingOnTeammate || unread == true { return true }
+        if queued { return true }
+        switch activity {
+        case "waiting-on-you", "waiting", "queued": return true
+        default: return false
+        }
+    }
+}
+
+/// The snooze presets the desktop offers, computed in the person's local
+/// time on purpose: it is their evening and their morning; the server
+/// stores the absolute moment either way.
+public enum ThreadSnoozePreset {
+    /// The next local 6 PM — "later today", rolling to tomorrow evening
+    /// once tonight's is already past.
+    public static func tonight(now: Date = Date(), calendar: Calendar = .current) -> Double {
+        var when = calendar.date(bySettingHour: 18, minute: 0, second: 0, of: now) ?? now
+        if when <= now { when = calendar.date(byAdding: .day, value: 1, to: when) ?? when }
+        return when.timeIntervalSince1970 * 1_000
+    }
+
+    /// Tomorrow morning at 9 local: a clean overnight break.
+    public static func tomorrowMorning(now: Date = Date(), calendar: Calendar = .current) -> Double {
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) ?? now
+        let when = calendar.date(bySettingHour: 9, minute: 0, second: 0, of: tomorrow) ?? tomorrow
+        return when.timeIntervalSince1970 * 1_000
+    }
+}
+
+/// A message the harness is holding until the running turn settles. The
+/// phone's copy of a server-owned queue entry, identified by the harness's
+/// queueId and never by its text.
+public struct QueuedSend: Codable, Hashable, Identifiable, Sendable {
+    public var queueId: String
+    public var text: String
+    /// Why the harness held it. "capacity" is the known value; anything else
+    /// parses and is shown as a plain queued line.
+    public var reason: String?
+
+    public var id: String { queueId }
+
+    public init(queueId: String, text: String, reason: String? = nil) {
+        self.queueId = queueId
+        self.text = text
+        self.reason = reason
     }
 }
 
@@ -286,6 +465,10 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var modelSelection: ModelSelection
     public var createdAt: Double
     public var busy: Bool?
+    /// A dispatched teammate has not settled yet; the bot itself is waiting
+    /// on it rather than working (#1223). Carries the active thread's wait;
+    /// per-thread waits live on the task.
+    public var waitingOnTeammate: Bool?
     public var pinned: Bool?
     public var hidden: Bool?
     /// Desktop sidebar section. Missing or blank means the built-in Bots area.
@@ -338,6 +521,7 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
         view.threadId = selectedThreadId
         view.modelSelection = task?.modelSelection ?? modelSelection
         view.busy = task?.busy ?? (selectedThreadId == threadId ? busy : false)
+        view.waitingOnTeammate = task?.waitingOnTeammate ?? (selectedThreadId == threadId ? waitingOnTeammate : false)
         view.unread = task?.unread ?? (selectedThreadId == threadId ? unread : false)
         view.approvalMode = task?.approvalMode ?? task?.autoApprove.map { $0 ? "auto" : "ask" } ?? approvalMode
         view.autoApprove = task?.autoApprove ?? autoApprove
@@ -420,7 +604,7 @@ public struct Room: Codable, Hashable, Identifiable, Sendable {
 
 // MARK: - Responses
 
-private struct Lossy<Element: Decodable>: Decodable {
+struct Lossy<Element: Decodable>: Decodable {
     let value: Element?
 
     init(from decoder: Decoder) throws {
@@ -431,18 +615,28 @@ private struct Lossy<Element: Decodable>: Decodable {
 public struct Fleet: Decodable, Sendable {
     public var bots: [Bot]
     public var groups: [Room]
+    /// Held sends for every bot thread, the same snapshot the
+    /// bot.queued frames carry. Older computers omit it.
+    public var botQueuedMessages: [String: [QueuedSend]]?
 
-    private enum CodingKeys: String, CodingKey { case bots, groups }
+    private enum CodingKeys: String, CodingKey { case bots, groups, botQueuedMessages }
 
-    public init(bots: [Bot], groups: [Room]) {
+    public init(bots: [Bot], groups: [Room], botQueuedMessages: [String: [QueuedSend]]? = nil) {
         self.bots = bots
         self.groups = groups
+        self.botQueuedMessages = botQueuedMessages
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         bots = try container.decodeIfPresent([Lossy<Bot>].self, forKey: .bots)?.compactMap(\.value) ?? []
         groups = try container.decodeIfPresent([Lossy<Room>].self, forKey: .groups)?.compactMap(\.value) ?? []
+        // One malformed entry must not cost the whole fleet: the roster is
+        // worth more than the queue note beside it.
+        botQueuedMessages = (try? container.decodeIfPresent(
+            [String: [Lossy<QueuedSend>]].self,
+            forKey: .botQueuedMessages
+        ))??.mapValues { list in list.compactMap(\.value) }
     }
 }
 
@@ -649,7 +843,20 @@ public struct InstanceList: Codable, Sendable {
 /// Derived from `ConfigFlag.provider`, never decoded straight off the wire.
 public enum VoiceProvider: Hashable, Sendable {
     case elevenlabs
+    case fish
     case system
+    case chatterbox
+
+    /// The exact string the config write carries. The server matches
+    /// spellings, not meanings, so neither does this.
+    public var wireValue: String {
+        switch self {
+        case .elevenlabs: "elevenlabs"
+        case .fish: "fish"
+        case .system: "system"
+        case .chatterbox: "chatterbox"
+        }
+    }
 }
 
 public struct ConfigFlag: Codable, Hashable, Sendable {
@@ -661,6 +868,11 @@ public struct ConfigFlag: Codable, Hashable, Sendable {
     /// it through `ConfigStatus.voiceProvider`, which applies the server's own
     /// fallback; nothing should compare this string directly.
     public var provider: String?
+    /// Chatterbox's credential is an address, not a key. `describeVoice`
+    /// sends it and the model id empty under every other engine — and an
+    /// older computer omits them — so both read as "not set".
+    public var baseUrl: String?
+    public var model: String?
 }
 
 public struct Profile: Codable, Hashable, Sendable {
@@ -697,14 +909,25 @@ public struct ConfigStatus: Codable, Sendable {
         return isTTSConfigured && (hasAgentVoice || hasWorkspaceDefaultVoice)
     }
 
-    /// `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact string
-    /// `"system"` selects the built-in engine. A missing field — a computer
-    /// older than the choice — and an engine this build has never heard of
-    /// both fall back to ElevenLabs, which is the server's own rule and what
-    /// keeps an unrecognised engine from being explained to the user with
-    /// copy written for a different one.
+    /// `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact
+    /// strings `"fish"`, `"system"`, and `"chatterbox"` select those engines. A missing
+    /// field — a computer older than the choice — and an engine this build
+    /// has never heard of both fall back to ElevenLabs, which is the
+    /// server's own rule and what keeps an unrecognised engine from being
+    /// explained to the user with copy written for a different one.
     public var voiceProvider: VoiceProvider {
-        tts?.provider == "system" ? .system : .elevenlabs
+        switch tts?.provider {
+        case "fish": .fish
+        case "system": .system
+        case "chatterbox": .chatterbox
+        default: .elevenlabs
+        }
+    }
+
+    /// Walkie synthesizes directly on the phone through its own ElevenLabs
+    /// key. A voice chosen from another provider's catalog is not compatible.
+    public func walkieAgentVoice(_ voice: String?) -> String? {
+        voiceProvider == .elevenlabs ? voice : nil
     }
 }
 
@@ -1081,6 +1304,10 @@ struct MessageResponse: Codable, Sendable {
     var message: Message
 }
 
+struct EditResponse: Decodable, Sendable {
+    var message: Message?
+}
+
 struct ActiveBranchResponse: Codable, Sendable {
     var activeLeafId: String
 }
@@ -1148,4 +1375,42 @@ public struct ServerEnvironment: Codable, Hashable, Sendable {
     public var label: String
     public var platform: String?
     public var version: String?
+}
+
+/// Keep future attachment kinds decodable; image entries display inline and
+/// audio entries render as voice notes (Message.voiceNotes). Unknown kinds
+/// decode without breaking, so a newer computer never gaps the transcript.
+public struct MessageImageAttachment: Codable, Hashable, Sendable {
+    public var kind: String
+    public var path: String?
+    public var mime: String?
+    /// The server's duration estimate for an audio attachment, in
+    /// milliseconds; shown until the player loads real metadata.
+    public var durationMs: Double?
+}
+
+/// One voice note in Message.attachments: the parked clip's bare generated
+/// filename plus the server's duration estimate. Mirrors the web bubble's
+/// VoiceNoteAttachment (PR #1801), the contract this rendering matches.
+public struct MessageVoiceNote: Hashable, Sendable, Identifiable {
+    public var path: String
+    public var mime: String?
+    public var durationMs: Double?
+
+    public var id: String { path }
+}
+
+extension Message {
+    /// Audio attachments that can render, in wire order: kind == "audio"
+    /// with a usable path, deduplicated the way generatedImages deduplicates
+    /// so a clip replayed by a late message patch renders once.
+    public var voiceNotes: [MessageVoiceNote] {
+        var seen = Set<String>()
+        return (attachments ?? []).compactMap { attachment in
+            guard attachment.kind == "audio", let path = attachment.path,
+                  !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  seen.insert(path).inserted else { return nil }
+            return MessageVoiceNote(path: path, mime: attachment.mime, durationMs: attachment.durationMs)
+        }
+    }
 }

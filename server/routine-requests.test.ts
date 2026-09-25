@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   RoutineRequestError,
@@ -15,7 +15,7 @@ import {
   type RoutineRequestStore,
   type RoutineToolDefinitionInput,
 } from "./routine-requests.ts";
-import { RoutineManager } from "./routines.ts";
+import { RoutineManager, type RoutineInput } from "./routines.ts";
 import type { JsonValue } from "./schema.ts";
 
 class MemoryStore implements RoutineRequestStore {
@@ -56,11 +56,12 @@ afterEach(() => {
 
 function harness(
   start = Date.parse("2026-08-28T10:00:00Z"),
-  cloudReady?: () => Promise<{ ready: boolean; reason?: string }>,
+  cloudReady?: (botId: string) => Promise<{ ready: boolean; reason?: string }>,
   canPersist?: (
     botId: string,
     threadId: string,
   ) => { ok: true } | { ok: false; status: number; error: string },
+  autoApply?: (botId: string, threadId: string) => boolean,
   autoConfirm?: () => boolean,
 ) {
   const clock = { now: start };
@@ -70,6 +71,7 @@ function harness(
     file: join(dir, "routines.json"),
     now: () => clock.now,
     botState: (botId) => (botId === "missing" ? "missing" : "busy"),
+    goalState: () => "busy",
     createTask: () => null,
     startTurn: async () => {},
   });
@@ -81,6 +83,7 @@ function harness(
     timeZone: () => "Asia/Kolkata",
     cloudReady,
     canPersist,
+    autoApply,
     autoConfirm,
   });
   return { clock, routines, service, store };
@@ -110,6 +113,249 @@ function cardFingerprint(card: RoutineRequestOptionCard, messageId: string): str
 }
 
 describe("RoutineRequestService", () => {
+  describe("duplicate creation", () => {
+    const existingInput: RoutineInput = {
+      botId: "bot-a", name: "Already scheduled", prompt: "Summarize the overnight support queue.",
+      schedule: { type: "daily", time: "09:00", weekdays: [1, 3] },
+    };
+
+    it("refuses a renamed duplicate before creating another approval card", async () => {
+      const { service, routines, store } = harness();
+      const existing = routines.create(existingInput);
+      await expect(service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal() }))
+        .rejects.toMatchObject({ status: 409, message: expect.stringContaining(existing.id) });
+      expect(store.messagesFor("thread-a")).toHaveLength(0);
+      expect(routines.listRoutines()).toHaveLength(1);
+    });
+
+    it("rechecks two pending cards at confirmation and leaves replay settlement working", async () => {
+      const { service, routines } = harness();
+      const first = await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal() });
+      const second = await service.propose({ botId: "bot-a", threadId: "thread-b", proposal: createProposal() });
+      const resolve = (threadId: string, requestId: string) => service.resolve({ botId: "bot-a", threadId, requestId, behavior: "allow" });
+      expect(resolve("thread-a", first.requestId)).toMatchObject({ state: "applied" });
+      expect(resolve("thread-b", second.requestId)).toMatchObject({ state: "invalid", status: 409 });
+      expect(resolve("thread-a", first.requestId)).toMatchObject({ state: "already_settled" });
+      expect(service.resolve({ botId: "bot-a", threadId: "thread-b", requestId: second.requestId, behavior: "deny" }))
+        .toMatchObject({ state: "denied" });
+      expect(routines.listRoutines()).toHaveLength(1);
+    });
+
+    it.each<Partial<RoutineInput>>([
+      { enabled: false }, { botId: "bot-b" }, { target: "room-goal", groupId: "room-a" },
+      { runOn: "cloud" }, { continuity: true }, { timeoutMinutes: 10 }, { durationMinutes: 60 }, { overlap: "queue" },
+      { schedule: { type: "daily", time: "10:00", weekdays: [1, 3] } },
+      { attachments: [{ id: "context", name: "Context", path: "/fixture/context.txt", kind: "file", size: 20 }] },
+    ])("does not confuse different execution settings with a duplicate: %j", async (patch) => {
+      const { service, routines } = harness();
+      routines.create({ ...existingInput, ...patch });
+      await expect(service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal() }))
+        .resolves.toMatchObject({ requestId: expect.any(String) });
+    });
+
+    it.each([
+      ["Notify when balance < -10", "Notify when balance > 10"],
+      ["Inspect C++", "Inspect C"],
+      ["Read /work/A.txt", "Read /work/a.txt"],
+    ])("preserves meaningful instruction text: %s / %s", async (existing, proposed) => {
+      const { service, routines } = harness();
+      routines.create({ ...existingInput, prompt: existing });
+      await expect(service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal({ instructions: proposed }) }))
+        .resolves.toMatchObject({ requestId: expect.any(String) });
+    });
+
+    it("matches implicit interval starts without ignoring an explicitly chosen phase or restrictions", async () => {
+      const { service, routines, clock } = harness();
+      const anchorAt = clock.now;
+      routines.create({ ...existingInput, schedule: { type: "interval", everyMinutes: 60, anchorAt } });
+      clock.now += 30_000;
+      const propose = (schedule: RoutineToolDefinitionInput["schedule"]) => service.propose({
+        botId: "bot-a", threadId: "thread-a", proposal: createProposal({ schedule }),
+      });
+      await expect(propose({ type: "interval", everyMinutes: 60 })).rejects.toMatchObject({ status: 409 });
+      await expect(propose({ type: "interval", everyMinutes: 60, anchorAt: new Date(anchorAt).toISOString() }))
+        .rejects.toMatchObject({ status: 409 });
+      await expect(propose({ type: "interval", everyMinutes: 60, anchorAt: new Date(clock.now).toISOString() }))
+        .resolves.toMatchObject({ requestId: expect.any(String) });
+      await expect(propose({ type: "interval", everyMinutes: 60, weekdays: ["monday"] }))
+        .resolves.toMatchObject({ requestId: expect.any(String) });
+    });
+
+    it("checks the target bot rather than the bot proposing work for a peer", async () => {
+      const { service, routines } = harness();
+      routines.create({ ...existingInput, botId: "bot-b" });
+      const proposal = createProposal();
+      if (proposal.action !== "create") throw new Error("Expected create");
+      await expect(service.propose({ botId: "bot-a", threadId: "thread-a", proposal: {
+        ...proposal, forBot: { botId: "bot-b", name: "Peer" },
+      } })).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("does not create repeated Full Access schedules", async () => {
+      const { service, routines } = harness(undefined, undefined, undefined, () => true);
+      const args = { botId: "bot-a", threadId: "thread-a", proposal: createProposal() };
+      expect(await service.submit(args)).toMatchObject({ state: "applied" });
+      await expect(service.submit(args)).rejects.toMatchObject({ status: 409 });
+      expect(routines.listRoutines()).toHaveLength(1);
+    });
+  });
+
+  it("applies Full Access routine actions using only the source thread grant and settles replay receipts", async () => {
+    const autoApply = vi.fn((_botId: string, threadId: string) => threadId === "full-thread");
+    const { service, routines, store } = harness(undefined, undefined, undefined, autoApply);
+    const appended: RoutineRequestOptionCard[] = [];
+    const append = store.appendMessage.bind(store);
+    vi.spyOn(store, "appendMessage").mockImplementation((threadId, message) => {
+      appended.push(structuredClone(message.card));
+      return append(threadId, message);
+    });
+    const ask = await service.submit({ botId: "bot-a", threadId: "ask-thread", proposal: createProposal() });
+    expect(ask.state).toBe("pending");
+    expect(routines.listRoutines()).toHaveLength(0);
+    expect(appended[0]).toMatchObject({ options: ["Confirm", "Cancel"] });
+
+    const submit = (proposal: RoutineProposalInput) => service.submit({ botId: "bot-a", threadId: "full-thread", proposal });
+    const created = await submit(createProposal());
+    expect(created).toMatchObject({ state: "applied", result: { action: "create" } });
+    const routineId = created.result!.resultId;
+    expect(routines.listRoutines()).toHaveLength(1);
+    expect(await submit({ action: "update", routineId, changes: { name: "Updated brief" } }))
+      .toMatchObject({ state: "applied", result: { action: "update", resultId: routineId } });
+    expect(routines.listRoutines().find((routine) => routine.id === routineId)?.name).toBe("Updated brief");
+    expect(await submit({ action: "pause", routineId })).toMatchObject({ state: "applied" });
+    expect(routines.listRoutines().find((routine) => routine.id === routineId)?.enabled).toBe(false);
+    expect(await submit({ action: "resume", routineId })).toMatchObject({ state: "applied" });
+    const run = await submit({ action: "run_now", routineId });
+    expect(run).toMatchObject({ state: "applied", result: { action: "run_now" } });
+    expect(routines.listRuns()).toHaveLength(1);
+    expect(service.resolve({ botId: "bot-a", threadId: "full-thread", requestId: run.requestId, behavior: "allow" }))
+      .toMatchObject({ state: "already_settled", behavior: "allow" });
+    expect(routines.listRuns()).toHaveLength(1);
+    expect(await submit({ action: "delete", routineId })).toMatchObject({ state: "applied" });
+    expect(routines.listRoutines().find((routine) => routine.id === routineId)).toBeUndefined();
+    expect(appended.slice(1).every((card) => card.dismissed && card.options.length === 0)).toBe(true);
+    expect(store.messagesFor("full-thread").every((message) => message.card?.answered === "allow")).toBe(true);
+    expect(autoApply).toHaveBeenLastCalledWith("bot-a", "full-thread");
+  });
+
+  it("rechecks the Full Access grant after cloud readiness and preserves scope validation", async () => {
+    let full = true;
+    const { service, routines, store } = harness(undefined, async () => {
+      full = false;
+      return { ready: true };
+    }, undefined, () => full);
+    const changed = await service.submit({ botId: "bot-a", threadId: "thread-a", proposal: createProposal({ runOn: "cloud" }) });
+    expect(changed.state).toBe("pending");
+    expect(routines.listRoutines()).toHaveLength(0);
+    expect(store.messagesFor("thread-a")[0]?.card?.dismissed).toBeUndefined();
+    full = true;
+    const own = await service.submit({ botId: "bot-a", threadId: "thread-a", proposal: createProposal() });
+    await expect(service.submit({ botId: "bot-b", threadId: "thread-b", proposal: { action: "delete", routineId: own.result!.resultId } }))
+      .rejects.toThrow();
+    expect(routines.listRoutines()).toHaveLength(1);
+    expect(store.messagesFor("thread-b")).toHaveLength(0);
+    await expect(service.submit({ botId: "bot-a", threadId: "thread-a", proposal: createProposal({ instructions: "A different cancelled request." }), canCommit: () => false }))
+      .rejects.toThrow("requesting turn ended");
+  });
+
+  it("reports a committed Full Access routine even if receipt settlement fails and never runs it twice", async () => {
+    const { service, routines, store } = harness(undefined, undefined, undefined, () => true);
+    const created = await service.submit({ botId: "bot-a", threadId: "thread-a", proposal: createProposal() });
+    const settle = vi.spyOn(store, "patchMessage").mockImplementation(() => { throw new Error("receipt write failed"); });
+    const run = await service.submit({ botId: "bot-a", threadId: "thread-a", proposal: { action: "run_now", routineId: created.result!.resultId } });
+    expect(run).toMatchObject({ state: "applied", result: { action: "run_now", settlementPending: true } });
+    expect(routines.listRuns()).toHaveLength(1);
+    expect(store.messagesFor("thread-a").at(-1)?.card).toMatchObject({ dismissed: true, options: [] });
+    settle.mockRestore();
+    expect(service.resolve({ botId: "bot-a", threadId: "thread-a", requestId: run.requestId, behavior: "allow" }))
+      .toMatchObject({ state: "applied", resultId: run.result!.resultId });
+    expect(routines.listRuns()).toHaveLength(1);
+    expect(routines.routineRequestReceipt(run.requestId)).toBeNull();
+  });
+
+  it("does not report Full Access success when the scheduler commit fails", async () => {
+    const { service, routines, store } = harness(undefined, undefined, undefined, () => true);
+    vi.spyOn(routines, "create").mockImplementationOnce(() => { throw new Error("scheduler write failed"); });
+    await expect(service.submit({ botId: "bot-a", threadId: "thread-a", proposal: createProposal() }))
+      .rejects.toThrow("scheduler write failed");
+    expect(routines.listRoutines()).toHaveLength(0);
+    expect(store.messagesFor("thread-a")[0]?.card).toMatchObject({ dismissed: true, options: [] });
+  });
+
+  it("keeps a monthly cron rule and its own timezone through confirmation, update, pause and resume", async () => {
+    const { service, store, routines, clock } = harness(Date.parse("2026-08-28T10:00:00Z"));
+    const schedule = { type: "cron" as const, expression: "0 9 1 * *", timeZone: "America/New_York" };
+    const proposed = await service.propose({
+      botId: "bot-a", threadId: "thread-a",
+      proposal: createProposal({ name: "Monthly report", schedule: { ...schedule, expression: " 0  9 1 * * " } }),
+    });
+    expect(routines.listRoutines()).toHaveLength(0);
+    expect(proposed.timeZone).toBe("America/New_York");
+    expect(proposed.summary).toContain("0 9 1 * *");
+    expect(proposed.summary).toContain("America/New_York");
+    expect(proposed.detail).toContain("Next 3 runs (America/New_York): Sep 1, 2026, 9:00 AM · Oct 1, 2026, 9:00 AM · Nov 1, 2026, 9:00 AM");
+    expect(proposed.nextRunAt).toBe(Date.parse("2026-09-01T13:00:00Z"));
+    const message = store.messagesFor("thread-a")[0]!;
+    // Persisted JSON cards retain the original version and exact executable rule.
+    message.card = JSON.parse(JSON.stringify(message.card)) as RoutineRequestOptionCard;
+    expect(message.card.routineRequest).toMatchObject({ version: 1, operation: { routine: { schedule } } });
+    expect(service.resolve({ botId: "bot-a", threadId: "thread-a", requestId: proposed.requestId, behavior: "allow" }))
+      .toMatchObject({ state: "applied", action: "create" });
+    const routineId = routines.listRoutines()[0]!.id;
+    expect(routines.listRoutines()[0]).toMatchObject({ schedule, enabled: true, nextRunAt: proposed.nextRunAt });
+    const apply = async (proposal: RoutineProposalInput) => {
+      clock.now += 1;
+      const card = await service.propose({ botId: "bot-a", threadId: "thread-a", proposal });
+      expect(service.resolve({ botId: "bot-a", threadId: "thread-a", requestId: card.requestId, behavior: "allow" }).state).toBe("applied");
+      return card;
+    };
+    const lastDay = { ...schedule, expression: "0 9 L * *" };
+    const update = await apply({ action: "update", routineId, changes: { schedule: lastDay } });
+    expect(update.detail).toContain("Aug 31, 2026, 9:00 AM");
+    expect(routines.listRoutines()[0]!.schedule).toEqual(lastDay);
+    const paused = await apply({ action: "pause", routineId });
+    expect(paused.detail).not.toContain("Next 3 runs");
+    expect(routines.listRoutines()[0]).toMatchObject({ schedule: lastDay, enabled: false, nextRunAt: null });
+    const whilePaused = await apply({ action: "update", routineId, changes: { schedule: { ...schedule, expression: "0 9 * * MON#2" } } });
+    expect(whilePaused.detail).toContain("remains paused");
+    expect(whilePaused.detail).not.toContain("Next 3 runs");
+    const resumed = await apply({ action: "resume", routineId });
+    expect(resumed.detail).toContain("Sep 14, 2026, 9:00 AM");
+    expect(routines.listRoutines()[0]).toMatchObject({ enabled: true, nextRunAt: Date.parse("2026-09-14T13:00:00Z") });
+  });
+
+  it.each<Record<string, JsonValue>>([
+    { expression: "0 9 1 * *" },
+    { expression: "0 9 1 * *", timeZone: "+05:30" },
+    { expression: "0 9 1 * *", timeZone: "Mars/Olympus" },
+    { expression: "0 0 9 1 * *", timeZone: "UTC" },
+    { expression: "@monthly", timeZone: "UTC" },
+    { expression: "0 9 31 2 *", timeZone: "UTC" },
+    { expression: "0 9 1 * *", timeZone: "UTC", weekdays: ["monday"] },
+  ])("refuses invalid or extra cron constraints before saving a card: %j", async (schedule) => {
+    const { service, store, routines } = harness();
+    await expect(service.propose({ botId: "bot-a", threadId: "thread-a", proposal: malformedProposal({
+      action: "create", routine: { name: "Bad schedule", instructions: "Do not run", schedule: { type: "cron", ...schedule } },
+    }) })).rejects.toMatchObject({ status: 400 });
+    expect(store.messagesFor("thread-a")).toHaveLength(0);
+    expect(routines.listRoutines()).toHaveLength(0);
+  });
+
+  it("revalidates a corrupted stored cron card without creating a routine", async () => {
+    const { service, store, routines } = harness();
+    const proposed = await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal({
+      schedule: { type: "cron", expression: "0 9 1 * *", timeZone: "UTC" },
+    }) });
+    const card = store.messagesFor("thread-a")[0]!.card!;
+    const operation = card.routineRequest!.operation;
+    if (operation.action !== "create") throw new Error("Expected create");
+    Object.assign(operation.routine.schedule, { expression: "0 9 31 2 *" });
+    expect(service.resolve({ botId: "bot-a", threadId: "thread-a", requestId: proposed.requestId, behavior: "allow" }))
+      .toMatchObject({ state: "invalid", status: 400 });
+    expect(routines.listRoutines()).toHaveLength(0);
+    expect(card.answered).toBeUndefined();
+  });
+
   it("normalizes weekly input, scrubs hidden payload text, and creates a durable confirmation card", async () => {
     const { service, store, routines } = harness();
     const secret = "sk-proj-abcdefghijklmnopqrstuv";
@@ -139,6 +385,7 @@ describe("RoutineRequestService", () => {
   it("auto-applies the proposal when autoConfirm is on, leaving the card answered", async () => {
     const { service, store, routines } = harness(
       Date.parse("2026-08-28T10:00:00Z"),
+      undefined,
       undefined,
       undefined,
       () => true,
@@ -192,6 +439,19 @@ describe("RoutineRequestService", () => {
     expect(routines.listRoutines().find((routine) => routine.name === "Morning brief")?.continuity).toBe(true);
   });
 
+  it("reviews and persists queue policy changes without losing them in tool normalization", async () => {
+    const { service, routines } = harness();
+    const created = await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal({ overlap: "queue" }) });
+    expect(created.detail).toContain("Queue one scheduled run; skip further occurrences");
+    service.resolve({ botId: "bot-a", threadId: "thread-a", requestId: created.requestId, behavior: "allow" });
+    const routine = routines.listRoutines()[0];
+    expect(routine.overlap).toBe("queue");
+    const update = await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: { action: "update", routineId: routine.id, changes: { overlap: "skip" } } });
+    expect(update.detail).toContain("Skip overlapping scheduled occurrences");
+    service.resolve({ botId: "bot-a", threadId: "thread-a", requestId: update.requestId, behavior: "allow" });
+    expect(routines.listRoutines()[0].overlap).toBeUndefined();
+  });
+
   it("canonicalizes receipt fingerprints and binds them to the card's conversation", async () => {
     const { service, store } = harness();
     await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal() });
@@ -211,7 +471,9 @@ describe("RoutineRequestService", () => {
                   everyMinutes: routine.schedule.everyMinutes,
                   type: "interval",
                 }
-              : { weekdays: [...routine.schedule.weekdays], time: routine.schedule.time, type: "daily" },
+              : routine.schedule.type === "cron"
+                ? { ...routine.schedule }
+                : { weekdays: [...routine.schedule.weekdays], time: routine.schedule.time, type: "daily" },
           instructions: routine.instructions,
           runOn: routine.runOn,
           name: routine.name,
@@ -657,6 +919,24 @@ describe("RoutineRequestService", () => {
       proposal: createProposal({ runOn: "cloud" }),
     })).rejects.toThrow(/Connect or provision/);
     expect(store.messagesFor("thread-a")).toHaveLength(0);
+  });
+
+  it("checks the executing bot for own, teammate and existing cloud routines", async () => {
+    const checked: string[] = [];
+    const { service, routines } = harness(undefined, async botId => {
+      checked.push(botId);
+      return { ready: botId === "bot-a", reason: "Target model unavailable" };
+    });
+    await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal({ runOn: "cloud" }) });
+    const peerProposal = createProposal({ runOn: "cloud" });
+    if (peerProposal.action !== "create") throw new Error("Expected create");
+    await expect(service.propose({ botId: "bot-a", threadId: "thread-a", proposal: {
+      ...peerProposal, forBot: { botId: "bot-b", name: "Peer" },
+    } })).rejects.toThrow("Target model unavailable");
+    const routine = routines.create({ botId: "bot-a", name: "Owned cloud", prompt: "Work",
+      runOn: "cloud", enabled: false, schedule: { type: "daily", time: "10:00", weekdays: [1] } });
+    await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: { action: "run_now", routineId: routine.id } });
+    expect(checked).toEqual(["bot-a", "bot-b", "bot-a"]);
   });
 
   it("checks effective cloud destinations while allowing safe moves away and non-running actions", async () => {

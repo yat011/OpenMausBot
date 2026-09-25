@@ -15,7 +15,7 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 import { writeFileAtomic } from "./atomic.ts";
 import { escapeAttribute, splitTranscriptAttachments } from "../src/lib/composer-attachments.ts";
 import { WORKSPACE_BACKUP_CLIENT_KEYS } from "../shared/workspace-backup-client.ts";
-import { excludedWorkspaceAuthPath, portableWorkspaceConfig, restoredWorkspaceConfig } from "./workspace-backup-policy.ts";
+import { ephemeralWorkspaceTokenPath, excludedWorkspaceAuthPath, portableWorkspaceConfig, redownloadedOrgLibraryPath, restoredWorkspaceConfig } from "./workspace-backup-policy.ts";
 import type { WorkspaceBackupClientState, WorkspaceBackupPrivateMetadata, WorkspaceBackupSummary } from "../shared/workspace-backup.ts";
 
 export type { WorkspaceBackupSummary, WorkspaceBackupPrivateMetadata } from "../shared/workspace-backup.ts";
@@ -30,6 +30,7 @@ const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}
 const EXCLUDED = new Set([
   ".backups", "tools", "cache", ".cache", "tmp", ".tmp", "dist-native", "tunnel-runtime",
   ".openmausbot-server-child", "environment-id", "sessions.json", "tunnel-account.json",
+  "team-computers.json",
   "openmausbot-server.lease", "box-create-requests.lock", "messages.db-wal", "messages.db-shm",
 ]);
 const EXCLUSION_NOTES = [
@@ -286,7 +287,7 @@ export async function createWorkspaceBackup(dataDir: string, options: CreateWork
       for (const name of readdirSync(directory).sort()) {
         if (!prefix && excluded(name)) continue;
         const path = prefix ? `${prefix}/${name}` : name;
-        if (excludedWorkspaceAuthPath(path)) continue;
+        if (excludedWorkspaceAuthPath(path) || ephemeralWorkspaceTokenPath(path) || redownloadedOrgLibraryPath(path)) continue;
         // Do not silently skip noncanonical source spellings: reject them so
         // a case-sensitive host cannot export auth paths active on Windows/Mac.
         if (forbiddenArchivePath(path)) throw new Error("A workspace filename conflicts with a protected authentication or runtime path.");
@@ -665,8 +666,11 @@ function prepareRestore(dataDir: string, id: string, manifest: Manifest): string
   folder(prepared);
   // Keep the authenticated original staging tree intact for reinspection and
   // recovery. Only this installation copy has paths/scheduling adapted.
-  for (const entry of manifest.entries.filter((entry) => entry.type === "directory")) folder(join(prepared, entry.path));
-  for (const entry of manifest.entries) {
+  // An archive from a release that exported per-turn hook tokens still
+  // restores; the dead tokens themselves are never installed.
+  const installed = manifest.entries.filter((entry) => !ephemeralWorkspaceTokenPath(entry.path));
+  for (const entry of installed.filter((entry) => entry.type === "directory")) folder(join(prepared, entry.path));
+  for (const entry of installed) {
     const destination = join(prepared, entry.path);
     if (entry.type === "file") copyRegular(join(job, "staged", "data", entry.path), destination);
   }
@@ -680,6 +684,14 @@ function prepareRestore(dataDir: string, id: string, manifest: Manifest): string
   for (const name of ["bots.json", "groups.json", "config.json", "routines.json", "calendar-calls.json"]) {
     changeJson(name, (value) => rebaseFields(value, manifest.sourceDataDir, resolve(dataDir)));
   }
+  // Voice provider configuration and credentials deliberately stay with the
+  // destination installation. Imported per-agent ids belong to the source
+  // provider's catalog, so retaining them could send an incompatible id to
+  // the destination provider.
+  changeJson("bots.json", (value) => {
+    if (!Array.isArray(value)) throw new Error("Invalid bot definitions in workspace backup.");
+    for (const bot of value) if (record(bot)) delete bot.voice;
+  });
   // Never install source connection settings. Destination keys, endpoints,
   // driver environments and MCP configuration remain paired and unchanged.
   const oldConfig = join(dataDir, "config.json");

@@ -16,7 +16,9 @@ import { DatabaseSync } from "node:sqlite";
 
 import { DATA_DIR } from "./config.ts";
 import { peerProvenanceAuthor } from "./peer-provenance.ts";
+import type { ResolvedSender, SteerQueueReason } from "../shared/wire.ts";
 import type { Message } from "./store.ts";
+import type { UsageTrigger } from "./usage-ledger.ts";
 
 const DB_FILE = () => join(DATA_DIR, "messages.db");
 
@@ -62,6 +64,13 @@ function open(): DatabaseSync {
       payload TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS chat_followups_receipt ON chat_followups(kind, owner_id, thread_id, send_id);
+    CREATE TABLE IF NOT EXISTS command_receipts (
+      kind TEXT NOT NULL,
+      key TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      result TEXT NOT NULL,
+      PRIMARY KEY (kind, key)
+    );
   `);
   ensureRecallIndex(db);
   ensureMemoryIndex(db);
@@ -172,15 +181,55 @@ function db(): DatabaseSync {
   return handle;
 }
 
+/** Nested writes use savepoints: even a caught inner error must not commit
+ * half of an inner command. The outer transaction still owns durability. */
+let transactionDepth = 0;
+function transaction<T>(fn: (database: DatabaseSync) => T): T {
+  const database = db();
+  if (transactionDepth > 0) {
+    const savepoint = `command_${transactionDepth}`;
+    database.exec(`SAVEPOINT ${savepoint}`);
+    transactionDepth += 1;
+    try {
+      const result = fn(database);
+      database.exec(`RELEASE ${savepoint}`);
+      return result;
+    } catch (error) {
+      database.exec(`ROLLBACK TO ${savepoint}`);
+      database.exec(`RELEASE ${savepoint}`);
+      throw error;
+    } finally { transactionDepth -= 1; }
+  }
+  database.exec("BEGIN IMMEDIATE");
+  transactionDepth = 1;
+  try {
+    const result = fn(database);
+    database.exec("COMMIT");
+    return result;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  } finally {
+    transactionDepth = 0;
+  }
+}
+
 export interface FollowupPayload {
   text: string;
   prompt?: string;
   replyToId?: string;
   sendId?: string;
-  reason?: "capacity";
+  reason?: SteerQueueReason;
   unattended?: boolean;
+  peerAsk?: Message["peerAsk"];
   mode?: "chat" | "goal";
   via?: "api";
+  /** Who queued these words. Absent on the owner's own sends and on every
+   * row written before this existed; both read as the profile name. */
+  sender?: ResolvedSender;
+  /** Who the usage ledger books the turn these words start to. Absent on
+   * rows written before this existed. */
+  trigger?: UsageTrigger;
 }
 export type FollowupStatus = "pending" | "dispatching" | "interrupted" | "cancelled";
 export interface ChatFollowup {
@@ -203,6 +252,45 @@ function writeFollowups(write: (connection: DatabaseSync) => void): void {
     try { write(connection); connection.exec("COMMIT"); }
     catch (error) { connection.exec("ROLLBACK"); throw error; }
   } finally { connection.exec("PRAGMA synchronous = NORMAL"); }
+}
+
+export interface StoredCommandReceipt {
+  kind: string;
+  key: string;
+  at: number;
+  /** JSON text of the command's result, exactly as first produced. */
+  result: string;
+}
+
+export function readCommandReceipt(kind: string, key: string): StoredCommandReceipt | null {
+  const row = db()
+    .prepare("SELECT kind, key, at, result FROM command_receipts WHERE kind = ? AND key = ?")
+    .get(kind, key) as StoredCommandReceipt | undefined;
+  return row ?? null;
+}
+
+/** Run `apply` and record its receipt in ONE transaction on the transcript
+ * DB, so a command's rows and the proof that it ran land together or not
+ * at all. A receipt already present short-circuits: the stored result is
+ * returned and `apply` never runs. Everything `apply` writes through this
+ * module (insertMessage, setActiveLeaf, ...) joins the same transaction. */
+export function withCommandReceipt(
+  kind: string,
+  key: string,
+  apply: () => string,
+  at: number,
+): { result: string; replayed: boolean } {
+  return transaction((database) => {
+    const existing = database
+      .prepare("SELECT result FROM command_receipts WHERE kind = ? AND key = ?")
+      .get(kind, key) as { result: string } | undefined;
+    if (existing) return { result: existing.result, replayed: true };
+    const result = apply();
+    database
+      .prepare("INSERT INTO command_receipts(kind, key, at, result) VALUES (?, ?, ?, ?)")
+      .run(kind, key, at, result);
+    return { result, replayed: false };
+  });
 }
 
 export function saveChatFollowup(followup: Omit<ChatFollowup, "status">): void {
@@ -265,6 +353,34 @@ export function readThread(threadId: string, legacyFile: string): ThreadRows {
   return importLegacy(threadId, legacyFile);
 }
 
+export interface ThreadTailRows extends ThreadRows {
+  /** `true` means older rows exist beyond this page; `false` means the SQL
+   * read returned the complete thread. Absent for a full legacy import.
+   * Both false and absent results can be cached as a full load. */
+  hasMore?: boolean;
+}
+
+/** The newest `limit` rows only, read at the SQL boundary — the fast path
+ * for a display page (startup hydrate, a fresh scrollback view) that never
+ * needs the rest of a long transcript. Falls back to a full legacy import
+ * on first touch, same as readThread(); that read is a one-time migration
+ * cost regardless of how much of the result the caller keeps. */
+export function readThreadTail(threadId: string, legacyFile: string, limit: number): ThreadTailRows {
+  const rows = db()
+    .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT ?")
+    .all(threadId, limit + 1) as Array<{ json: string }>;
+  if (rows.length) {
+    const hasMore = rows.length > limit;
+    if (hasMore) rows.length = limit;
+    rows.reverse();
+    const state = db()
+      .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
+      .get(threadId) as { active_leaf_id: string | null } | undefined;
+    return { messages: rows.map(rowToMessage), activeLeafId: state?.active_leaf_id ?? null, hasMore };
+  }
+  return importLegacy(threadId, legacyFile);
+}
+
 function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   let messages: Message[] = [];
   let activeLeafId: string | null = null;
@@ -310,34 +426,22 @@ export function insertMessage(threadId: string, message: Message): void {
 
 /** A backup may only populate a fresh thread, never replace a transcript. */
 export function importThread(threadId: string, messages: Message[], activeLeafId: string | null): void {
-  const database = db();
-  database.exec("BEGIN IMMEDIATE");
-  try {
+  transaction((database) => {
     if (database.prepare("SELECT 1 FROM messages WHERE thread_id = ? LIMIT 1").get(threadId) ||
         database.prepare("SELECT 1 FROM thread_state WHERE thread_id = ?").get(threadId)) {
       throw new Error("Cannot import over an existing conversation");
     }
     for (const message of messages) insertMessage(threadId, message);
     setActiveLeaf(threadId, activeLeafId);
-    database.exec("COMMIT");
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
-  }
+  });
 }
 
 /** Persist a new message and the branch head as one crash-safe mutation. */
 export function appendMessage(threadId: string, message: Message): void {
-  const database = db();
-  database.exec("BEGIN IMMEDIATE");
-  try {
+  transaction(() => {
     insertMessage(threadId, message);
     setActiveLeaf(threadId, message.id);
-    database.exec("COMMIT");
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
-  }
+  });
 }
 
 export function updateMessage(threadId: string, message: Message): void {
@@ -368,6 +472,25 @@ export function setActiveLeaf(threadId: string, leafId: string | null): void {
     .run(threadId, leafId);
 }
 
+/** Newest message timestamp per thread. One grouped read, chunked under
+ * SQLite's variable limit. Threads with no rows are absent. */
+export function latestMessageAts(threadIds: readonly string[]): Map<string, number> {
+  const ids = [...new Set(threadIds.filter((id) => id.length > 0))];
+  const out = new Map<string, number>();
+  const chunk = 400;
+  for (let i = 0; i < ids.length; i += chunk) {
+    const slice = ids.slice(i, i + chunk);
+    const placeholders = slice.map(() => "?").join(", ");
+    const rows = db()
+      .prepare(`SELECT thread_id, MAX(at) AS at FROM messages WHERE thread_id IN (${placeholders}) GROUP BY thread_id`)
+      .all(...slice) as Array<{ thread_id: string; at: number }>;
+    for (const row of rows) {
+      if (typeof row.at === "number" && Number.isFinite(row.at)) out.set(row.thread_id, row.at);
+    }
+  }
+  return out;
+}
+
 export function deleteThread(threadId: string): void {
   writeFollowups((connection) => {
     connection.prepare("DELETE FROM chat_followups WHERE thread_id = ?").run(threadId);
@@ -389,6 +512,15 @@ export interface SearchHit {
   matchLength: number;
   /** room messages: which member said it */
   from?: string;
+}
+
+/** Every thread whose stored messages mention `fragment` anywhere (an
+ * attachment's file name, say). A scan, like search; used only to decide
+ * whether a member on a workspace with a restricted bot may fetch a file. */
+export function threadsReferencing(fragment: string): string[] {
+  if (!fragment) return [];
+  const rows = db().prepare("SELECT DISTINCT thread_id FROM messages WHERE instr(json, ?) > 0").all(fragment) as Array<{ thread_id: string }>;
+  return rows.map((row) => row.thread_id);
 }
 
 /** Case-insensitive substring search over text messages, newest first.
@@ -452,6 +584,8 @@ export interface RecallHit {
   messageId: string;
   at: number;
   role: string;
+  /** "digest" for a work-digest row; absent for ordinary text. */
+  kind?: "digest";
   /** the matched text, with each matched term wrapped in [brackets] */
   snippet: string;
   /** room messages: which member said it */
@@ -531,24 +665,48 @@ export function readMessageText(
  * bm25 rank from FTS5; the snippet is FTS5's own, windowed around the
  * matched terms. Scoping happens in SQL before LIMIT, so a busy thread
  * cannot crowd out a quieter one. */
-export function recallMessages(query: string, threadIds: readonly string[], limit = 12): RecallHit[] {
+/** An optional time window on a recall: milliseconds since the epoch. */
+export interface RecallRange {
+  since?: number;
+  until?: number;
+}
+
+function rangeClause(range: RecallRange | undefined, column: string): { sql: string; params: number[] } {
+  const parts: string[] = [];
+  const params: number[] = [];
+  if (range?.since !== undefined) {
+    parts.push(`${column} >= ?`);
+    params.push(range.since);
+  }
+  if (range?.until !== undefined) {
+    parts.push(`${column} <= ?`);
+    params.push(range.until);
+  }
+  return { sql: parts.map((part) => ` AND ${part}`).join(""), params };
+}
+
+export function recallMessages(query: string, threadIds: readonly string[], limit = 12, range?: RecallRange): RecallHit[] {
   const match = ftsQuery(query);
   if (!match || !threadIds.length) return [];
   const placeholders = threadIds.map(() => "?").join(", ");
+  const window = rangeClause(range, "m.at");
   const rows = db()
     .prepare(
-      "SELECT m.thread_id, m.id, m.at, m.role, json_extract(m.json, '$.from.name') AS from_name, " +
+      "SELECT m.thread_id, m.id, m.at, m.role, m.kind, json_extract(m.json, '$.from.name') AS from_name, " +
         `json_extract(m.json, '$.peerAsk.name') AS peer_name, substr(m.text, 1, ${PEER_NOTE_HEAD_CHARS}) AS head, ` +
         `snippet(messages_fts, 0, '[', ']', '…', ${SNIPPET_TOKENS}) AS snippet ` +
         "FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid " +
-        `WHERE messages_fts MATCH ? AND m.kind = 'text' AND m.thread_id IN (${placeholders}) ` +
-        "ORDER BY bm25(messages_fts), m.at DESC LIMIT ?",
+        `WHERE messages_fts MATCH ? AND m.kind IN ('text', 'digest') AND m.thread_id IN (${placeholders})${window.sql} ` +
+        // a digest is a record of work, not something anyone said: it ranks
+        // after every text hit so recall reads like a conversation first
+        "ORDER BY (m.kind = 'digest'), bm25(messages_fts), m.at DESC LIMIT ?",
     )
-    .all(match, ...threadIds, limit) as Array<{
+    .all(match, ...threadIds, ...window.params, limit) as Array<{
     thread_id: string;
     id: string;
     at: number;
     role: string;
+    kind: string;
     from_name: string | null;
     peer_name: string | null;
     head: string;
@@ -561,11 +719,91 @@ export function recallMessages(query: string, threadIds: readonly string[], limi
       messageId: row.id,
       at: row.at,
       role: row.role,
+      ...(row.kind === "digest" ? { kind: "digest" as const } : {}),
       snippet: row.snippet.replace(/\s+/g, " ").trim(),
       ...(row.from_name ? { from: row.from_name } : {}),
       ...(peer ? { peer } : {}),
     };
   });
+}
+
+/** Characters of a message shown when a recall is by time, not by words:
+ * enough to know what was said, never the whole message. */
+const RECENT_HEAD_CHARS = 240;
+
+/** The text messages of the given threads inside a time window, newest
+ * first — "what happened since yesterday" needs no words to match. Same
+ * shape as a ranked hit, with the head of the message standing in for the
+ * FTS snippet. */
+export function recentMessages(threadIds: readonly string[], range: RecallRange, limit = 12): RecallHit[] {
+  if (!threadIds.length) return [];
+  const placeholders = threadIds.map(() => "?").join(", ");
+  const window = rangeClause(range, "m.at");
+  const rows = db()
+    .prepare(
+      "SELECT m.thread_id, m.id, m.at, m.role, json_extract(m.json, '$.from.name') AS from_name, " +
+        `json_extract(m.json, '$.peerAsk.name') AS peer_name, substr(m.text, 1, ${Math.max(PEER_NOTE_HEAD_CHARS, RECENT_HEAD_CHARS)}) AS head ` +
+        `FROM messages m WHERE m.kind = 'text' AND m.text IS NOT NULL AND m.thread_id IN (${placeholders})${window.sql} ` +
+        "ORDER BY m.at DESC LIMIT ?",
+    )
+    .all(...threadIds, ...window.params, limit) as Array<{
+    thread_id: string;
+    id: string;
+    at: number;
+    role: string;
+    from_name: string | null;
+    peer_name: string | null;
+    head: string;
+  }>;
+  return rows.map((row) => {
+    const peer = peerAuthor(row.peer_name, row.head);
+    const folded = row.head.replace(/\s+/g, " ").trim();
+    return {
+      threadId: row.thread_id,
+      messageId: row.id,
+      at: row.at,
+      role: row.role,
+      snippet: folded.length > RECENT_HEAD_CHARS ? `${folded.slice(0, RECENT_HEAD_CHARS)}…` : folded,
+      ...(row.from_name ? { from: row.from_name } : {}),
+      ...(peer ? { peer } : {}),
+    };
+  });
+}
+
+/** The newest thing one bot said in a thread. */
+export interface ThreadLatest {
+  threadId: string;
+  messageId: string;
+  at: number;
+  /** the head of that message, whitespace folded */
+  head: string;
+}
+
+/** For each of the given threads, the newest text message the bot itself
+ * said there since `since` — one row per thread, newest thread first. A
+ * room line carries from.botId; a 1:1 line carries none and is the bot's
+ * by construction. What a bot last said in a conversation is the shortest
+ * honest answer to "what have you been doing there". */
+export function latestSaidByBot(threadIds: readonly string[], botId: string, since: number, limit = 20): ThreadLatest[] {
+  if (!threadIds.length) return [];
+  const placeholders = threadIds.map(() => "?").join(", ");
+  const rows = db()
+    .prepare(
+      "SELECT thread_id, id, at, head FROM (" +
+        "SELECT m.thread_id, m.id, m.at, substr(m.text, 1, 400) AS head, " +
+        "ROW_NUMBER() OVER (PARTITION BY m.thread_id ORDER BY m.at DESC) AS rn " +
+        "FROM messages m " +
+        `WHERE m.kind = 'text' AND m.role = 'bot' AND m.text IS NOT NULL AND m.at >= ? AND m.thread_id IN (${placeholders}) ` +
+        "AND (json_extract(m.json, '$.from.botId') IS NULL OR json_extract(m.json, '$.from.botId') = ?)" +
+        ") WHERE rn = 1 ORDER BY at DESC LIMIT ?",
+    )
+    .all(since, ...threadIds, botId, limit) as Array<{ thread_id: string; id: string; at: number; head: string }>;
+  return rows.map((row) => ({
+    threadId: row.thread_id,
+    messageId: row.id,
+    at: row.at,
+    head: row.head.replace(/\s+/g, " ").trim(),
+  }));
 }
 
 export interface MemoryFileStat {

@@ -1,6 +1,6 @@
 // `/learn` — turn a described workflow, URL, folder, or "what we just did"
-// into a staged SKILL.md. The live agent authors the skill with skill_manage;
-// the harness lands it DISABLED until a person confirms the in-app card.
+// into a reusable SKILL.md. The live agent authors the skill with skill_manage;
+// the harness applies it under granted Full Access or stages a pending review.
 //
 // There is no separate distillation engine. This module only builds the
 // prompt and recognises the slash command, so it works on every engine
@@ -65,10 +65,10 @@ export function buildLearnPrompt(userRequest: string, autoConfirm = false): stri
 
   const applyStep = autoConfirm
     ? "4. skill_manage applies the change on this instance. After it reports applied, you may tell the user the skill is in effect.\n\n"
-    : "4. skill_manage only STAGES the change. A create stays inactive and an update leaves the current version untouched until the user approves the review card.\n\n";
+    : "4. Follow the skill_manage result: with granted Full Access it may apply immediately. After an applied result, continue the requested work without another confirmation. If review is pending, a create stays inactive and an update leaves the current version untouched; end the turn and wait for the in-app decision. Never claim success from the permission mode alone, and report failed or cancelled changes honestly.\n\n";
 
   return (
-    `${LEARN_PROMPT_MARKER} The user wants you to learn a reusable skill from the request below, and stage it for their review.\n\n` +
+    `${LEARN_PROMPT_MARKER} The user wants you to learn a reusable skill from the request below, using the granted access level.\n\n` +
     `THE REQUEST:\n${req}\n\n` +
     "Do this:\n" +
     "1. Inventory every source the user named, using the tools you already have — file tools for local paths, web fetch for URLs, and this conversation if they referred to something you just did. If the request is ambiguous about scope, make a reasonable choice and note it; do not stall.\n" +

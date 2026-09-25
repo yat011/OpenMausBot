@@ -25,10 +25,10 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
-import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
-import { describeSpawnFailure, killCliTree, spawnCli } from "../procs.ts";
+import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
+import { commandSummary, toolDetailPreview } from "../tool-summary.ts";
 
 import type {
   DriverCreateInput,
@@ -42,7 +42,9 @@ import type {
   SendTurnInput,
   TurnImageInput,
 } from "../contracts.ts";
-import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
+import { EFFORT_LEVELS } from "../../shared/wire.ts";
+import { newEventId, newId } from "../contracts.ts";
+import { parseAskQuestions, parseChoices, questionAnswersByQuestion } from "../../shared/ask-question.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -54,6 +56,7 @@ import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "piAgent";
 const PI_ARGS = ["--mode", "rpc", "--no-session"];
+const PI_MODEL_UPDATE_ARGS = ["update", "--models", "--no-approve"];
 const NODE_ENV_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
 type PiPromptImage = {
@@ -99,13 +102,7 @@ export function piThinkingLevel(effort: EffortLevel): (typeof EFFORT_LEVELS)[num
 export function buildMcpServers(turn: SendTurnInput): Record<string, unknown> | null {
   const servers: Record<string, unknown> = {};
   if (turn.integrations?.composio) servers.composio = { ...turn.integrations.composio };
-  if (turn.integrations?.computer) {
-    servers.computer = {
-      command: process.execPath,
-      args: [SPAWNED_PROXIES.computer],
-      env: { ...NODE_ENV_FLAG, ...computerProxyEnv(turn.integrations.computer) },
-    };
-  } else if (turn.integrations?.localComputer) {
+  if (turn.integrations?.localComputer) {
     const local = turn.integrations.localComputer;
     servers.computer = {
       command: local.command,
@@ -363,6 +360,23 @@ export async function fetchPiModels(
   });
 }
 
+/** Refresh pi's provider-owned catalog cache. This is deliberately called
+ * only by the explicit model-picker refresh action, never during app startup.
+ * Failure is non-fatal: the caller still probes the last usable cache. */
+export async function updatePiModelCatalog(
+  cli: string,
+  env: Record<string, string | undefined>,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    execCli(
+      cli,
+      PI_MODEL_UPDATE_ARGS,
+      { env, timeout: 60_000, maxBuffer: 1024 * 1024 },
+      (error) => resolve(!error),
+    );
+  });
+}
+
 export interface PiConfig {
   cli: string;
   /** Full-auto: never ask before an action. Host control is unavailable in
@@ -397,6 +411,8 @@ interface PiEvent {
   // tool_execution_*
   toolCallId?: string;
   toolName?: string;
+  args?: unknown;
+  result?: unknown;
   isError?: boolean;
   // turn_end / message_end
   message?: { stopReason?: string; errorMessage?: string; usage?: { input?: number; output?: number } };
@@ -440,7 +456,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
     const { instanceId, config } = input;
     const catalogEnv = piEnvironment({ ...process.env, ...input.environment });
     let models = EMPTY;
-    const refreshModels = async () => {
+    const readModels = async () => {
       let base = models;
       try {
         const resolved = await fetchPiModels(config.cli, catalogEnv);
@@ -455,7 +471,13 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         if (base.options.length) models = base;
       }
     };
-    await refreshModels();
+    const refreshModels = async () => {
+      await updatePiModelCatalog(config.cli, catalogEnv);
+      await readModels();
+    };
+    // Startup stays local and fast. Only the explicit Refresh button crosses
+    // pi's model-catalog network boundary.
+    await readModels();
 
     const listeners = new Set<RuntimeEventListener>();
     // one active turn per thread
@@ -493,6 +515,10 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       }
       const turnId = newId();
       const pending = new Map<string, (decision: { behavior: "allow" | "deny" | "answer"; message?: string }) => void>();
+      // Ask fail-safe timers, tracked so settle() can cancel them outright:
+      // a cleared pending map alone leaves each timer holding the ask
+      // closure (send, child) alive until it fires.
+      const askTimers = new Set<ReturnType<typeof setTimeout>>();
       let settled = false;
       // pi's RPC surface accepts image content directly. Read before spawning
       // so an attachment that disappeared produces one clear dispatch error
@@ -590,6 +616,12 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       const settle = (ok: boolean, stopReason?: string | null, usage?: { input?: number; output?: number }) => {
         if (settled) return;
         settled = true;
+        // The turn is over: drop unanswered asks so their 15-minute
+        // fail-safe timers are cancelled outright instead of no-oping on a
+        // dead child while holding the ask closure alive.
+        for (const timer of askTimers) clearTimeout(timer);
+        askTimers.clear();
+        pending.clear();
         flushAssistantText();
         emit({
           ...base(threadId, turnId),
@@ -665,6 +697,8 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               itemType: "tool",
               itemId: evt.toolCallId,
               title: String(evt.toolName ?? "tool").slice(0, 80),
+              summary: commandSummary(evt.args),
+              input: toolDetailPreview(evt.args),
             });
             return;
           }
@@ -675,6 +709,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               itemType: "tool",
               itemId: evt.toolCallId,
               ok: !evt.isError,
+              output: toolDetailPreview(evt.result),
             });
             return;
           }
@@ -684,23 +719,75 @@ export const PiDriver: ProviderDriver<PiConfig> = {
             if (evt.method === "select" || evt.method === "confirm" || evt.method === "input") {
               flushAssistantText();
               const reqId = evt.id ?? newId();
-              const isQuestion = evt.method === "input";
+              const isSelect = evt.method === "select";
+              const isQuestion = isSelect || evt.method === "input";
+              const selectOptions: string[] = isSelect && Array.isArray(evt.options)
+                ? evt.options.filter((option): option is string => typeof option === "string") : [];
+              const summary = String(evt.title ?? (isQuestion ? "pi has a question" : "pi wants confirmation")).slice(0, 200);
+              // A select is a question with named options; the structured
+              // card renders from it while the flat choices keep older
+              // clients answering. An input has nothing to pick from and
+              // stays the free-text question it always was.
+              const question = isSelect
+                ? (parseAskQuestions({
+                    questions: [{ question: summary, options: selectOptions }],
+                  }) ?? [])[0]
+                : undefined;
+              const choices = question?.options.length ? question.options.map((option) => option.label) : undefined;
+              let timer: ReturnType<typeof setTimeout> | undefined;
               // Register BEFORE emitting: the harness may auto-approve from
               // inside its synchronous request.opened listener. Emitting first
               // made respondToRequest see no pending ask, return unavailable,
               // then fall back to a human card on every "Always allow" call.
               pending.set(reqId, (decision) => {
+                if (timer) {
+                  clearTimeout(timer);
+                  askTimers.delete(timer);
+                }
                 if (decision.behavior === "deny") send({ type: "extension_ui_response", id: reqId, cancelled: true });
-                else if (isQuestion) send({ type: "extension_ui_response", id: reqId, value: decision.message ?? "" });
+                else if (isQuestion) {
+                  // Recover the picked label from a structured card's Q:/A:
+                  // reply; a flat answer or typed text passes through
+                  // verbatim (questionAnswersByQuestion's single-question
+                  // fallback does exactly that).
+                  const value = question
+                    ? questionAnswersByQuestion(decision.message ?? "", [question])[question.question] ?? decision.message ?? ""
+                    : decision.message ?? "";
+                  // Display labels are capped/trimmed; pi expects the
+                  // original option. Never guess if two normalize alike.
+                  const matched = selectOptions.filter(option => parseChoices([option], 1)?.[0] === value);
+                  send(matched.length > 1
+                    ? { type: "extension_ui_response", id: reqId, cancelled: true }
+                    : { type: "extension_ui_response", id: reqId, value: matched[0] ?? value });
+                }
                 else send({ type: "extension_ui_response", id: reqId, confirmed: true });
               });
+              // The ask must never hold the turn forever: cancel it after 15
+              // minutes. The pending.delete guard makes this a no-op once the
+              // turn settled (settle clears pending) or a person answered.
+              timer = setTimeout(() => {
+                if (timer) askTimers.delete(timer);
+                if (!pending.delete(reqId)) return;
+                send({ type: "extension_ui_response", id: reqId, cancelled: true });
+                emit({
+                  ...base(threadId, turnId),
+                  requestId: reqId,
+                  type: "request.resolved",
+                  behavior: "deny",
+                  source: "timeout",
+                });
+              }, 15 * 60_000);
+              askTimers.add(timer);
+              timer.unref?.();
               emit({
                 ...base(threadId, turnId),
                 requestId: reqId,
                 type: "request.opened",
                 requestType: isQuestion ? "question" : "permission",
                 tool: String(evt.title ?? "pi"),
-                summary: String(evt.title ?? "pi wants confirmation"),
+                summary,
+                ...(choices ? { choices } : {}),
+                ...(question ? { questions: [question] } : {}),
               });
             }
             return;
@@ -805,6 +892,12 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         }
       }
 
+      // pi compacts long sessions by summarizing older user messages, and
+      // this driver delivers the prompt as the leading user message: a
+      // receipt-based split would let a compacted session keep running
+      // bare, without its standing instructions. Re-deliver the full prompt
+      // every turn until pi exposes a compaction signal the harness can
+      // watch (its extension API has session_before_compact).
       const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
       try {
         send({ type: "prompt", message, ...(images.length ? { images } : {}) });

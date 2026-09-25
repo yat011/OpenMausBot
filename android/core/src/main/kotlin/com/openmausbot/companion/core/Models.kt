@@ -25,6 +25,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 
@@ -76,9 +77,27 @@ data class OptionCard(
     val allowKey: String? = null,
     /** Learned skills require a complete, hash-bound review before approval. */
     val skillRequest: SkillRequestCardData? = null,
+    /**
+     * The model's own questions and options (Claude's `AskUserQuestion`).
+     * Present only on a structured ask; every other card leaves it null.
+     */
+    val questionRequest: QuestionRequestCardData? = null,
+    /**
+     * What an answered question was answered WITH. `answered` only records the
+     * behavior once the harness settles a live ask, so without this a settled
+     * question card would read "answer" instead of the reply.
+     */
+    val answeredText: String? = null,
 ) {
     val isPending: Boolean get() = requestId != null && answered == null && dismissed != true
     val isPermission: Boolean get() = tool != null
+
+    /**
+     * A structured ask draws its own card: the model posed real questions with
+     * real options, and a flat row of buttons cannot say which question a tap
+     * answered.
+     */
+    val questions: List<AskQuestion> get() = questionRequest?.questions.orEmpty()
 
     fun responseBehavior(choice: String): String = responseBehavior(choice, isPermission)
 
@@ -124,6 +143,19 @@ data class ToolActivity(
 )
 
 /**
+ * A compaction record: from this message on, rebuilds of the thread's
+ * context carry [summary] instead of the earlier messages.
+ */
+@Serializable
+data class Compaction(
+    val summary: String,
+    val tokensBefore: Int,
+) {
+    val chipText: String
+        get() = "Context compacted · ${"%,d".format(tokensBefore)} tokens summarised"
+}
+
+/**
  * The thread an activity chip opened — "Opened thread #Title on Scout" — so
  * the phone can go there. Newer computers only; a chip without one is just a
  * receipt.
@@ -163,6 +195,8 @@ data class Message(
     val card: OptionCard? = null,
     val tool: ToolActivity? = null,
     val threadRef: ThreadRef? = null,
+    /** `kind == COMPACTION`: the record itself. */
+    val compaction: Compaction? = null,
     val parentId: String? = null,
     val from: Sender? = null,
     val reactions: List<Reaction>? = null,
@@ -170,6 +204,8 @@ data class Message(
     val hasImage: Boolean? = null,
     val png: String? = null,
     val mime: String? = null,
+    /** Agent-generated images on text replies, including late message patches. */
+    val attachments: List<MessageImageAttachment>? = null,
     /**
      * A user line the engine took INTO the turn that was already running,
      * rather than one that started a turn of its own.
@@ -181,9 +217,12 @@ data class Message(
      * finally lands.
      */
     val queueId: String? = null,
+    /** Completed provider turns can fold narration without guessing which reply is final. */
+    val turnId: String? = null,
+    val turnTerminal: Boolean? = null,
 ) {
     @Serializable(with = MessageKindSerializer::class)
-    enum class Kind { TEXT, OPTIONS, ACTIVITY, SCREEN, UNKNOWN }
+    enum class Kind { TEXT, OPTIONS, ACTIVITY, SCREEN, DIGEST, COMPACTION, UNKNOWN }
 
     @Serializable(with = MessageRoleSerializer::class)
     enum class Role { BOT, USER }
@@ -197,6 +236,8 @@ object MessageKindSerializer : KSerializer<Message.Kind> {
         "options" -> Message.Kind.OPTIONS
         "activity" -> Message.Kind.ACTIVITY
         "screen" -> Message.Kind.SCREEN
+        "digest" -> Message.Kind.DIGEST
+        "compaction" -> Message.Kind.COMPACTION
         else -> Message.Kind.UNKNOWN
     }
 
@@ -243,6 +284,22 @@ data class ThreadOpener(
     val at: Double,
 )
 
+/**
+ * The bot that closed a thread with close_thread, once its result was read.
+ * Absent means the thread is open; the computer clears it the moment a new
+ * turn starts there, so a reopened thread simply loses the stamp.
+ */
+@Serializable
+data class ThreadCloser(
+    val botId: String,
+    val name: String,
+    val at: Double,
+)
+
+/** A folder within one bot, in the order saved on the computer. */
+@Serializable
+data class BotProject(val id: String, val name: String, val emoji: String? = null)
+
 @Serializable
 data class BotTask(
     val threadId: String,
@@ -251,19 +308,72 @@ data class BotTask(
     val modelSelection: ModelSelection? = null,
     val activity: String? = null,
     val busy: Boolean? = null,
+    /** This thread's own turn is done and a dispatched teammate has not
+     * settled yet (#1223): a wait, never work. Newer harnesses only. */
+    val waitingOnTeammate: Boolean? = null,
     val unread: Boolean? = null,
     val approvalMode: String? = null,
     val autoApprove: Boolean? = null,
     val alwaysAllow: List<String>? = null,
     val projectId: String? = null,
     val openedBy: ThreadOpener? = null,
+    val closedBy: ThreadCloser? = null,
+    /** The person put this thread away. Present means archived — a stamp of
+     * 0 is still archived, because the task API accepts any epoch number. */
+    val archivedAt: Double? = null,
     /** Bot-only internal execution. Keep it addressable, but out of thread pickers. */
     val routineRunId: String? = null,
+    /** The person pinned this thread above the update-ordered list. */
+    val pinned: Boolean? = null,
+    /** Newest message time. Absent on older computers; the list uses createdAt. */
+    val updatedAt: Double? = null,
+    /**
+     * Asleep until: 0 is the "until new activity" sentinel and never ticks,
+     * while a future epoch-milliseconds timestamp sleeps only until it
+     * passes. The server drops expired snoozes from snapshots; the phone
+     * still checks the clock, because a live stream never refreshes one.
+     */
+    val snoozedUntil: Double? = null,
 )
+
+/** The time the thread list sorts and stamps by. */
+val BotTask.listStamp: Double
+    get() = updatedAt ?: createdAt
 
 /** The thread list's quiet second line, worded as the desktop words it. */
 val BotTask.openedByLabel: String?
     get() = openedBy?.let { "opened by ${it.name}" }
+
+/** A bot closed this thread and nothing has happened there since. */
+val BotTask.isClosed: Boolean
+    get() = closedBy != null
+
+/** Archived is the presence of the stamp, not its value: archivedAt 0 counts. */
+val BotTask.isArchived: Boolean
+    get() = archivedAt != null
+
+/**
+ * Snoozed means asleep right now: 0 is the "until new activity" sentinel and
+ * sleeps until woken, while a timestamp sleeps only until it passes
+ * (`isSnoozed` in `SidebarThreadRow.tsx`).
+ */
+fun BotTask.isSnoozed(now: Long = System.currentTimeMillis()): Boolean =
+    snoozedUntil != null && (snoozedUntil == 0.0 || snoozedUntil > now)
+
+/**
+ * The one line under a title: who closed it once a bot has, "Archived" while
+ * it stays filed away, "Snoozed" while it sleeps, otherwise who opened it,
+ * otherwise nothing. Closed wins because it is the newer fact; archived and
+ * snoozed win over the opener because they explain why the row sits where
+ * it does.
+ */
+fun BotTask.bylineLabel(now: Long = System.currentTimeMillis()): String? =
+    when {
+        closedBy != null -> "closed by ${closedBy.name}"
+        isArchived -> "Archived"
+        isSnoozed(now) -> "Snoozed"
+        else -> openedByLabel
+    }
 
 @Serializable
 data class Bot(
@@ -281,6 +391,8 @@ data class Bot(
     val avatarCrop: AvatarCrop? = null,
     val busy: Boolean? = null,
     val activity: String? = null,
+    /** A dispatched teammate has not settled; the bot waits, it does not work. */
+    val waitingOnTeammate: Boolean? = null,
     val pinned: Boolean? = null,
     val hidden: Boolean? = null,
     /** Desktop sidebar section. Missing or blank means the built-in Bots area. */
@@ -304,6 +416,7 @@ data class Bot(
     val messages: List<Message>? = null,
     val activeLeafId: String? = null,
     val hasMore: Boolean? = null,
+    val projects: List<BotProject>? = null,
 )
 
 /** Project only task-local controls; the original fleet record stays profile-global. */
@@ -316,6 +429,7 @@ fun Bot.forTask(requestedThreadId: String): Bot? {
         modelSelection = task.modelSelection ?: modelSelection,
         busy = task.busy ?: if (selected) busy else false,
         activity = task.activity ?: if (selected) activity else null,
+        waitingOnTeammate = task.waitingOnTeammate ?: if (selected) waitingOnTeammate else null,
         unread = task.unread ?: if (selected) unread else false,
         approvalMode = task.approvalMode ?: task.autoApprove?.let { if (it) "auto" else "ask" } ?: approvalMode,
         autoApprove = task.autoApprove ?: autoApprove,
@@ -367,7 +481,16 @@ data class Room(
 )
 
 @Serializable(with = FleetSerializer::class)
-data class Fleet(val bots: List<Bot>, val groups: List<Room>)
+data class Fleet(
+    val bots: List<Bot>,
+    val groups: List<Room>,
+    /**
+     * Held sends for every bot thread, the same snapshot the bot.queued
+     * frames carry. Older computers omit it; a missing or unreadable field
+     * reads as absent, never as an empty queue.
+     */
+    val botQueuedMessages: Map<String, List<QueuedSend>>? = null,
+)
 
 object FleetSerializer : KSerializer<Fleet> {
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("Fleet")
@@ -388,6 +511,15 @@ object FleetSerializer : KSerializer<Fleet> {
         return Fleet(
             bots = lossyArray("bots") { input.json.decodeFromJsonElement(Bot.serializer(), it) },
             groups = lossyArray("groups") { input.json.decodeFromJsonElement(Room.serializer(), it) },
+            // One malformed entry must not cost the whole fleet: the roster
+            // is worth more than the queue note beside it.
+            botQueuedMessages = runCatching {
+                objectValue["botQueuedMessages"]?.jsonObject?.mapValues { (_, entries) ->
+                    entries.jsonArray.mapNotNull { element ->
+                        runCatching { element.jsonObject.queuedSendOrNull() }.getOrNull()
+                    }
+                }
+            }.getOrNull(),
         )
     }
 
@@ -397,6 +529,13 @@ object FleetSerializer : KSerializer<Fleet> {
         output.encodeJsonElement(buildJsonObject {
             put("bots", JsonArray(value.bots.map { output.json.encodeToJsonElement(Bot.serializer(), it) }))
             put("groups", JsonArray(value.groups.map { output.json.encodeToJsonElement(Room.serializer(), it) }))
+            value.botQueuedMessages?.let { queues ->
+                put("botQueuedMessages", buildJsonObject {
+                    queues.forEach { (threadId, sends) ->
+                        put(threadId, JsonArray(sends.map { it.toJsonObject() }))
+                    }
+                })
+            }
         })
     }
 }
@@ -624,8 +763,24 @@ data class InstanceCapabilities(
 @Serializable
 data class InstanceList(val instances: List<Instance>)
 
-/** Which engine actually speaks. `VoiceProvider` in `server/tts/index.ts`. */
-enum class VoiceProvider { ELEVENLABS, SYSTEM }
+/**
+ * Which engine actually speaks. `VoiceProvider` in `server/tts/index.ts`;
+ * [wire] is the exact string the config write carries, and [fromWire] applies
+ * the server's own fallback: a missing field — an older desktop that predates
+ * the choice — and a provider this build has never heard of both mean
+ * ElevenLabs, keeping an unrecognised engine from being explained with copy
+ * written for a different one.
+ */
+enum class VoiceProvider(val wire: String) {
+    ELEVENLABS("elevenlabs"),
+    FISH("fish"),
+    SYSTEM("system"),
+    CHATTERBOX("chatterbox");
+
+    companion object {
+        fun fromWire(value: String?): VoiceProvider = entries.firstOrNull { it.wire == value } ?: ELEVENLABS
+    }
+}
 
 @Serializable
 data class ConfigFlag(
@@ -668,15 +823,12 @@ data class ConfigStatus(
         isTTSConfigured && (!agentVoice.isNullOrBlank() || hasWorkspaceDefaultVoice)
 
     /**
-     * `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact string
-     * "system" selects the built-in engine. A missing field — an older
-     * desktop that predates the choice — and a provider this build has never
-     * heard of both fall back to ElevenLabs, which is the server's own rule
-     * and keeps an unrecognised engine from being explained with copy
-     * written for a different one.
+     * `voiceProvider(cfg)` in `server/tts/index.ts`: only a known, exact wire
+     * value selects its engine. Everything else falls back to ElevenLabs
+     * through [VoiceProvider.fromWire], which is the server's own rule.
      */
     val voiceProvider: VoiceProvider
-        get() = if (tts?.provider == "system") VoiceProvider.SYSTEM else VoiceProvider.ELEVENLABS
+        get() = VoiceProvider.fromWire(tts?.provider)
 }
 
 object ConnectedAppsRules {
@@ -1042,6 +1194,9 @@ internal data class SearchResponse(val hits: List<SearchHit>)
 internal data class MessageResponse(val message: Message)
 
 @Serializable
+internal data class EditResponse(val message: Message? = null)
+
+@Serializable
 internal data class ActiveBranchResponse(val activeLeafId: String)
 
 @Serializable
@@ -1091,4 +1246,28 @@ data class BotOverview(
     val reaches: List<String> = emptyList(),
     val wont: List<String> = emptyList(),
     val recent: List<BotOverviewRecent> = emptyList(),
+)
+
+/** Native server sessions returned by POST /api/auth/pair. */
+@Serializable
+data class ServerPairResponse(
+    val token: String,
+    val session: ServerSession,
+    val environment: ServerEnvironment,
+)
+
+@Serializable
+data class ServerSession(val id: String, val label: String, val scopes: List<String>)
+
+@Serializable
+data class ServerEnvironment(val environmentId: String, val label: String)
+
+/** Unknown attachment kinds remain decodable and are not rendered. */
+@Serializable
+data class MessageImageAttachment(
+    val kind: String,
+    val path: String? = null,
+    val mime: String? = null,
+    /** `kind == "audio"`: the server's duration estimate, used until the player loads metadata. */
+    val durationMs: Double? = null,
 )

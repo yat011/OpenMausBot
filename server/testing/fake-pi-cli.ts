@@ -5,7 +5,8 @@
 // / set_model, and streams a scripted turn in response to `prompt`. Failure
 // modes mirror how the real CLI misbehaves:
 //
-//   FAKE_PI_MODE   happy (default) | tooluse | permission | interleave | turn-error | no-models | exit-early
+//   FAKE_PI_MODE   happy (default) | tooluse | permission | interleave | question-select | question-input
+//                  | turn-error | no-models | exit-early
 //   FAKE_PI_MODELS comma-separated provider/model pairs (default "ollama-cloud/glm-5.2,openai/gpt-4o")
 //   FAKE_PI_DUMP   path to append {argv, env} JSON, so a test can assert argv shape
 //                  and env hygiene (no leaked secrets into the pi child).
@@ -58,6 +59,11 @@ if (process.env.FAKE_PI_DUMP) {
   }
 }
 
+// Explicit model refresh is a short-lived command, separate from RPC mode.
+if (argv[0] === "update" && argv.includes("--models")) {
+  process.exit(mode === "update-error" ? 1 : 0);
+}
+
 // exit-early: die before saying anything — a failed spawn surfaces as a
 // runtime.error + failed turn, never a hang.
 if (mode === "exit-early") {
@@ -100,8 +106,8 @@ const streamErrorTurn = () => {
 const streamToolTurn = () => {
   send({ type: "agent_start" });
   send({ type: "turn_start" });
-  send({ type: "tool_execution_start", toolCallId: "call_1", toolName: "bash", args: { command: "echo hi" } });
-  send({ type: "tool_execution_end", toolCallId: "call_1", toolName: "bash", isError: false });
+  send({ type: "tool_execution_start", toolCallId: "call_1", toolName: "bash", args: { command: "echo hi", password: "pi-input-secret" } });
+  send({ type: "tool_execution_end", toolCallId: "call_1", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "hi" }], api_key: "pi-output-secret" } });
   send({ type: "turn_end", message: { stopReason: "toolUse", usage: { input: 5, output: 1 } }, usage: { input: 5, output: 1 } });
   // pi auto-continues within the same prompt to synthesize the reply
   send({ type: "turn_start" });
@@ -116,6 +122,25 @@ const streamPermissionTurn = () => {
   send({ type: "agent_start" });
   send({ type: "turn_start" });
   send({ type: "extension_ui_request", id: "ask-1", method: "select", title: "Run bash: echo hi?", options: ["Allow once", "Deny"] });
+  // wait for the answer before finishing
+};
+
+// question-select: a select ask that is genuinely a question — named
+// options the driver must surface as choices + a structured question.
+const streamQuestionSelectTurn = () => {
+  send({ type: "agent_start" });
+  send({ type: "turn_start" });
+  send({ type: "extension_ui_request", id: "ask-select", method: "select", title: "Which color?",
+    options: process.env.FAKE_PI_QUESTION_OPTIONS ? JSON.parse(process.env.FAKE_PI_QUESTION_OPTIONS) : ["Blue", "Green"] });
+  // wait for the answer before finishing
+};
+
+// question-input: a free-text ask — no options, the typed answer returns
+// verbatim.
+const streamQuestionInputTurn = () => {
+  send({ type: "agent_start" });
+  send({ type: "turn_start" });
+  send({ type: "extension_ui_request", id: "ask-input", method: "input", title: "Which city?" });
   // wait for the answer before finishing
 };
 
@@ -173,11 +198,19 @@ function handle(cmd: any) {
       });
       return;
     case "new_session":
+      if (mode === "session-error") {
+        send({ type: "response", command: "new_session", success: false, error: "fake pi: session unavailable" });
+        return;
+      }
       sessionCounter += 1;
       currentSessionFile = `/fake/pi-session-${sessionCounter}.json`;
       send({ type: "response", command: "new_session", success: true, data: { sessionId: `s-${sessionCounter}`, sessionFile: currentSessionFile } });
       return;
     case "switch_session":
+      if (mode === "session-error") {
+        send({ type: "response", command: "switch_session", success: false, error: "fake pi: session unavailable" });
+        return;
+      }
       currentSessionFile = cmd.sessionPath ?? currentSessionFile;
       send({ type: "response", command: "switch_session", success: true, data: { sessionId: "s-resumed", sessionFile: currentSessionFile } });
       return;
@@ -218,12 +251,22 @@ function handle(cmd: any) {
       send({ type: "response", command: "prompt", success: true });
       if (mode === "tooluse") streamToolTurn();
       else if (mode === "permission") streamPermissionTurn();
+      else if (mode === "question-select") streamQuestionSelectTurn();
+      else if (mode === "question-input") streamQuestionInputTurn();
       else if (mode === "interleave") streamInterleaveTurn();
       else if (mode === "turn-error") streamErrorTurn();
       else streamTurn();
       return;
     case "extension_ui_response":
+      if (process.env.FAKE_PI_DUMP) {
+        try {
+          appendFileSync(process.env.FAKE_PI_DUMP, JSON.stringify({ uiResponse: cmd }) + "\n");
+        } catch {
+          /* never let dumping break a run */
+        }
+      }
       if (cmd.id === "ask-1") finishPermissionTurn();
+      else if (cmd.id === "ask-select" || cmd.id === "ask-input") finishPermissionTurn();
       return;
     case "abort":
       send({ type: "turn_end", message: { stopReason: "cancelled", usage: { input: 0, output: 0 } }, usage: { input: 0, output: 0 } });

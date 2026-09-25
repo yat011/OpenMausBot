@@ -14,6 +14,7 @@ import com.openmausbot.companion.core.Room
 import com.openmausbot.companion.core.Session
 import com.openmausbot.companion.core.chat
 import com.openmausbot.companion.core.TranscriptRow
+import com.openmausbot.companion.core.webhookContent
 
 /**
  * The decisions the chat and roster screens make that are worth testing without
@@ -53,11 +54,13 @@ object ThreadResolution {
     fun chatOrNull(state: CompanionState, threadId: String): Chat? =
         (resolve(state, threadId) as? Result.Open)?.chat
 
-    /** Keep the addressed task open until the reader switches or it is removed. */
+    /** Bot selection is local; a room follows its shared current conversation. */
     fun resolve(state: CompanionState, destination: Destination.Conversation): Result =
         when (destination) {
-            is Destination.Chat -> state.chat(destination.target)?.let(Result::Open)
-                ?: unknown(state)
+            is Destination.Chat -> when (val target = destination.target) {
+                is ChatTarget.Bot -> state.chat(target)
+                is ChatTarget.Room -> state.rooms.firstOrNull { it.id == target.roomId }?.let(Chat::RoomChat)
+            }?.let(Result::Open) ?: unknown(state)
             is Destination.Thread -> resolve(state, destination.threadId)
         }
 
@@ -465,16 +468,16 @@ object MessageActions {
     /** The text worth putting on the clipboard, or null when there is none. */
     fun copyableText(message: Message): String? = when (message.kind) {
         Message.Kind.TEXT, Message.Kind.UNKNOWN -> message.text
-            ?.let { AttachedMessageContent.parse(it) }
-            ?.text
+            ?.let { message.webhookContent?.task ?: AttachedMessageContent.parse(it).text }
             ?.takeIf { it.isNotBlank() }
         // An approval card is worth copying for what it is asking to do.
         Message.Kind.OPTIONS -> message.card
             ?.let { card -> listOf(card.title, card.subtitle).filter { it.isNotBlank() } }
             ?.takeIf { it.isNotEmpty() }
             ?.joinToString("\n\n")
-        // A tool chip is context, and a screenshot is pixels.
-        Message.Kind.ACTIVITY, Message.Kind.SCREEN -> null
+        // A tool chip is context, a screenshot is pixels, a digest is a log line.
+        Message.Kind.ACTIVITY, Message.Kind.SCREEN, Message.Kind.DIGEST -> null
+        Message.Kind.COMPACTION -> message.compaction?.summary ?: message.text?.takeIf { it.isNotBlank() }
     }
 
     /**
@@ -484,6 +487,7 @@ object MessageActions {
      */
     fun editableText(message: Message): String? {
         if (message.role != Message.Role.USER || message.kind != Message.Kind.TEXT) return null
+        if (message.webhookContent != null) return null
         val raw = message.text ?: return null
         if (AttachedMessageContent.parse(raw).attachments.isNotEmpty()) return null
         return raw

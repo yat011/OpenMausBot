@@ -138,6 +138,11 @@ final class SpeechDictation: ObservableObject {
         }
         self.recognizer = recognizer
 
+        // Take ownership of the shared session before reconfiguring it:
+        // the audible voice note (if any) pauses here, and transcript
+        // playback stays off until teardown() returns the session.
+        VoiceNoteCenter.shared.beginInputOwnership(.dictation)
+
         let session = AVAudioSession.sharedInstance()
         // `.record` rather than `.playAndRecord`: this is composer
         // dictation, not a call, and holding the playback route would
@@ -245,6 +250,7 @@ final class SpeechDictation: ObservableObject {
         audioEngine = nil
         recognizer = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        VoiceNoteCenter.shared.endInputOwnership(.dictation)
     }
 
     private enum CaptureError: Error {

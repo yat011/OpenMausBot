@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -23,8 +23,16 @@ describe("routine delegation through the isolated harness", () => {
   const file = (threadId: string, extension: string) => join(fixture.info.dataDir, `${threadId}.${extension}`);
   const finish = (threadId: string) => writeFileSync(file(threadId, "gate"), "finish isolated turn");
   const dump = async (threadId: string) => {
-    await expect.poll(() => existsSync(file(threadId, "json")), { timeout: 15_000 }).toBe(true);
-    return JSON.parse(readFileSync(file(threadId, "json"), "utf8"));
+    let parsed: any;
+    await expect.poll(() => {
+      try {
+        parsed = JSON.parse(readFileSync(file(threadId, "json"), "utf8"));
+        return true;
+      } catch {
+        return false;
+      }
+    }, { timeout: 15_000 }).toBe(true);
+    return parsed;
   };
   const runState = async (id: string) => (await api("GET", "/api/routines")).runs.find((run: any) => run.id === id);
   const messages = async (threadId: string) => (await api("GET", `/api/threads/${threadId}/messages?limit=100`)).messages as any[];
@@ -67,7 +75,8 @@ describe("routine delegation through the isolated harness", () => {
   afterEach(async () => {
     if (!fixture) return;
     const path = `${fixture.info.logPath}.json`;
-    writeFileSync(path, JSON.stringify({ evidence, final: await api("GET", "/api/routines").catch(() => null) }, null, 2));
+    writeFileSync(path, JSON.stringify({ evidence, final: await api("GET", "/api/routines").catch(() => null),
+      bots: await api("GET", "/api/bots?messages=0").catch(() => null) }, null, 2));
     console.info(JSON.stringify({ logPath: fixture.info.logPath, evidencePath: path }));
     await fixture.close();
   });
@@ -119,8 +128,8 @@ describe("routine delegation through the isolated harness", () => {
     await dump("probe");
     await expect.poll(async () => (await runState(run.id))?.status).toBe("waiting");
 
-    // The source thread is idle, but startTurn's later bot-wide admission
-    // check rejects its wake. Keep that condition deterministic across drains.
+    // The source thread is idle, but every shared bot slot is occupied.
+    // Keep that condition deterministic across repeated wake drains.
     const occupiedThreads: string[] = [];
     for (let index = 0; index < capacity; index++) {
       const { task } = await api("POST", `/api/bots/${source.id}/tasks`, { title: `Occupied ${index}` });
@@ -146,17 +155,22 @@ describe("routine delegation through the isolated harness", () => {
     }
 
     if (resume === "raise") await api("PATCH", "/api/config", { threads: { maxConcurrentPerBot: capacity + 1 } });
-    else finish(occupiedThreads[0]);
+    else {
+      finish(occupiedThreads[0]);
+      await expect.poll(async () => {
+        const bot = (await api("GET", "/api/bots?messages=0")).bots.find((bot: any) => bot.id === source.id);
+        return bot.tasks.find((task: any) => task.threadId === occupiedThreads[0]).busy;
+      }, { timeout: 15_000 }).toBe(false);
+    }
     await expect.poll(async () => (await runState(run.id))?.status, { timeout: 15_000 }).toBe("completed");
     expect((await runState(run.id)).output).toContain("[A delegated task just completed]");
-    if (resume === "raise") {
-      const bot = (await api("GET", "/api/bots")).bots.find((bot: any) => bot.id === source.id);
-      expect(bot.tasks.find((task: any) => task.threadId === occupiedThreads[0]).busy).toBe(true);
-    }
+    const bot = (await api("GET", "/api/bots?messages=0")).bots.find((bot: any) => bot.id === source.id);
+    expect(occupiedThreads.map(threadId => bot.tasks.find((task: any) => task.threadId === threadId).busy))
+      .toEqual(resume === "raise" ? [true] : [false, true, true]);
     evidence.push({ busyRetriesPreservedWakeBudget: true, capacity, resume, runId: run.id, transcript: await messages(run.threadId) });
   }, 60_000);
 
-  it("resumes a new user's delegation on a completed routine's execution thread", async () => {
+  it("coordinates a new user request on a completed routine's thread without changing its recorded result", async () => {
     const run = await start();
     finish(run.threadId);
     await expect.poll(async () => (await runState(run.id))?.status, { timeout: 15_000 }).toBe("completed");
@@ -168,11 +182,22 @@ describe("routine delegation through the isolated harness", () => {
     unlinkSync(file(run.threadId, "gate"));
     unlinkSync(file(run.threadId, "json"));
     await api("POST", `/api/bots/${source.id}/messages`, { threadId: run.threadId, text: "A new request: ask the peer for a fresh report." });
-    await delegate(run.threadId);
+    const launched = await dump(run.threadId);
+    const coordinated = await api("POST", "/api/internal/coordinate-bots", {
+      botIds: [peer.id], requestKey: "fresh-report", message: "Produce a fresh fixture report.",
+    }, launched.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN);
+    expect(coordinated.accepted).toHaveLength(1);
+    const requestId = coordinated.accepted[0].requestId;
+    const handoff = () => JSON.parse(readFileSync(join(fixture.info.dataDir, "room-handoffs.json"), "utf8"))
+      .find((node: any) => node.id === requestId);
     finish(run.threadId);
+    await dump(handoff().threadId);
+    finish(handoff().threadId);
     await expect.poll(async () => (await messages(run.threadId)).some(
-      (message) => message.role === "bot" && message.text?.includes("[A delegated task just completed]"),
+      (message) => message.from?.botId === peer.id && message.roomRequest?.id === requestId && message.roomRequest.phase === "result",
     ), { timeout: 20_000 }).toBe(true);
+    await control(["wait", "--bot", source.id, "--task", run.threadId]);
+    expect(handoff().status).toBe("completed");
     expect(await runState(run.id)).toMatchObject({ status: "completed", finishedAt: finished.finishedAt, output: finished.output });
     evidence.push({ reusedCompletedExecution: true, transcript: await messages(run.threadId) });
   }, 45_000);
@@ -207,6 +232,9 @@ describe("routine delegation through the isolated harness", () => {
     // provider fleet; it makes no credential probe or external request.
     await api("PUT", "/api/config", { composio: { apiKey: "" } });
     await expect.poll(async () => (await runState(run.id))?.status).toBe("failed");
+    const health = (await api("GET", "/api/routines")).routines.find((routine: any) => routine.id === run.routineId);
+    expect(health.failureStreak).toBe(1);
+    evidence.push({ failedRunHealth: health });
     expect(JSON.parse(readFileSync(pendingFile, "utf8"))[run.threadId]).toBeUndefined();
     unlinkSync(file(run.threadId, "json"));
     await api("POST", `/api/bots/${source.id}/messages`, { threadId: run.threadId, text: "New unrelated work after the failed routine." });
@@ -238,7 +266,7 @@ describe("routine delegation through the isolated harness", () => {
     await control(["wait", "--bot", source.id, "--task", run.threadId]);
     const transcript = await messages(run.threadId);
     expect(transcript.some((message) => message.text?.includes("[A delegated task just completed]"))).toBe(false);
-    expect((await runState(run.id)).status).toBe("cancelled");
+    await expect.poll(async () => (await runState(run.id))?.status, { timeout: 10_000 }).toBe("cancelled");
     evidence.push({ cancelledPeerDidNotResumeNewUserTurn: true, transcript });
   }, 45_000);
 });

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { JsonValue } from "../../server/schema.ts";
+import type { JsonValue } from "../../shared/json";
 
 export interface LocalVmWorkspaceBot {
   id: string;

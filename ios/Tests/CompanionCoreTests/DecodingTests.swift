@@ -530,6 +530,33 @@ final class DecodingTests: XCTestCase {
         }
     }
 
+    func testDecodesAThreadABotClosedAndOneStillOpen() throws {
+        // close_thread stamps who closed a thread; an open thread — and every
+        // thread from an older computer — has no stamp and decodes as open.
+        let closed = try JSONDecoder().decode(BotTask.self, from: Data("""
+        {"threadId":"t2","title":"Ship it","createdAt":1,
+         "openedBy":{"botId":"pm","name":"Parker","at":2},
+         "closedBy":{"botId":"pm","name":"Parker","at":9}}
+        """.utf8))
+        XCTAssertEqual(closed.closedBy?.botId, "pm")
+        XCTAssertEqual(closed.closedBy?.name, "Parker")
+        XCTAssertEqual(closed.closedBy?.at, 9)
+        XCTAssertTrue(closed.isClosed)
+        XCTAssertEqual(closed.bylineLabel, "closed by Parker", "closed outranks opened on the one byline")
+
+        let open = try JSONDecoder().decode(
+            BotTask.self,
+            from: Data(#"{"threadId":"t1","title":"","createdAt":1,"openedBy":{"botId":"pm","name":"Parker","at":2}}"#.utf8)
+        )
+        XCTAssertNil(open.closedBy)
+        XCTAssertFalse(open.isClosed)
+        XCTAssertEqual(open.bylineLabel, "opened by Parker")
+        XCTAssertNil(try JSONDecoder().decode(BotTask.self, from: Data(#"{"threadId":"t1","title":"","createdAt":1}"#.utf8)).bylineLabel)
+        for task in try decode(Fleet.self, "bots-paged").bots.flatMap({ $0.tasks ?? [] }) {
+            XCTAssertFalse(task.isClosed, task.threadId)
+        }
+    }
+
     func testAThreadOpenedByABotSaysSoInTheList() throws {
         // Same words as the desktop's thread list, so a person reading both
         // screens reads one sentence.
@@ -711,6 +738,28 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(message.kind, .unknown)
         // and keeps what it can show
         XCTAssertEqual(message.text, "Stripe fired")
+    }
+
+    // A digest is known, not new: it must not take the unknown-kind path,
+    // which draws any text it carries as a message bubble.
+    func testADigestIsNotAnUnknownKind() throws {
+        let json = """
+        {"id":"m1","role":"bot","kind":"digest","at":1,"text":"[digest] · tools: shell ×1"}
+        """
+        let message = try JSONDecoder().decode(Message.self, from: Data(json.utf8))
+        XCTAssertNotEqual(message.kind, .unknown)
+    }
+
+    func testACompactionMessageDecodesItsRecord() throws {
+        let json = """
+        {"id":"c1","role":"bot","kind":"compaction","at":1,"text":"[compaction] Earlier: …",
+         "compaction":{"summary":"Earlier: the user asked for X.","firstKeptId":"c1","tokensBefore":12345,"by":"person"}}
+        """
+        let message = try JSONDecoder().decode(Message.self, from: Data(json.utf8))
+        XCTAssertEqual(message.kind, .compaction)
+        XCTAssertEqual(message.compaction?.summary, "Earlier: the user asked for X.")
+        XCTAssertTrue(message.compaction?.chipText.hasPrefix("Context compacted · ") == true)
+        XCTAssertTrue(message.compaction?.chipText.hasSuffix("345 tokens summarised") == true)
     }
 
     func testAnUnknownRoleIsNotAttributedToYou() throws {

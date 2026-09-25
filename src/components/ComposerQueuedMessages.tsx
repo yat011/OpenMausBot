@@ -1,5 +1,6 @@
 import { CornerDownRight, Trash2 } from "lucide-react";
 
+import type { SteerQueueReason } from "../../shared/wire";
 import { t } from "@/lib/i18n";
 
 export function composerCanSteerQueuedMessages(
@@ -9,6 +10,37 @@ export function composerCanSteerQueuedMessages(
   approvalPending = false,
 ): boolean {
   return busy && !locked && !approvalPending && pendingCount > 0;
+}
+
+/** How long a just-queued chip accepts a second Enter as "steer it now". */
+export const DOUBLE_ENTER_STEER_WINDOW_MS = 1_500;
+
+/** A new chip on a busy steer-capable thread opens the double-Enter
+ * window: the words queued because the live steer lost its race (or carried
+ * an attachment) can still join the running turn without interrupting it.
+ * Rooms and 1:1 threads share the gesture; capability, not the surface,
+ * decides whether it applies.
+ * Returns the window's expiry, or null when the gesture does not apply. */
+export function doubleEnterSteerWindowExpiresAt(
+  prevPendingCount: number,
+  pendingCount: number,
+  busy: boolean,
+  canSteer: boolean,
+  now = Date.now(),
+): number | null {
+  if (!busy || !canSteer) return null;
+  return pendingCount > prevPendingCount ? now + DOUBLE_ENTER_STEER_WINDOW_MS : null;
+}
+
+/** Whether an Enter press is the second one: empty composer, a chip waiting,
+ * and inside the window opened when that chip arrived. */
+export function doubleEnterSteersQueue(
+  windowExpiresAt: number,
+  now: number,
+  pendingCount: number,
+  hasContent: boolean,
+): boolean {
+  return !hasContent && pendingCount > 0 && now < windowExpiresAt;
 }
 
 /** Messages held by the harness until the running turn settles.
@@ -23,12 +55,16 @@ export function QueuedComposerMessages({
   onSteer,
   steerMode = "all",
   steering = false,
+  steerInterrupts = false,
   onCancel,
 }: {
-  items: Array<{ queueId: string; text: string; reason?: "capacity" }>;
+  items: Array<{ queueId: string; text: string; reason?: SteerQueueReason }>;
   onSteer?: () => void;
   steerMode?: "all" | "next";
   steering?: boolean;
+  /** True when Steer is backed by an interrupt (engine without live steer):
+   * the hint must say what the click really does. */
+  steerInterrupts?: boolean;
   onCancel: (queueId: string) => void;
 }) {
   if (!items.length) return null;
@@ -41,11 +77,17 @@ export function QueuedComposerMessages({
         ? t("composer.queued.steerAll")
         : t("composer.queued.steerNext")
       : t("composer.queued.steer");
-  const steerDescription = multiple
-    ? steerMode === "all"
-      ? t("composer.queued.steerAllHint", { count: items.length })
-      : t("composer.queued.steerNextHint")
-    : t("composer.queued.steerHint");
+  const steerDescription = steerInterrupts
+    ? multiple
+      ? steerMode === "all"
+        ? t("composer.queued.steerAllInterruptHint", { count: items.length })
+        : t("composer.queued.steerNextInterruptHint")
+      : t("composer.queued.steerInterruptHint")
+    : multiple
+      ? steerMode === "all"
+        ? t("composer.queued.steerAllHint", { count: items.length })
+        : t("composer.queued.steerNextHint")
+      : t("composer.queued.steerHint");
 
   return (
     <div
@@ -57,6 +99,9 @@ export function QueuedComposerMessages({
       }
       aria-live="polite"
     >
+      {items.some((item) => item.reason === "group-turn") && (
+        <p className="px-3 pt-2 text-[12px] text-ink-secondary">{t("composer.queued.groupTurn")}</p>
+      )}
       {items.some((item) => item.reason === "capacity") && (
         <p className="px-3 pt-2 text-[12px] text-ink-secondary">{t("composer.queued.capacity")}</p>
       )}

@@ -17,7 +17,6 @@ import {
   VM_WORKSPACE_DIR,
   VM_WORKSPACE_GUEST,
   WORKSPACE_LABEL,
-  computerProxyEnv,
   containerComputerAction,
   containerComputerFrame,
   containerComputerMcp,
@@ -34,6 +33,7 @@ import {
   setupCommands,
   type CommandRunner,
   type LocalVmTarget,
+  autoLocalVmAttachable,
 } from "./container-computer.ts";
 
 function runner(responses: Record<string, string | Error>) {
@@ -454,7 +454,7 @@ describe("containerComputerStatus", () => {
 
     expect(status.persistence).toBe("unsafe");
     expect(status.ready).toBe(false);
-    expect(status.problem).toContain("durable workspace");
+    expect(status.problem).toBe("The existing Local VM is missing its durable folder; recreate it");
   });
 
   it("does not mistake an unrelated container executable for Apple container off macOS", async () => {
@@ -604,13 +604,6 @@ describe("containerComputerStatus", () => {
 });
 
 describe("Cua integration", () => {
-  it("hands cloud credentials only to the isolated remote adapter", () => {
-    expect(computerProxyEnv({ boxId: "bx_1", token: "t" })).toEqual({
-      OGB_BOX_ID: "bx_1",
-      OGB_BOX_TOKEN: "t",
-    });
-  });
-
   it("mounts the official Cua MCP server for Local VM turns", () => {
     const connection = containerComputerMcp("podman");
     expect(connection.command).toBe(process.execPath);
@@ -990,5 +983,19 @@ describe("localVmRecreatableOnDemand", () => {
 
     expect(status.image).toBe(false);
     expect(localVmRecreatableOnDemand(status)).toBe(false);
+  });
+});
+
+describe("Auto's Local VM eligibility", () => {
+  const base = { runtime: "podman", daemonUp: true, image: true, container: "missing", create_supported: true, ready: false } as unknown as Parameters<typeof autoLocalVmAttachable>[0];
+  it("attaches a ready desktop or one whose prepared image can be recreated, and nothing else", () => {
+    expect(autoLocalVmAttachable({ ...base, ready: true, container: "running" })).toBe(true);
+    expect(autoLocalVmAttachable(base)).toBe(true);
+    // never a first-time setup, a stopped image that cannot resume, or a dead daemon
+    expect(autoLocalVmAttachable({ ...base, image: false })).toBe(false);
+    expect(autoLocalVmAttachable({ ...base, daemonUp: false })).toBe(false);
+    expect(autoLocalVmAttachable({ ...base, container: "stopped" })).toBe(false);
+    expect(autoLocalVmAttachable({ ...base, runtime: null })).toBe(false);
+    expect(autoLocalVmAttachable({ ...base, create_supported: false })).toBe(false);
   });
 });

@@ -51,6 +51,51 @@ distinguishes window delivery from full-desktop input. OMB retains its existing
 CUA driver, permission broker, and human-control gate rather than importing
 OpenClaw's application-specific gateway or unrestricted authorization policy.
 
+## Windows local control
+
+`pnpm build:cua:win && pnpm smoke:cua-win` on Windows x64 stages the pinned
+0.28.2 executable and matching SDK, loads the packaged native-library bundle,
+starts an embedded host, then proves its child exits after Stop. CI runs this
+on a disposable Windows runner with telemetry disabled and a bounded timeout.
+The smoke does not capture a screen or send input.
+
+Packaging retains the original `cua-driver.exe` for the stdio MCP proxy and
+derives `cua-driver-background.exe` for the embedded daemon. The pinned native
+SDK owns process creation and has no `windowsHide` option. The derived copy
+uses the Windows GUI subsystem, with identical executable sections and entry
+point. Its obsolete upstream signature is removed, and its PE checksum is
+recalculated; the upstream CLI remains byte-for-byte intact. The conversion
+rejects unsupported architectures, truncated images, and non-trailing
+certificate tables. This is a package build step, never an installed-file edit.
+See Microsoft's [PE format reference](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format).
+
+The smoke compares the complete derived image, checks via Windows
+`AttachConsole` that the running daemon has **no console**, initializes MCP
+through the original CLI, lists tool definitions, and stops the owned daemon.
+The console probe runs in its own hidden PowerShell process and touches only
+the smoke's child. It does not prove an entire NSIS install/update flow or
+custom `CUA_DRIVER_PATH` executables. An explicit override remains untouched;
+an incomplete installed package reports a missing-driver error rather than
+silently falling back to the console binary.
+
+The portable conversion checks use synthetic inert PE data:
+
+```sh
+pnpm exec vitest run scripts/cua-windows-background.test.mjs \
+  electron/cua-windows-isolation.test.mjs electron/cua-launch.test.mjs
+```
+
+`pnpm exec vitest run electron/cua-windows-isolation.test.mjs` exercises the
+Windows branch with a disposable directory and mocked SDK: private embedded
+startup, failed host, cancellation, replacement isolation, shutdown,
+and development binary discovery. It refuses macOS permission imports and any
+unowned daemon launch or foreign-pipe probe. macOS keeps its existing fallback.
+
+Release packaging calls `build:cua:win` automatically. This proves startup and
+transport ownership, not arbitrary Windows input, elevated/UAC screens, or
+background focus behavior; those still require a disposable interactive
+Windows desktop acceptance test.
+
 ## Separate native focus issue
 
 CUA's [background contract](https://cua.ai/docs/concepts/the-no-foreground-contract)

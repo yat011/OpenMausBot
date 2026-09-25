@@ -19,8 +19,10 @@ switching and Stop can be exercised without a real provider or account.
    rows should show Working. Changing the selection must not move messages.
 3. Stop iCloud. Gmail must remain Working; its Stop control still targets Gmail.
 4. In an idle thread, change its model. Select a sibling and return; each
-   should retain its own choice. Model/account/approval controls apply to the
-   visible thread, not all conversations belonging to the bot.
+   should retain its own choice. The model picker defaults to **This bot**:
+   it updates the visible thread plus the default for groups and new threads,
+   not existing siblings. Choose **Only this thread** for an independent
+   model/account/effort override. Approval controls remain thread-scoped.
 5. Rename a thread through its row menu. Remove the Email folder through its
    settings and confirm **Delete folder, keep threads**. Histories and model
    selections must remain, now directly beneath Pepper.
@@ -68,6 +70,40 @@ switching and Stop can be exercised without a real provider or account.
     all histories/folders. Also toggle off/on without reloading and check that
     folder disclosure state survives. Check the Appearance switch in a narrow
     window and keyboard navigation through bot rows and activity controls.
+14. In a bot with only one completed thread, use its row menu → **Delete
+    thread** and confirm. The old transcript must disappear immediately and
+    one empty **New thread** must replace it, with the bot still selected.
+    Reload and send a new message: the old conversation must not return.
+    A running thread must still require Stop before deletion. Deleting a
+    conversation does not delete generated project files.
+15. Use a non-selected idle thread's menu → **Snooze → Until new activity**.
+    It should fold out of the normal list, remain searchable, and expose
+    **Stop snoozing** in its menu. Wake it and clear the search: the row
+    returns. Timed snoozes also return when due without a new server snapshot.
+    Pinned, selected, unread, queued, and working threads remain reachable.
+    Snooze is a display preference, not a pause or cancellation of work.
+16. Open **Active Threads** while a channel is working. Its entry should name
+    the channel and open that channel's exact thread, not a member's direct
+    chat. Direct-chat and channel activity can appear together.
+17. In compact/quiet rows, idle message previews disappear but working,
+    approval, teammate-wait, and queued status remain. One-thread bots and
+    channels have no duplicate child row until search makes it useful;
+    **New thread** stays on the owner row and **All threads** in the header.
+
+The snooze menu → hidden row → search → Stop snoozing flow and a working
+channel's Active Threads → channel-composer navigation passed on 2026-09-24
+in a disposable full-app Chromium fixture. HTTP tests exercise timestamp
+validation, explicit-null wake, persistence, and activity-sentinel clearing.
+Timer unit checks cover distant deadlines and render/effect expiry races.
+These checks do not prove native mobile UI or operating-system notifications.
+
+The last-thread walkthrough passed on 2026-09-13 in this disposable fixture:
+Miso completed a fake-provider turn, its only thread was deleted through the
+real confirmation dialog, the empty state survived reload, and a fresh send
+completed without the old messages. Pepper's existing threads were unchanged.
+Store/API regressions also verify fresh provider context, retained generated
+files and rejection of running/stale deletes. Renderer regressions cover both
+orders of the full response and slim event, including late old-thread messages.
 
 For approval verification, new fake-provider launches also write fixture-only
 `<thread-id>.launch.json` receipts inside the printed disposable data directory.

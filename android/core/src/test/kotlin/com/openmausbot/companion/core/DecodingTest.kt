@@ -335,6 +335,29 @@ class DecodingTest {
     }
 
     @Test
+    fun decodesVoiceProvidersWithTheServersFallback() {
+        fun provider(json: String) = CompanionJson.decodeFromString<ConfigStatus>(json).voiceProvider
+
+        assertEquals(VoiceProvider.ELEVENLABS, provider("""{"tts":{"configured":true,"provider":"elevenlabs"}}"""))
+        assertEquals(VoiceProvider.FISH, provider("""{"tts":{"configured":true,"provider":"fish"}}"""))
+        assertEquals(VoiceProvider.SYSTEM, provider("""{"tts":{"configured":false,"provider":"system"}}"""))
+        assertEquals(
+            VoiceProvider.CHATTERBOX,
+            provider("""{"tts":{"configured":true,"provider":"chatterbox","baseUrl":"http://127.0.0.1:4123"}}"""),
+        )
+        assertEquals(
+            VoiceProvider.ELEVENLABS,
+            provider("""{"tts":{"configured":true}}"""),
+            "an older desktop predates the field entirely",
+        )
+        assertEquals(
+            VoiceProvider.ELEVENLABS,
+            provider("""{"tts":{"configured":true,"provider":"cartesia"}}"""),
+            "an engine this build has never heard of falls back the way the server does",
+        )
+    }
+
+    @Test
     fun decodesEveryCapturedFrame() {
         val frames = decodeFixture<List<StreamFrame>>("sse-frames")
         assertTrue(frames.isNotEmpty())
@@ -393,6 +416,17 @@ class DecodingTest {
         )
         assertEquals(Message.Kind.UNKNOWN, message.kind)
         assertEquals("Stripe fired", message.text)
+    }
+
+    @Test
+    fun aCompactionMessageDecodesItsRecord() {
+        val message = CompanionJson.decodeFromString<Message>(
+            """{"id":"c1","role":"bot","kind":"compaction","at":1,"text":"[compaction] Earlier: …",
+               "compaction":{"summary":"Earlier: the user asked for X.","firstKeptId":"c1","tokensBefore":12345,"by":"person"}}""",
+        )
+        assertEquals(Message.Kind.COMPACTION, message.kind)
+        assertEquals("Earlier: the user asked for X.", message.compaction?.summary)
+        assertEquals(12345, message.compaction?.tokensBefore)
     }
 
     @Test
@@ -467,6 +501,79 @@ class DecodingTest {
         decodeFixture<Fleet>("bots-paged").bots.flatMap { it.tasks.orEmpty() }.forEach { task ->
             assertNull(task.openedBy, task.threadId)
         }
+    }
+
+    @Test
+    fun decodesAThreadABotClosedAndOneStillOpen() {
+        // close_thread stamps who closed a thread; an open thread — and every
+        // thread from an older computer — has no stamp and decodes as open.
+        val closed = CompanionJson.decodeFromString<BotTask>(
+            """{"threadId":"t2","title":"Ship it","createdAt":1,
+               "openedBy":{"botId":"pm","name":"Parker","at":2},
+               "closedBy":{"botId":"pm","name":"Parker","at":9}}""",
+        )
+        assertEquals(ThreadCloser("pm", "Parker", 9.0), closed.closedBy)
+        assertTrue(closed.isClosed)
+        assertEquals("closed by Parker", closed.bylineLabel())
+
+        val open = CompanionJson.decodeFromString<BotTask>(
+            """{"threadId":"t1","title":"","createdAt":1,"openedBy":{"botId":"pm","name":"Parker","at":2}}""",
+        )
+        assertNull(open.closedBy)
+        assertFalse(open.isClosed)
+        assertEquals("opened by Parker", open.bylineLabel())
+        assertNull(CompanionJson.decodeFromString<BotTask>("""{"threadId":"t1","title":"","createdAt":1}""").bylineLabel())
+        decodeFixture<Fleet>("bots-paged").bots.flatMap { it.tasks.orEmpty() }.forEach { task ->
+            assertFalse(task.isClosed, task.threadId)
+        }
+    }
+
+    @Test
+    fun decodesSnoozedUntilAsSentinelTimestampOrNothing() {
+        // 0 sleeps until activity, a timestamp sleeps until the clock passes
+        // it, and an older payload simply never slept.
+        val asleep = CompanionJson.decodeFromString<BotTask>(
+            """{"threadId":"t1","title":"","createdAt":1,"snoozedUntil":0}""",
+        )
+        assertEquals(0.0, asleep.snoozedUntil)
+        assertTrue(asleep.isSnoozed(now = 500L))
+
+        val timed = CompanionJson.decodeFromString<BotTask>(
+            """{"threadId":"t2","title":"","createdAt":1,"snoozedUntil":900}""",
+        )
+        assertEquals(900.0, timed.snoozedUntil)
+        assertTrue(timed.isSnoozed(now = 500L))
+        assertFalse(timed.isSnoozed(now = 901L))
+        assertEquals("Snoozed", timed.bylineLabel(now = 500L))
+
+        val awake = CompanionJson.decodeFromString<BotTask>("""{"threadId":"t3","title":"","createdAt":1}""")
+        assertNull(awake.snoozedUntil)
+        assertFalse(awake.isSnoozed(now = 500L))
+        decodeFixture<Fleet>("bots-paged").bots.flatMap { it.tasks.orEmpty() }.forEach { task ->
+            assertNull(task.snoozedUntil, task.threadId)
+        }
+    }
+
+    @Test
+    fun archivedMeansTheStampIsPresentEvenAtZero() {
+        // The task API accepts any epoch number, so archivedAt 0 is archived —
+        // the same presence rule the desktop's isArchived uses.
+        val atZero = CompanionJson.decodeFromString<BotTask>(
+            """{"threadId":"t1","title":"","createdAt":1,"archivedAt":0}""",
+        )
+        assertTrue(atZero.isArchived)
+        assertEquals("Archived", atZero.bylineLabel())
+
+        val never = CompanionJson.decodeFromString<BotTask>("""{"threadId":"t1","title":"","createdAt":1}""")
+        assertFalse(never.isArchived)
+        assertNull(never.bylineLabel())
+
+        val closedToo = CompanionJson.decodeFromString<BotTask>(
+            """{"threadId":"t1","title":"","createdAt":1,"archivedAt":5,
+               "closedBy":{"botId":"pm","name":"Parker","at":9}}""",
+        )
+        assertTrue(closedToo.isArchived)
+        assertEquals("closed by Parker", closedToo.bylineLabel())
     }
 
     @Test

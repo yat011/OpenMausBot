@@ -5,11 +5,12 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly; spawnCli
 // resolves it to `node <script>`, so these run everywhere.
+import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ensureDirs, NATIVE_DIR } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
@@ -24,6 +25,7 @@ import {
   PiDriver,
   preferPiInjectRows,
   splitPiModel,
+  updatePiModelCatalog,
 } from "./pi.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-pi-cli.ts");
@@ -98,20 +100,6 @@ describe("buildMcpServers", () => {
     });
   });
 
-  it("wraps the cloud computer in the computer-proxy spawn contract", () => {
-    const servers = buildMcpServers({
-      threadId: "t",
-      text: "hi",
-      integrations: {
-        computer: { kind: "box", boxId: "b1", token: "tok", control: { url: "http://c", token: "ct" } },
-      },
-    });
-    expect(servers?.computer).toMatchObject({
-      command: process.execPath,
-      args: [expect.stringContaining("computer-proxy")],
-      env: expect.objectContaining({ OGB_BOX_ID: "b1", OGB_BOX_TOKEN: "tok" }),
-    });
-  });
 
   it("passes a local computer (Cua/VPS) through as a direct stdio server", () => {
     const servers = buildMcpServers({
@@ -187,6 +175,45 @@ describe("PiDriver catalog (fake CLI)", () => {
       FAKE_PI_MODE: "no-models",
     });
     expect(catalog.options).toEqual([]);
+  });
+
+  it("updates pi's catalog only on explicit refresh, then probes it again", async () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-pi-update-"));
+    const dump = join(home, "launches.jsonl");
+    const instance = await PiDriver.create({
+      instanceId: "pi-refresh",
+      displayName: undefined,
+      environment: { HOME: home, FAKE_PI_DUMP: dump },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    try {
+      const startup = readFileSync(dump, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(startup.some((entry) => entry.argv?.[0] === "update")).toBe(false);
+
+      writeFileSync(dump, "");
+      await instance.refreshModels?.();
+      const refresh = readFileSync(dump, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(refresh.map((entry) => entry.argv)).toEqual([
+        ["update", "--models", "--no-approve"],
+        ["--mode", "rpc", "--no-session"],
+      ]);
+    } finally {
+      await instance.dispose();
+    }
+  });
+
+  it("reports update failure without preventing a cached catalog probe", async () => {
+    expect(await updatePiModelCatalog(FAKE_CLI, {
+      PATH: process.env.PATH ?? "",
+      FAKE_PI_MODE: "update-error",
+    })).toBe(false);
+    const catalog = await fetchPiModels(FAKE_CLI, {
+      PATH: process.env.PATH ?? "",
+      HOME: join(tmpdir(), "omb-pi-update-error"),
+      FAKE_PI_MODE: "update-error",
+    });
+    expect(catalog.options).toHaveLength(2);
   });
 });
 
@@ -301,6 +328,59 @@ describe("PiDriver turns (fake CLI)", () => {
       | { sessionId: string }
       | undefined;
     expect(secondSession?.sessionId).toBe(firstSession?.sessionId);
+  });
+
+  it("delivers the full prompt on every turn so compaction cannot strand the session", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-split-"));
+    const dump = join(dir, "dump.jsonl");
+    await create(undefined, { FAKE_PI_DUMP: dump });
+    // The receipt store is keyed by thread and session file, so a unique
+    // thread keeps the run hermetic against earlier suite executions.
+    const threadId = "t-pi-prompt-split-" + randomUUID();
+    const prompts = () =>
+      readFileSync(dump, "utf8").split("\n").filter(Boolean)
+        .map((line) => JSON.parse(line) as { prompt?: { message?: string } })
+        .filter((row) => row.prompt).map((row) => row.prompt!.message!);
+    const send = async (text: string, volatile: string, cursor?: string) => {
+      const { turnId } = await instance.adapter.sendTurn({
+        threadId,
+        text,
+        system: "Standing rules.\n\n" + volatile,
+        systemStable: "Standing rules.",
+        systemVolatile: volatile,
+        ...(cursor ? { resumeCursor: cursor } : {}),
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+      const session = recorder.events.find((e) => e.type === "session.started" && e.turnId === turnId) as { sessionId: string };
+      return { message: prompts().at(-1)!, cursor: session.sessionId };
+    };
+
+    // pi summarizes older user messages when it compacts, and the prompt
+    // rides a user message: every turn re-delivers it in full so a
+    // compacted session never loses its standing instructions.
+    const first = await send("first", "Memory: likes quiet hours.");
+    expect(first.message).toBe("Standing rules.\n\nMemory: likes quiet hours.\n\nfirst");
+    const second = await send("second", "Memory: moved to Toronto.", first.cursor);
+    expect(second.message).toBe("Standing rules.\n\nMemory: moved to Toronto.\n\nsecond");
+  });
+
+  it("keeps the full prompt when no session could be established", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-split-error-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("session-error", { FAKE_PI_DUMP: dump });
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-pi-prompt-split-error-" + randomUUID(),
+      text: "bare",
+      system: "Standing rules.\n\nMemory: likes quiet hours.",
+      systemStable: "Standing rules.",
+      systemVolatile: "Memory: likes quiet hours.",
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const message = readFileSync(dump, "utf8").split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line) as { prompt?: { message?: string } })
+      .find((row) => row.prompt)?.prompt?.message;
+    // Without a session the prompt is the model's only context.
+    expect(message).toBe("Standing rules.\n\nMemory: likes quiet hours.\n\nbare");
   });
 
   it("fails promptly when the pi process exits before replying", async () => {
@@ -436,11 +516,6 @@ describe("PiDriver turns (fake CLI)", () => {
     const servers = mcpRow!.mcpConfig!.mcpServers!;
     // composio passes through verbatim as a stdio server
     expect(servers.composio).toMatchObject({ command: "node", args: ["connector-proxy.js"], env: { COMPOSIO_KEY: "ck" } });
-    // the cloud computer wraps in the computer-proxy spawn contract
-    expect(servers.computer.args[0]).toContain("computer-proxy");
-    expect(servers.computer.env).toMatchObject({ OGB_BOX_ID: "b1", OGB_BOX_TOKEN: "bt" });
-    // the box token lives in the 0600 config file, never in argv
-    expect(JSON.stringify(mcpRow!.argv)).not.toContain("bt");
   });
 
   it("rides the toolUse auto-continue and only settles on the final end_turn", async () => {
@@ -451,6 +526,10 @@ describe("PiDriver turns (fake CLI)", () => {
     // a tool ran and completed, then pi auto-continued to synthesize the reply
     expect(recorder.events.filter((e) => e.type === "item.started").length).toBe(1);
     expect(recorder.events.filter((e) => e.type === "item.completed" && (e as { itemType: string }).itemType === "tool").length).toBe(1);
+    expect(recorder.events.find((event) => event.type === "item.started")).toMatchObject({ summary: "echo hi", input: expect.stringContaining("echo hi") });
+    expect(recorder.events.find((event) => event.type === "item.completed" && event.itemType === "tool")).toMatchObject({ output: expect.stringContaining('"text": "hi"') });
+    expect(JSON.stringify(recorder.events)).not.toContain("pi-input-secret");
+    expect(JSON.stringify(recorder.events)).not.toContain("pi-output-secret");
     expect(done).toMatchObject({ ok: true, stopReason: "end_turn" });
     expect((done as { usage: { input: number; output: number } }).usage).toEqual({ input: 12, output: 2 });
     const text = recorder.events.find(
@@ -551,6 +630,131 @@ describe("PiDriver turns (fake CLI)", () => {
     unsubscribe();
     const done = await recorder.until((event) => event.type === "turn.completed");
     expect(done).toMatchObject({ ok: true, stopReason: "end_turn" });
+  });
+
+  it("renders a select ask as a question with choices and returns the picked value", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-question-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("question-select", { FAKE_PI_DUMP: dump });
+    await instance.adapter.sendTurn({ threadId: "t-pi-select", text: "go" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({
+      requestType: "question",
+      summary: "Which color?",
+      choices: ["Blue", "Green"],
+      questions: [{ question: "Which color?", options: [{ label: "Blue" }, { label: "Green" }] }],
+    });
+    // Exactly what the tabbed QuestionCard submits: one Q:/A: block, not a
+    // bare option label.
+    const outcome = await instance.adapter.respondToRequest("t-pi-select", (opened as { requestId: string }).requestId, {
+      behavior: "answer",
+      message: "The user answered your questions.\n\nQ: Which color?\nA: Green",
+    });
+    expect(outcome).toBe("answered");
+    await recorder.until((e) => e.type === "turn.completed");
+    const rows = readFileSync(dump, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { uiResponse?: { id?: string; value?: string; cancelled?: boolean } });
+    expect(rows.find((row) => row.uiResponse)?.uiResponse).toMatchObject({ id: "ask-select", value: "Green" });
+  });
+
+  it("returns typed text verbatim for a free-text input ask", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-input-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("question-input", { FAKE_PI_DUMP: dump });
+    await instance.adapter.sendTurn({ threadId: "t-pi-input", text: "go" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ requestType: "question", summary: "Which city?" });
+    expect(opened).not.toHaveProperty("choices");
+    await instance.adapter.respondToRequest("t-pi-input", (opened as { requestId: string }).requestId, {
+      behavior: "answer",
+      message: "  Toronto  ",
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    const rows = readFileSync(dump, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { uiResponse?: { id?: string; value?: string } });
+    expect(rows.find((row) => row.uiResponse)?.uiResponse).toMatchObject({ id: "ask-input", value: "  Toronto  " });
+  });
+
+  it.each([false, true])("returns original capped options, refusing ambiguous display labels (%s)", async collision => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-capped-question-"));
+    const dump = join(dir, "dump.jsonl");
+    const label = "  Green ".repeat(30);
+    await create("question-select", { FAKE_PI_DUMP: dump,
+      FAKE_PI_QUESTION_OPTIONS: JSON.stringify([label, collision ? label + "other" : "Blue"]) });
+    await instance.adapter.sendTurn({ threadId: "t-pi-capped", text: "go" });
+    const opened = await recorder.until(e => e.type === "request.opened");
+    await instance.adapter.respondToRequest("t-pi-capped", (opened as { requestId: string }).requestId, {
+      behavior: "answer", message: `The user answered your questions.\n\nQ: Which color?\nA: ${label.trim().slice(0, 120)}`,
+    });
+    await recorder.until(e => e.type === "turn.completed");
+    const rows = readFileSync(dump, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+    expect(rows.find(row => row.uiResponse)?.uiResponse).toMatchObject(collision
+      ? { id: "ask-select", cancelled: true } : { id: "ask-select", value: label });
+  });
+
+  it("denies an ask by cancelling the protocol request", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-deny-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("question-select", { FAKE_PI_DUMP: dump });
+    await instance.adapter.sendTurn({ threadId: "t-pi-deny", text: "go" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    const outcome = await instance.adapter.respondToRequest("t-pi-deny", (opened as { requestId: string }).requestId, {
+      behavior: "deny",
+    });
+    expect(outcome).toBe("rejected");
+    const resolved = await recorder.until((e) => e.type === "request.resolved");
+    expect(resolved).toMatchObject({ behavior: "deny", source: "user" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const rows = readFileSync(dump, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { uiResponse?: { id?: string; cancelled?: boolean } });
+    expect(rows.find((row) => row.uiResponse)?.uiResponse).toMatchObject({ id: "ask-select", cancelled: true });
+  });
+
+  it("cancels an unanswered ask after 15 minutes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-timeout-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("question-select", { FAKE_PI_DUMP: dump });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-pi-timeout", text: "go" });
+      const opened = await recorder.until((e) => e.type === "request.opened");
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      const resolved = await recorder.until((e) => e.type === "request.resolved" && e.requestId === opened.requestId);
+      expect(resolved).toMatchObject({ behavior: "deny", source: "timeout" });
+      await recorder.until((e) => e.type === "turn.completed");
+      const rows = readFileSync(dump, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { uiResponse?: { id?: string; cancelled?: boolean } });
+      expect(rows.find((row) => row.uiResponse)?.uiResponse).toMatchObject({ id: "ask-select", cancelled: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels an ask's fail-safe timer when the turn is interrupted", async () => {
+    await create("question-select");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-ask-interrupt", text: "go" });
+      await recorder.until((e) => e.type === "request.opened");
+      await instance.adapter.interruptTurn("t-ask-interrupt");
+      await recorder.until((e) => e.type === "turn.completed");
+      // Flush the short-lived RPC waiter timers, then require that nothing
+      // is left queued: settle() cancels the ask's 15-minute fail-safe
+      // outright instead of leaving it to fire against a dead child while
+      // holding the ask closure alive.
+      await vi.advanceTimersByTimeAsync(21_000);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("respondToRequest is unavailable for an ask that is not pending", async () => {

@@ -4,12 +4,13 @@
 // logo → favicon → monogram.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Loader2, RefreshCw, Search, TriangleAlert, X } from "lucide-react";
-import { api, useStore } from "@/state/store";
+import { api, useStore, type Bot, type InstanceInfo } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
 import type { LocaleKey } from "@/locales";
 import { readCachedInventory, writeCachedInventory } from "@/lib/connected-apps-cache";
 import { managedConnectorUnavailableReason } from "../../shared/connector-availability";
+import { isConnectorToolGrantShape } from "@/lib/connector-grants";
 import { McpServersPanel } from "./McpServersPanel";
 
 export interface ToolkitCard {
@@ -87,8 +88,43 @@ export function disconnectAccountConfirmation(
   return t("connectors.disconnectConfirm", { identity, service });
 }
 
-export function connectedAppsMayDisconnect(remoteClient: boolean): boolean {
-  return !remoteClient;
+/** Bots that cannot see the workspace's connected apps because their own
+ * per-bot grant is off. Connecting an app is only half of it: a bot a Chief
+ * of Staff created, a package brought in, or a backup restored starts with
+ * that grant off, and until it is on the bot is never told the tools exist
+ * and reaches for a browser instead — with nothing on screen saying why.
+ * Bots whose engine cannot mount the tools at all are left out, because
+ * their switch is disabled: naming them would move the dead end, not end it.
+ * Hidden bots are left out for the same reason — the person cannot act on
+ * one from here. */
+export function botsMissingConnectedApps(bots: Bot[], instances: InstanceInfo[]): Bot[] {
+  return bots.filter((bot) =>
+    !bot.hidden &&
+    bot.composio === false &&
+    instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId)
+      ?.capabilities?.composioMcp === true);
+}
+
+/** Bots whose connector tool grants limit this service below every tool —
+ * a partial list, no entry at all inside an explicit record, or a grant
+ * shape this build cannot read. Legacy bots (no grants record) have every
+ * tool and never appear. Engines that cannot mount the tools and hidden
+ * bots are left out: their editors are dead ends from here. */
+export function botsWithLimitedServiceTools(bots: Bot[], instances: InstanceInfo[], slug: string): Bot[] {
+  return bots.filter((bot) => {
+    if (bot.hidden || bot.composio === false) return false;
+    if (!instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId)
+      ?.capabilities?.composioMcp) return false;
+    const record: unknown = bot.connectorTools;
+    if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+    const grant = (record as Record<string, unknown>)[slug];
+    if (grant === undefined) return true;
+    return !isConnectorToolGrantShape(grant) || grant.tools !== "*";
+  });
+}
+
+export function hasUsableConnectedApps(configured: boolean, phase: ConnectorInventoryPhase, stale: boolean, status: Record<string, ConnectorStatus>): boolean {
+  return configured && phase === "ready" && !stale && Object.values(status).some((service) => service.connected);
 }
 
 export function requiresAccountAlias(message: string) {
@@ -212,15 +248,24 @@ export function ServiceIcon({ card, className = "size-11" }: { card: Pick<Toolki
   );
 }
 
+/** Catalog completeness, as reported by /api/connectors/catalog. Absent
+ * totalItems means upstream never stated a total, so there is nothing to
+ * compare the served cards against. */
+export interface CatalogPagination {
+  items: number;
+  totalItems?: number;
+  stalled: boolean;
+}
+
 export function PluginsPanel() {
   const { state, dispatch } = useStore();
   const remoteClient = window.ogb?.remoteClient?.active === true;
-  const mayDisconnect = connectedAppsMayDisconnect(remoteClient);
   const dialogRef = useRef<HTMLDivElement>(null);
   const surface = state.pluginsSurface;
   const [cards, setCards] = useState<ToolkitCard[] | null>(null);
   const [source, setSource] = useState<"api" | "curated">("curated");
-  const [configured, setConfigured] = useState(true);
+  const [pagination, setPagination] = useState<CatalogPagination | null>(null);
+  const [configured, setConfigured] = useState(false);
   const [mode, setMode] = useState<"managed" | "self-hosted" | "unavailable">("unavailable");
   // Paint what we last knew before any request goes out: the module cache if
   // this window already fetched, otherwise the inventory saved on disk. An
@@ -349,6 +394,7 @@ export function PluginsPanel() {
         if (!alive) return;
         setCards(r.cards ?? []);
         setSource(r.source ?? "curated");
+        setPagination(r.pagination ?? null);
         setConfigured(Boolean(r.configured));
         setMode(r.mode ?? "unavailable");
       })
@@ -494,6 +540,10 @@ export function PluginsPanel() {
   const connectedCount = Object.values(status).filter((service) => service.connected || service.accounts?.length).length;
   const connectedEmptyCopy = connectedInventoryCopy(inventoryPhase);
   const close = () => dispatch({ type: "togglePlugins", open: false });
+  // Only worth saying once an app is actually connected and reachable.
+  const botsWithoutApps = hasUsableConnectedApps(configured, inventoryPhase, stale, status)
+    ? botsMissingConnectedApps(state.bots, state.instances)
+    : [];
 
   return (
     <div
@@ -622,6 +672,24 @@ export function PluginsPanel() {
             </button>
           </div>
         )}
+        {botsWithoutApps.length > 0 && (
+          <div className="mx-6 mb-1 rounded-xl bg-inset px-4 py-3 text-[12.5px] leading-relaxed text-ink-secondary sm:mx-8">
+            <span className="font-medium text-ink">{t("connectors.perBot.title")}</span>{" "}
+            {t("connectors.perBot.body")}
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {botsWithoutApps.map((candidate) => (
+                <button
+                  key={candidate.id}
+                  type="button"
+                  onClick={() => dispatch({ type: "updateBot", botId: candidate.id, patch: { composio: true } })}
+                  className="rounded-full bg-control px-2.5 py-1 text-[11.5px] font-medium text-ink hover:bg-raised-hover"
+                >
+                  {t("connectors.perBot.allow", { name: candidate.name })}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {configured && !remoteClient && source === "curated" && mode === "self-hosted" && (
           <div className="mx-6 mb-1 text-[12px] text-ink-secondary sm:mx-8">
             {t("connectors.featuredBefore")}{" "}
@@ -652,6 +720,17 @@ export function PluginsPanel() {
                   : search
                     ? t("connectors.section.results")
                     : t("connectors.section.available")}
+                {tab === "marketplace" && !search && pagination
+                  && (pagination.stalled || (pagination.totalItems !== undefined && pagination.items < pagination.totalItems)) && (
+                  <span className="ml-2 font-normal">
+                    {pagination.totalItems !== undefined && pagination.items < pagination.totalItems
+                      ? t("connectors.marketplace.partialCount", {
+                        shown: pagination.items.toLocaleString(),
+                        total: pagination.totalItems.toLocaleString(),
+                      })
+                      : t("connectors.marketplace.partialStalled")}
+                  </span>
+                )}
               </div>
               <div className="grid grid-cols-1 gap-x-10 md:grid-cols-2">
               {visible.map((card) => {
@@ -746,28 +825,52 @@ export function PluginsPanel() {
                                 {account.alias ? `${account.id} · ` : ""}{account.status.toLowerCase()}
                               </div>
                             </div>
-                            {mayDisconnect && (
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => {
-                                  if (!window.confirm(disconnectAccountConfirmation(card.label, account))) return;
-                                  disconnectAccount(card.slug, account.id);
-                                }}
-                                className="rounded-md px-2 py-1 text-[11px] text-ink-secondary transition-colors hover:bg-danger/10 hover:text-danger disabled:opacity-40"
-                                aria-label={t("connectors.disconnectAria", {
-                                  account: account.alias || account.id,
-                                  service: card.label,
-                                })}
-                              >
-                                {t("connectors.disconnect")}
-                              </button>
-                            )}
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => {
+                                if (!window.confirm(disconnectAccountConfirmation(card.label, account))) return;
+                                disconnectAccount(card.slug, account.id);
+                              }}
+                              className="rounded-md px-2 py-1 text-[11px] text-ink-secondary transition-colors hover:bg-danger/10 hover:text-danger disabled:opacity-40"
+                              aria-label={t("connectors.disconnectAria", {
+                                account: account.alias || account.id,
+                                service: card.label,
+                              })}
+                            >
+                              {t("connectors.disconnect")}
+                            </button>
                           </div>
                         );
                       })}
                     </div>
                   )}
+                  {(serviceStatus?.connected || included) && (() => {
+                    const limited = botsWithLimitedServiceTools(state.bots, state.instances, card.slug);
+                    if (!limited.length) return null;
+                    const names = limited.slice(0, 4).map((candidate, index) => (
+                      <span key={candidate.id}>
+                        {index > 0 && ", "}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            close();
+                            dispatch({ type: "toggleSettings", open: true, botId: candidate.id, section: "access" });
+                          }}
+                          className="font-medium text-ink underline underline-offset-2 hover:text-accent-text"
+                        >
+                          {candidate.name}
+                        </button>
+                      </span>
+                    ));
+                    return (
+                      <div className="ml-14 mt-2 text-[11px] leading-relaxed text-ink-secondary">
+                        <span>{t("connectors.grants.limited", { count: limited.length })}</span>{" "}
+                        {names}
+                        {limited.length > 4 && <span>{t("connectors.grants.more", { count: limited.length - 4 })}</span>}
+                      </div>
+                    );
+                  })()}
                   {addingAccount && (
                     <form
                       className="ml-14 mt-3 flex items-center gap-2"

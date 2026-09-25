@@ -70,6 +70,36 @@ The old whole-file `PUT /api/bots/:id/memory` still works for one release; it
 has no hash check, so it can overwrite what the bot just wrote. Clients should
 move to `PUT /api/bots/:id/memory/file` with `expectedHash`.
 
+## What a bot knows about its other conversations
+
+A bot's 1:1 chats and its rooms are separate conversations, and its memory
+holds only what stays true — so on its own, a bot answering in a room had no
+idea what it did in its 1:1 an hour earlier, and a morning standup ended in
+guesses. Three things close that gap without attaching transcripts:
+
+- **The recent-work brief.** Every turn's system prompt, 1:1 or room, carries
+  a short block: the newest thing the bot said in each of its *other*
+  conversations over the last two days — `today 09:05 · 1:1 with Milind ·
+  "Invoice reconciliation" · you said: "Sent the three flagged invoices…"`.
+  At most ten lines and about 350 tokens; the current conversation is not
+  listed. When a brief in a room names a private 1:1 chat, the room gets a
+  chip — *Lead's recent-work brief covers 1 private chat with you* — once per
+  chat, the same rule as recalled messages.
+- **One log line per finished turn.** The harness appends what the bot said
+  last, the tools it used, and whether the turn failed to
+  `memory/log/YYYY-MM-DD.md`, sourced to the chat or room. The log is never
+  loaded into a prompt; `session_search` finds it.
+- **Recall by time.** `session_search` takes `since` (`"24h"`, `"3d"`,
+  `"yesterday"`, or a date) and `until`, with or without words, and covers
+  the rooms the bot is a member of as well as its 1:1 tasks. "What happened
+  since yesterday's standup" needs no keyword. Hits name the room or task
+  they came from; a private chat recalled into a room is marked, and the
+  room is told.
+
+A daily standup is then a room routine: the chief asks, each member answers
+from its brief and pulls detail with `session_search since`, and what was
+agreed shows up in each member's next 1:1 brief.
+
 ## The journal
 
 Every change to a memory file that the app can see is recorded — yours from

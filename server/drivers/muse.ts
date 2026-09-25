@@ -28,6 +28,7 @@ import type { ApprovalMode } from "../../shared/approval-mode.ts";
 import type {
   DriverCreateInput,
   EffortLevel,
+  McpServerSpec,
   ModelCatalog,
   ProviderDriver,
   ProviderInstance,
@@ -35,6 +36,7 @@ import type {
   RuntimeEvent,
   RuntimeEventListener,
   SendTurnInput,
+  StdioMcpSpec,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
@@ -211,12 +213,21 @@ export interface MuseMcpMounts {
 }
 
 export function museMcpMountsFromTurn(turn: {
-  integrations?: { agents?: MuseStdioMcpSpec; browser?: MuseStdioMcpSpec; custom?: Record<string, MuseStdioMcpSpec> };
+  integrations?: { agents?: MuseStdioMcpSpec; browser?: MuseStdioMcpSpec; custom?: Record<string, McpServerSpec> };
 }): MuseMcpMounts | null {
   const agents = turn.integrations?.agents;
   const browser = turn.integrations?.browser;
   const custom = turn.integrations?.custom;
-  const customEntries = custom && Object.keys(custom).length ? custom : undefined;
+  // Muse settings only mount stdio servers; remote entries ({type, url})
+  // are skipped — a driver that cannot speak to one kind skips it.
+  const stdioCustom = custom
+    ? Object.fromEntries(
+      Object.entries(custom).filter(
+        (entry): entry is [string, StdioMcpSpec] => !("url" in entry[1]),
+      ),
+    )
+    : undefined;
+  const customEntries = stdioCustom && Object.keys(stdioCustom).length ? stdioCustom : undefined;
   if (!agents && !browser && !customEntries) return null;
   return {
     ...(agents ? { agents } : {}),
@@ -233,7 +244,7 @@ export function buildMuseSettingsWithMcp(
   base: Record<string, unknown> | null,
   mounts: MuseMcpMounts,
 ): Record<string, unknown> {
-  const settings: Record<string, unknown> = { ...(base ?? {}) };
+  const settings: Record<string, unknown> = { ...base };
   settings.schema_version = 1;
   const fromCamel = asPlainObject(settings.mcpServers) ?? {};
   const fromSnake = asPlainObject(settings.mcp_servers) ?? {};

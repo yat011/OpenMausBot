@@ -17,6 +17,7 @@ import { resolveAgentBrowserBinary } from "../../server/browser-engine.ts";
 import { removeTempDir, waitForExit } from "../../server/testing/cleanup.ts";
 import { runControlOmb } from "../control-omb.ts";
 import { UI_TOOLS_DIR } from "./control-omb-ui.ts";
+import { fixtureApi } from "./preview-fixture.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const CLI = join(ROOT, "scripts", "control-omb.ts");
@@ -120,6 +121,95 @@ describe("control-omb ui drives the real renderer", () => {
     if (ownsEvidenceDir) await removeTempDir(evidenceDir);
   });
 
+  run("tests saved keys only from an untouched field and blocks erased drafts", async () => {
+    launched = await launch([]);
+    const { info } = launched;
+    await fixtureApi(info.url)("PUT", "/api/config", {
+      openaiCompat: { key: "fixture-saved-key", url: "http://127.0.0.1:1/v1" },
+    });
+    const evaluate = async (js: string) => (await ui("eval", info.ui, "--js", js)).result;
+    const click = (name: string) => ui("click", info.ui, "--name", name);
+    const input = `document.querySelector('input[aria-label="OpenAI-compatible API key"]')`;
+    const testButton = `[...${input}.parentElement.querySelectorAll('button')].find(b => b.textContent === 'Test')`;
+    const verdict = () => evaluate(`${input}.parentElement.parentElement.querySelector('[role="status"]')?.textContent`);
+    const save = () => evaluate(`[...${input}.parentElement.querySelectorAll('button')].find(b => b.textContent === 'Save').click(); true`);
+    const type = async (text: string) => {
+      await click("OpenAI-compatible API key");
+      await evaluate(`${input}.select(); true`);
+      await ui("press", info.ui, "--keys", "Backspace");
+      if (text) await ui("type", info.ui, "--name", "OpenAI-compatible API key", "--text", text);
+    };
+    await evaluate(`(() => {
+      const original = window.fetch.bind(window);
+      window.keyTests = [];
+      window.rejectKeySave = false;
+      window.fetch = (url, init = {}) => {
+        if (String(url) === '/api/keys/test') {
+          window.keyTests.push(JSON.parse(init.body));
+          return Promise.resolve(Response.json({ ok: true, check: 'models', models: ['fixture-model'] }));
+        }
+        if (String(url) === '/api/config' && init.method === 'PUT' && window.rejectKeySave) {
+          return Promise.resolve(Response.json({ error: 'Fixture save rejected' }, { status: 503 }));
+        }
+        return original(url, init);
+      };
+      return true;
+    })()`);
+    await click("You");
+    await click("Settings");
+    await click("Connections");
+    await type("fixture-saved-key");
+    await save();
+    // The Connections panel re-renders after navigation and keystrokes, so a
+    // loaded runner can briefly detach the key field or its Test button; poll
+    // for the settled state with a budget that outlasts a re-render.
+    await expect.poll(() => evaluate(`${input}?.value ?? null`), { timeout: 10_000 }).toBe("");
+    await click("Appearance");
+    await click("Connections");
+    await expect.poll(() => evaluate(`${testButton}?.disabled ?? null`), { timeout: 10_000 }).toBe(false);
+    await click("Test");
+    await expect.poll(() => evaluate("window.keyTests")).toEqual([{ provider: "openaiCompat" }]);
+    await expect.poll(verdict).toBe("Saved key: Model catalog reachable: fixture-model. Authentication and chat not verified.");
+    await type("  fixture-draft-key  ");
+    await click("Test");
+    await expect.poll(() => evaluate("window.keyTests")).toEqual([
+      { provider: "openaiCompat" }, { provider: "openaiCompat", key: "fixture-draft-key" },
+    ]);
+    await expect.poll(verdict).toBe("Unsaved key — save it to use it. Model catalog reachable: fixture-model. Authentication and chat not verified.");
+    for (const erased of ["", "   "]) {
+      await type(erased);
+      await expect.poll(() => evaluate(`${input}?.value ?? null`), { timeout: 10_000 }).toBe(erased);
+      await expect.poll(() => evaluate(`${testButton}?.disabled ?? null`), { timeout: 10_000 }).toBe(true);
+      await evaluate(`${testButton}.click(); true`);
+      expect(await evaluate("window.keyTests.length")).toBe(2);
+    }
+    mkdirSync(evidenceDir, { recursive: true });
+    await ui("screenshot", info.ui, "--out", join(evidenceDir, "provider-key-erased-draft.png"));
+
+    // A failed save must retain draft state; only success returns to testing
+    // the saved credential from the now-empty, untouched field.
+    await type("fixture-replacement-key");
+    await evaluate("window.rejectKeySave = true");
+    await save();
+    await expect.poll(async () => (await ui("snapshot", info.ui)).snapshot).toContain("Fixture save rejected");
+    await expect.poll(() => evaluate(`${input}?.value ?? null`), { timeout: 10_000 }).toBe("fixture-replacement-key");
+    await type("");
+    await expect.poll(() => evaluate(`${testButton}?.disabled ?? null`), { timeout: 10_000 }).toBe(true);
+    await type("fixture-replacement-key");
+    await evaluate("window.rejectKeySave = false");
+    await save();
+    await expect.poll(() => evaluate(`${input}?.value ?? null`), { timeout: 10_000 }).toBe("");
+    await expect.poll(() => evaluate(`${testButton}?.disabled ?? null`), { timeout: 10_000 }).toBe(false);
+    await click("Test");
+    await expect.poll(() => evaluate("window.keyTests")).toEqual([
+      { provider: "openaiCompat" }, { provider: "openaiCompat", key: "fixture-draft-key" }, { provider: "openaiCompat" },
+    ]);
+    await expect.poll(verdict).toBe("Saved key: Model catalog reachable: fixture-model. Authentication and chat not verified.");
+    await waitForExit(launched.child, { signal: "SIGINT", graceMs: 30_000 });
+    expect(launched.child.exitCode).toBe(0);
+    expect(existsSync(info.dataDir)).toBe(false);
+  }, LAUNCH_TIMEOUT_MS + 180_000);
+
   run("sends a turn from the composer and shows the reply and the scripted tool chip", async () => {
     launched = await launch(["--tool-calls", TOOL_CALLS]);
     const { info } = launched;
@@ -137,6 +227,38 @@ describe("control-omb ui drives the real renderer", () => {
     // Skill authoring is on by default, so the run card's Save as skill
     // needs no flag; the fixture's default config is what a fresh install has.
     expect(flagged.features).toMatchObject({ skillAuthoring: true });
+
+    // The header defaults to the conversation. Updating the bot default is
+    // explicit, and same-provider model changes preserve permissions.
+    const savedBot = async () => (await fetch(`${info.url}/api/bots`).then((response) => response.json())).bots.find((bot: any) => bot.id === info.botId);
+    const originalBot = await savedBot();
+    const originalModel = originalBot.modelSelection.model;
+    const models = await runControlOmb(["models", "--url", info.url]) as any;
+    const options = models.instances.find((instance: any) => instance.instanceId === originalBot.modelSelection.instanceId).models.options;
+    const originalLabel = options.find((option: any) => option.id === originalModel).label;
+    const nextModel = options.find((option: any) => option.id !== originalModel);
+    await ui("click", info.ui, "--name", originalLabel);
+    expect(await ui("eval", info.ui, "--js", "[...document.querySelectorAll('[aria-label=\"Apply model changes to\"] button')].find(b => b.textContent === 'Only this thread').getAttribute('aria-pressed')"))
+      .toMatchObject({ result: "true" });
+    await ui("click", info.ui, "--name", "Thread + bot default");
+    const scopeShot = join(evidenceDir, "model-scope.png");
+    mkdirSync(evidenceDir, { recursive: true });
+    await ui("screenshot", info.ui, "--out", scopeShot);
+    await ui("click", info.ui, "--name", nextModel.label);
+    await expect.poll(async () => (await savedBot()).modelSelection.model, { timeout: 10_000 }).toBe(nextModel.id);
+    expect((await savedBot()).tasks.find((task: any) => task.threadId === originalBot.threadId).modelSelection.model).toBe(nextModel.id);
+    await ui("click", info.ui, "--name", nextModel.label);
+    await ui("click", info.ui, "--name", "Only this thread");
+    // The provider-default badge is part of the accessible model-row name.
+    const modelSnapshot = await ui("snapshot", info.ui, "--interactive");
+    const originalRow = Object.entries(modelSnapshot.refs as Record<string, { name: string; role: string }>)
+      .find(([, value]) => value.role === "button" && value.name.startsWith(originalLabel));
+    expect(originalRow).toBeDefined();
+    await ui("click", info.ui, "--ref", `@${originalRow![0]}`);
+    await expect.poll(async () => (await savedBot()).tasks.find((task: any) => task.threadId === originalBot.threadId).modelSelection.model,
+      { timeout: 10_000 }).toBe(originalModel);
+    expect((await savedBot()).modelSelection.model).toBe(nextModel.id);
+    expect((await savedBot()).approvalMode).toBe(originalBot.approvalMode);
 
     const before = await ui("snapshot", info.ui, "--interactive");
     expect(before.ok).toBe(true);
@@ -176,6 +298,20 @@ describe("control-omb ui drives the real renderer", () => {
     // and a deliberately missing UI target rejects instead of reporting green.
     expect(await runControlOmb(["doctor", "--url", info.url])).toMatchObject({ ok: true });
     await expect(ui("click", info.ui, "--name", "Deliberately missing QA control")).rejects.toThrow("no element is named");
+
+    // A control the app paints after its data arrives must still be
+    // clickable. Resolving --name used to take one snapshot, so a lookup
+    // that landed a tick early failed as "no element is named" — the smoke's
+    // own model row, and ~1 run in 8 red on four unrelated branches. The
+    // button below is planted with the same delay the real one has.
+    await ui("eval", info.ui, "--js", `(() => {
+      const late = document.createElement("button");
+      late.textContent = "Late QA control";
+      late.setAttribute("aria-label", "Late QA control");
+      setTimeout(() => document.body.appendChild(late), 1500);
+      return "planted";
+    })()`);
+    expect(await ui("click", info.ui, "--name", "Late QA control")).toMatchObject({ ok: true });
 
     mkdirSync(evidenceDir, { recursive: true });
     const shotPath = join(evidenceDir, "chat-ui.png");

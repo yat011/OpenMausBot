@@ -13,7 +13,7 @@ import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { buildMuseExecArgs, buildMuseSettingsWithMcp, loadMuseCatalog, museCliSupportsCompaction, museCompactionBounds, museCompactionThreshold, MuseDriver, parseMuseLine, type MuseConfig } from "./muse.ts";
+import { buildMuseExecArgs, buildMuseSettingsWithMcp, loadMuseCatalog, museCliSupportsCompaction, museCompactionBounds, museCompactionThreshold, MuseDriver, museMcpMountsFromTurn, parseMuseLine, type MuseConfig } from "./muse.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-muse-cli.ts");
 
@@ -51,7 +51,7 @@ describe("MuseDriver turns (fake CLI)", () => {
       displayName: "Muse Test",
       environment,
       enabled: true,
-      config: { cli: FAKE_CLI, ...config },
+      config: { cli: FAKE_CLI, provider: "meta", model: "", baseUrl: "", ...config },
     });
     recorder = recordEvents(instance.adapter);
   };
@@ -386,6 +386,22 @@ describe("muse protocol helpers", () => {
         browser: { command: "node", args: ["proxy"], env: { TOKEN: "t" } },
       },
     });
+  });
+
+  it("skips remote MCP entries and keeps stdio custom servers", () => {
+    expect(
+      museMcpMountsFromTurn({
+        integrations: {
+          custom: {
+            notes: { command: "notes-mcp", args: [], env: {} },
+            remote: { type: "http", url: "https://mcp.example.com", headers: {} },
+          },
+        },
+      }),
+    ).toEqual({ custom: { notes: { command: "notes-mcp", args: [], env: {} } } });
+    expect(
+      museMcpMountsFromTurn({ integrations: { custom: { remote: { type: "http", url: "https://mcp.example.com", headers: {} } } } }),
+    ).toBeNull();
   });
 
   it("parses deltas, completions, failures, and noise", () => {

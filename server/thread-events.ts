@@ -14,24 +14,11 @@
 import { closeSync, fstatSync, openSync, readSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import type { RuntimeEvent } from "./contracts.ts";
+import type { InspectorEntry, InspectorPage, NativeRecord } from "../shared/inspector.ts";
 
-/** One line of native/<threadId>.ndjson (server/drivers/native.ts). */
-export interface NativeRecord {
-  at: string;
-  dir: "in" | "out";
-  source: string;
-  msg: unknown;
-}
-
-export type InspectorEntry =
-  | { kind: "runtime"; at: string; data: RuntimeEvent }
-  | { kind: "native"; at: string; data: NativeRecord };
-
-export interface InspectorPage {
-  entries: InspectorEntry[];
-  /** line counts before the cap, so the UI can say "showing 200 of 1,687" */
-  total: { runtime: number; native: number };
-}
+// The inspector wire shapes live in shared/inspector.ts now (part of the
+// wire model); re-exported here so existing importers keep working.
+export type { InspectorEntry, InspectorPage, NativeRecord } from "../shared/inspector.ts";
 
 const DEFAULT_LIMIT = 300;
 const MAX_LIMIT = 2000;
@@ -159,6 +146,23 @@ const stringOrMissing = (value: unknown) => value === undefined || typeof value 
 const stringOrNullOrMissing = (value: unknown) => value === undefined || value === null || typeof value === "string";
 const numberOrNullOrMissing = (value: unknown) => value === undefined || value === null || typeof value === "number";
 const stringsOrMissing = (value: unknown) => value === undefined || (Array.isArray(value) && value.every((item) => typeof item === "string"));
+/** A computer holder as the wait events carry it: a name, and the holding
+ * thread's title when one was known. */
+const computerHolderOrMissing = (value: unknown) =>
+  value === undefined ||
+  (isRecord(value) && typeof value.name === "string" && stringOrMissing(value.task));
+/** A replayed structured ask. Only the shape the card actually reads is
+ * required; the rest is optional and simply absent on an older event. */
+const askQuestionsOrMissing = (value: unknown) =>
+  value === undefined ||
+  (Array.isArray(value) &&
+    value.every(
+      (question) =>
+        isRecord(question) &&
+        typeof question.question === "string" &&
+        Array.isArray(question.options) &&
+        question.options.every((option) => isRecord(option) && typeof option.label === "string"),
+    ));
 
 function isRuntimeEvent(value: unknown): value is RuntimeEvent {
   if (
@@ -199,6 +203,17 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
         (value.usage === undefined ||
           (isRecord(value.usage) && typeof value.usage.input === "number" && typeof value.usage.output === "number"))
       );
+    case "turn.wait_started":
+      return typeof value.resource === "string" && computerHolderOrMissing(value.holder);
+    case "turn.wait_ended":
+      return (
+        typeof value.resource === "string" &&
+        computerHolderOrMissing(value.holder) &&
+        typeof value.waitedMs === "number" &&
+        Number.isFinite(value.waitedMs) &&
+        value.waitedMs >= 0 &&
+        (value.outcome === "acquired" || value.outcome === "gave_up" || value.outcome === "stopped")
+      );
     case "item.started":
       return (value.itemType === "tool" || value.itemType === "reasoning") && stringOrMissing(value.title);
     case "item.updated":
@@ -212,7 +227,11 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
         (value.requestType === "permission" || value.requestType === "question") &&
         typeof value.tool === "string" &&
         typeof value.summary === "string" &&
-        stringsOrMissing(value.choices)
+        stringsOrMissing(value.choices) &&
+        askQuestionsOrMissing(value.questions) &&
+        // Required fields only: events recorded before origin exists replay
+        // unchanged, and a value other than the two documented marks is not.
+        (value.origin === undefined || value.origin === "tool" || value.origin === "output")
       );
     case "request.resolved":
       return (

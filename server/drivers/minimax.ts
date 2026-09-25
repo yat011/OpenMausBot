@@ -14,14 +14,17 @@ const DEFAULT_URL = "https://api.minimax.io/v1";
 const CN_URL = "https://api.minimaxi.com/v1";
 const MODELS: ModelCatalog = {
   default: "MiniMax-M3",
+  // `custom: true` because the driver is access "custom": the picker opens
+  // custom-access engines in the pane that lists only custom-flagged models.
   options: [
-    { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000 },
-    { id: "MiniMax-M2.7", label: "MiniMax M2.7", contextWindow: 204_800 },
-    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
+    { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000, custom: true },
+    { id: "MiniMax-M2.7", label: "MiniMax M2.7", contextWindow: 204_800, custom: true },
+    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, custom: true },
   ],
 };
 
 export interface MinimaxConfig {
+  tools?: boolean;
   url: string;
 }
 
@@ -61,9 +64,12 @@ export function loadLocalMiniMaxConfig(home = homedir()): LocalMiniMaxConfig {
 }
 
 export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
+  const tools = ((raw ?? {}) as Record<string, unknown>).tools;
+  if (tools !== undefined && typeof tools !== "boolean") throw new Error("tools must be a boolean");
   const parsed = driverConfigSchema.safeParse(raw ?? {});
   const config = parsed.success ? parsed.data : {};
   return {
+    ...(tools !== undefined ? { tools } : {}),
     url: normalizedApiUrl(config.url?.trim() || process.env.MINIMAX_BASE_URL?.trim() || DEFAULT_URL),
   };
 }
@@ -103,6 +109,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       driverKind: DRIVER_KIND,
       apiKey,
       apiUrl,
+      tools: input.config.tools,
       models: () => models,
       requestBody: (model, messages, stream) => ({
         model,
@@ -115,6 +122,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       missingKeyError: `no MiniMax key — set ${API_KEY_ENV} or run mmx auth login --api-key …`,
       unavailableReason: `no MiniMax API key — run mmx auth login --api-key … or set ${API_KEY_ENV}`,
       timeoutMs: 180_000,
+      reasoning: true,
       billing: "metered",
       includeUsageInCompleted: true,
       noBodyError: "MiniMax returned no response body",

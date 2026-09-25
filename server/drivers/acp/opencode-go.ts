@@ -103,12 +103,19 @@ export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
     const contextWindow = typeof limit.context === "number" && Number.isFinite(limit.context) && limit.context > 0
       ? Math.floor(limit.context)
       : undefined;
+    const variants = record.variants && typeof record.variants === "object" && !Array.isArray(record.variants)
+      ? Object.entries(record.variants).filter(([, settings]) => (
+          settings && typeof settings === "object" && !Array.isArray(settings)
+          && (settings as Record<string, unknown>).disabled !== true
+        )).map(([id]) => ({ id, label: labelForModel(id) }))
+      : undefined;
     seen.add(slug);
     options.push({
       id: slug,
       label: `${providerLabel(provider)} · ${name}`,
       ...(localModelRecord(record) ? { custom: true, loaded: true } : {}),
       ...(contextWindow ? { contextWindow } : {}),
+      ...(variants ? { variants } : {}),
     });
   };
 
@@ -365,10 +372,23 @@ const support = (loadCatalog: OpenCodeCatalogLoader): AcpSupport => ({
   spawnArgs: () => ["acp"],
   credentialEnv: ["OPENCODE_API_KEY"],
   selectModel: { configId: "model" },
+  modelVariants: true,
   resolveTurnModel: (model, env) => model
     ? ensureOpenCodeInjectModel(normalizeLegacyOpenCodeModel(model, env), env)
     : model,
   transformEnv: stripForeignProviderKeys,
+  applyTurnEnv: (env, { fullAuto }) => {
+    if (!fullAuto) return;
+    // Scope native permissions to this child, not the user's OpenCode config.
+    // A wildcard alone leaves OpenCode's more-specific external-directory and
+    // read rules in place. Replace the built-in rules as well, including path
+    // maps, so Full means the same thing inside the provider and in OMB.
+    env.OPENCODE_PERMISSION = JSON.stringify(Object.fromEntries([
+      "*", "external_directory", "read", "edit", "bash", "glob", "grep",
+      "list", "task", "lsp", "skill", "webfetch", "websearch", "codesearch",
+      "todoread", "todowrite", "doom_loop",
+    ].map((permission) => [permission, "allow"])));
+  },
   pickAuthMethod: () => null,
   authFailure: "continue",
   isAuthenticated: async (env, config) => (

@@ -4,14 +4,15 @@ Approval levels belong to a bot and apply to its next provider turn, including
 when that provider resumes an existing native thread. Each level is one of the
 provider's own permission modes, passed through. OpenMausBot does not judge an
 action itself: there is no app-side allowlist, classifier, or pattern rule. A
-request that reaches you is one the provider left for you.
+native tool request that reaches you is one the provider left for you. In Full
+Access, OMB also applies its own configuration tools without another approval.
 
 | Level | Behavior |
 | --- | --- |
 | **Ask for approval** | Requests approval for commands and file changes, the way the provider's supervised mode does. |
 | **Auto-accept edits** | Approves file edits automatically; other actions can still require approval. Offered where the provider has such a mode (Claude, Grok, Antigravity). |
 | **Approve for me** | Uses the provider's automatic review on Codex, Claude, Cursor, and Grok to approve routine actions and ask about others. Providers without an equivalent fall back to asking. |
-| **Full access** | Enables the provider's permissive mode for commands, edits, and selected-computer actions, including potentially destructive or sensitive work. Residual native prompts are answered for you. Applies to this bot's direct, scheduled, and delegated work (ask_bot, delegate_bot); delegation uses the receiving bot's setting, never the sender's. Questions and separate OpenMausBot confirmations still wait for you. |
+| **Full access** | Enables the provider's permissive mode for commands, edits, and selected-computer actions, including potentially destructive or sensitive work. Residual native permission prompts are answered for you. OMB profile changes, routine actions, team setup, bot deletion, and enabled skill authoring apply without a second approval. Peer-review prompts are skipped within the bot's authorized scope. Delegation uses the receiving bot's setting, never the sender's — except from a Chief of Staff with Full access (below). Actual questions and missing credentials still need your input. |
 | **Custom (`config.toml`)** | Codex only. OpenMausBot reads and reapplies the effective approval and sandbox settings from your Codex configuration. |
 
 Full access is an elevated-risk standing approval. Full and Custom can only be
@@ -19,8 +20,18 @@ enabled from a packaged local desktop app, where the choice crosses a private
 process channel rather than the bot-accessible HTTP API. They are hidden in
 development, standalone web, and remote pages. Full access does not bypass operating
 system privacy controls, authentication, CAPTCHA or MFA, service permissions,
-or OpenMausBot's separate confirmations for credentials, routines, skills, and
-peer communication.
+or workspace/team ownership and computer-sharing grants. Full Access controls
+approval prompts; it does not sign in for you, enable a feature you disabled,
+or grant another bot access to a different workspace.
+
+The effective setting belongs to the source conversation. An existing Ask
+thread remains Ask even if the bot default is Full; a Full thread works without
+these extra prompts even if the bot default is Ask. Ask, Auto, and Custom retain
+their existing OMB configuration review cards. Full actions return an applied
+result and leave a settled receipt, so the bot continues in the same turn.
+Invalid input, unavailable services, or failed writes return errors, not a
+request to approve again. An expired native permission request is not turned
+into another Allow/Deny card.
 
 A turn a webhook, a routine, or another bot started runs in the bot's level
 like any other turn. The decision log records that nobody was at the keyboard
@@ -30,6 +41,22 @@ The terminal CLI can start the whole process in YOLO: `openmausbot serve --yolo`
 (or `OMB_YOLO=1`). That maps every supported engine's turns to Full access for
 that process only. It does not persist Full on the bot, and HTTP still cannot
 elevate a bot to Full.
+
+### A Chief of Staff's Full access covers the work it delegates
+
+Approvals were where a team's owner spent their day: every teammate a Chief
+handed work to stopped that work to ask the owner, one card every few
+minutes, across the whole team. So a **Chief of Staff with Full access passes
+that access on**. Work it delegates from a Full-access conversation —
+`delegate_bot`, and `coordinate_bots` into a teammate's thread — runs with
+Full access whatever the teammate's own level: the delegated thread is
+switched to Full, stays Full, and opens with a line saying so ("Full access —
+delegated by Clive, a Chief of Staff with Full access"). Work a Full-access
+Chief hands out inside a room runs Full for that turn. The teammate's own
+default and its other conversations do not change; a teammate whose engine
+has no Full mode keeps its own level; an ordinary bot's delegation still uses
+the recipient's setting; a Chief delegating from an Ask conversation passes
+nothing on. Questions and missing credentials still reach you.
 
 ## Answering a request
 
@@ -71,10 +98,32 @@ applies to every model in that Antigravity instance, including Gemini.
 Choose Auto explicitly in the local packaged desktop app. Old Antigravity
 `auto` / `autoApprove` settings still behave as Ask and are displayed as Ask;
 they never become unrestricted access on upgrade. Switching back to Ask
-restores prompts on the next turn. Questions, credential forms, and the
-separate confirmations described above still require an answer. A Chief or
+restores prompts on the next turn. Questions and missing-credential forms
+still require an answer. A Chief or
 teammate can delegate work to this bot without downgrading its explicit Auto
 (full access) grant. It does not enable Auto on any other bot.
+
+## Asking you questions
+
+Every engine can stop and ask, and no approval level ever answers a question
+for you: Ask, Auto-accept edits, Auto, and Full access all leave a question
+card for a person. What differs per engine is only how the ask travels:
+
+| Engine family | How an ask travels | Multiple questions at once |
+| --- | --- | --- |
+| Claude Code | Structured round-trip (its own `AskUserQuestion`) | Yes — capped at 4 by the CLI |
+| Codex | Structured round-trip | Yes — up to 6 |
+| Grok Build, Minimax, OpenAI-compatible endpoints | The injected `ask_user` tool | Yes — up to 6 |
+| ACP engines (Cursor, Antigravity, Gemini CLI, Qwen Code, OpenCode, …) | Option-match round-trip on the ACP permission request | One at a time — the request carries one choice set |
+| Pi | Free-text round-trip over `extension_ui_request` | One at a time |
+| BoxAgent (cloud computer) | A fenced `omb-ask` block in the run's final output; the turn stays open until you answer or the ask times out | Yes — up to 6 |
+
+A question the harness parsed out of model-authored output rather than a
+real tool call — the BoxAgent transport — carries an "Agent-composed
+question" badge on the card, and the decision log records it with
+`origin: output`. Flat clients (notifications, older companion builds)
+see plain buttons only when a card asks a single choice question; a
+multi-question card renders its structured form on current apps instead.
 
 ## Provider mappings
 
@@ -84,9 +133,11 @@ teammate can delegate work to this bot without downgrading its explicit Auto
 | Claude | Native `default` | Native `acceptEdits` | Native `auto` | Native `bypassPermissions` |
 | Cursor | Native default | not offered | Native `--auto-review` | Native `--force` |
 | Antigravity | Native `default` | Native `auto_edit` | Legacy `auto` behaves as Ask; UI Auto selects Full access | Native `yolo` plus automatic approval of remaining tool-permission requests; shown as Auto |
-| Grok Build | Native `default` | Native `acceptEdits` | Native `--permission-mode auto`; availability of Grok's reviewer depends on its feature rollout | Native `bypassPermissions`; remaining native requests still appear |
+| Grok Build | Native `default` | Native `acceptEdits` | Native `--permission-mode auto`; availability of Grok's reviewer depends on its feature rollout | Native `bypassPermissions` plus automatic approval of remaining tool-permission requests |
 | Muse Code | Native `--approval-mode on-request` | not offered | not offered | Native `--yolo` (disable approval, disable sandbox, trust this workspace). `--approval-mode never` is not Full: sandbox stays on and the workspace stays untrusted. |
 | OpenCode | Ask | not offered | Ask | Approve individual ACP permission requests, never task questions |
+| Qwen Code | Native `default` | Native `--approval-mode auto-edit` | Native `--approval-mode auto` (Qwen's LLM classifier approves safe actions, blocks risky ones) | `--yolo`, plus automatic approval of remaining ACP permission requests |
+| Gemini CLI | Native `default` | Native `--approval-mode auto_edit` | Ask (no reviewer) | `--yolo`, plus automatic approval of remaining ACP permission requests |
 | Other/custom engines | Ask | not offered | Ask | Not offered until a provider mapping is implemented |
 
 These settings apply on each turn, including resumed conversations. Switching
@@ -117,6 +168,10 @@ provider's session. Its quieter default is Full access; OpenMausBot keeps its
 own opt-in desktop confirmation and Ask as the default.
 
 ## Verification for contributors
+
+The [Full Access workflow recipe](verification/full-access.md) tests immediate
+profile, routine, team, skill, and peer actions through the real server and MCP
+proxy. Its fixture also verifies that explicit Ask sibling threads still wait.
 
 Run `pnpm exec electron scripts/smoke-approval-modes.cjs` to exercise the real
 private desktop-to-server grant protocol in a disposable fixture. It verifies
