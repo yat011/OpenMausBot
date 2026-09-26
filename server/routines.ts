@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { DATA_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
+import { isTurnAdmissionBlocked } from "./turn-dispatch-guard.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { redactSecretsInText } from "./redact.ts";
 import type { GroupGoalRunStatus } from "../shared/group-goal-run.ts";
@@ -1647,6 +1648,23 @@ export class RoutineManager {
             );
           }
         } catch (error) {
+          // Same-thread wake collision (e.g. a second webhook delivery
+          // arriving while the inbox turn still holds the thread): park this
+          // exact run back in the queue instead of failing it. failThread
+          // matches by thread id and would hit the occupying run, so revert
+          // the colliding run directly and let the next tick retry it once
+          // the thread settles — the same parking direct-chat wakes get.
+          if (isTurnAdmissionBlocked(error)) {
+            run.status = "queued";
+            run.startedAt = undefined;
+            run.error = undefined;
+            if (run.deferredAt == null) {
+              run.deferredAt = this.now();
+            }
+            this.save();
+            this.emitRun(run);
+            continue;
+          }
           this.failThread(task.threadId, error instanceof Error ? error.message : String(error));
         }
       }

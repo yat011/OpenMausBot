@@ -2251,6 +2251,70 @@ describe("RoutineManager", () => {
     expect(created).toBe(1);
   });
 
+  it("holds a webhook delivery queued when its inbox thread is still busy instead of failing it", async () => {
+    const h = harness();
+    const threads = new Map<string, string>();
+    let created = 0;
+    h.options.ensureTask = (_botId, title, activate, webhookKey) => {
+      h.taskActivations.push(activate ?? false);
+      const key = webhookKey ?? title;
+      const existing = threads.get(key);
+      if (existing) return { threadId: existing };
+      const threadId = `inbox-${++created}`;
+      threads.set(key, threadId);
+      return { threadId };
+    };
+    const input = {
+      webhookId: "hook-wa",
+      webhookName: "WhatsApp inbound",
+      prompt: "Handle chat",
+      botId: "maus-webhook",
+      runOn: "maus" as const,
+      receivedAt: Date.now(),
+      threadKey: "wa:inbox",
+    };
+    h.manager.enqueueWebhook({ ...input, deliveryId: "m1" });
+    await h.manager.tick();
+    // echo2 arrives while echo1 still holds the same inbox thread.
+    h.manager.enqueueWebhook({ ...input, deliveryId: "m2", prompt: "Handle chat 2" });
+    const busy = Object.assign(
+      new Error("this thread is already working — interrupt it first"),
+      { status: 409, code: "thread_busy" },
+    );
+    // The only dispatch in the next tick is m2's; the inbox is still busy.
+    let colliding = true;
+    h.options.startTurn = async (botId, threadId, prompt) => {
+      if (colliding) {
+        colliding = false;
+        throw busy;
+      }
+      h.started.push({ botId, threadId, prompt });
+    };
+    await h.manager.tick();
+
+    const held = h.manager.listRuns().find((run) => run.deliveryId === "m2")!;
+    expect(held.status).toBe("queued");
+    expect(held.error).toBeUndefined();
+    expect(h.failed).toHaveLength(0);
+    // The occupying run is untouched — the collision must not fail it.
+    expect(h.manager.listRuns().find((run) => run.deliveryId === "m1")!.status).toBe("running");
+    // The inbox frees; the held delivery dispatches without loss.
+    h.options.startTurn = async (botId, threadId, prompt) => {
+      h.started.push({ botId, threadId, prompt });
+    };
+    h.manager.handleRuntimeEvent({
+      type: "turn.completed",
+      ok: true,
+      eventId: "done-1",
+      provider: "fake",
+      threadId: "inbox-1",
+      createdAt: new Date().toISOString(),
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.deliveryId === "m2")!.status).toBe("running");
+    expect(h.started.map((start) => start.threadId)).toEqual(["inbox-1", "inbox-1"]);
+  });
+
   it("still opens a new task for webhooks that omit an inbox key", async () => {
     const h = harness();
     h.manager.enqueueWebhook({
