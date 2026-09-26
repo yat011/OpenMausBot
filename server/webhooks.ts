@@ -255,11 +255,13 @@ function taskFromPayload(payload: JsonValue): string {
 }
 
 export function webhookThreadTitle(value: string | undefined): string | undefined {
+  // eslint-disable-next-line no-control-regex -- intentional: strip C0 controls + DEL from header values
   const title = (value ?? "").replace(/[\u0000-\u001F\u007F]+/g, " ").trim().slice(0, 80);
   return title || undefined;
 }
 
 export function webhookThreadKey(value: string | undefined): string | undefined {
+  // eslint-disable-next-line no-control-regex -- intentional: strip C0 controls + DEL from header values
   const key = (value ?? "").replace(/[\u0000-\u001F\u007F]+/g, "").trim().slice(0, 200);
   return key || undefined;
 }
