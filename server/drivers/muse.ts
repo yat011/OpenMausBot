@@ -705,7 +705,12 @@ export const MuseDriver: ProviderDriver<MuseConfig> = {
       const { threadId } = turn;
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
-      const resume = typeof turn.resumeCursor === "string" && turn.resumeCursor ? turn.resumeCursor : sessions.get(threadId);
+      // sessionReset takes precedence over both the cursor and the remembered
+      // id (contracts.ts): a reset turn must never reuse --session-id, or the
+      // CLI resumes the old session with its frozen first-turn tool catalog.
+      const resume = turn.sessionReset
+        ? undefined
+        : typeof turn.resumeCursor === "string" && turn.resumeCursor ? turn.resumeCursor : sessions.get(threadId);
       const promptOf = (recovery: string | undefined) =>
         [turn.system, recovery, turn.text].filter((s) => typeof s === "string" && s.trim()).join("\n\n");
 

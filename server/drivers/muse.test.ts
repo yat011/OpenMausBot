@@ -2,7 +2,8 @@
 // server/testing/fake-muse-cli.ts — the driver must normalize the
 // `exec --json` JSONL protocol into canonical events, keep argv hygiene
 // (prompt via --prompt-file, no parent-process key leak), resume sessions
-// by id, and retry a dead session once with the recovery replay.
+// by id, retry a dead session once with the recovery replay, and start a
+// fresh session on sessionReset despite a stale cursor or memory.
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -139,6 +140,32 @@ describe("MuseDriver turns (fake CLI)", () => {
     expect(launches[0]?.sessionId).toBe("dead-beef");
     expect(launches[1]?.sessionId).not.toBe("dead-beef");
     expect(launches[1]?.prompt).toBe("prior summary\n\ncontinue");
+  });
+
+  it("starts a fresh session on sessionReset despite a stale cursor and memory", async () => {
+    await create();
+    const firstTurn = await instance.adapter.sendTurn({ threadId: "t-reset", text: "go" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === firstTurn.turnId);
+    const resetTurn = await instance.adapter.sendTurn({
+      threadId: "t-reset",
+      text: "after reset",
+      resumeCursor: "stale-id",
+      sessionReset: true,
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === resetTurn.turnId);
+
+    const launches = readDump(dump);
+    expect(launches).toHaveLength(2);
+    const [first, second] = launches as [DumpLine, DumpLine];
+    expect(first.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second.sessionId).not.toBe(first.sessionId);
+    expect(second.sessionId).not.toBe("stale-id");
+
+    // The fresh id becomes the remembered session from here on.
+    const thirdTurn = await instance.adapter.sendTurn({ threadId: "t-reset", text: "keep going" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === thirdTurn.turnId);
+    expect(readDump(dump)[2]?.sessionId).toBe(second.sessionId);
   });
 
   it("fails a turn whose CLI exits before answering", async () => {
