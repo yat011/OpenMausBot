@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserRuntime } from "./browser-runtime.ts";
-import { BrowserLive, browserStreamPort, normalizeBrowserLiveMessage, parseBrowserLiveAction } from "./browser-live.ts";
+import { BrowserLive, browserStreamPort, normalizeBrowserLiveMessage, parseBrowserLiveAction, parsePageViewport } from "./browser-live.ts";
 
 const execute = vi.hoisted(() => vi.fn());
 const nativeClose = vi.hoisted(() => vi.fn());
@@ -111,6 +111,10 @@ describe("browser viewer protocol boundary", () => {
     expect(browserStreamPort(ready)).toBe(43210);
     for (const value of [null, {}, { enabled: false, port: 42 }, { enabled: true, port: "42" }, { enabled: true, port: 0 }, { enabled: true, port: 65536 }, { enabled: true, port: 2.2 }]) expect(() => browserStreamPort(value)).toThrow();
   });
+  it("reads the true page viewport from probe output and rejects bad shapes", () => {
+    expect(parsePageViewport({ result: "{\"w\":1920,\"h\":968}" })).toEqual({ width: 1920, height: 968 });
+    for (const value of [null, {}, { result: 42 }, { result: "nope" }, { result: "{\"w\":0,\"h\":5}" }, { result: "{\"w\":1920}" }, { result: "{\"w\":99999,\"h\":99999}" }]) expect(parsePageViewport(value)).toBeNull();
+  });
   it("maps only fixed navigation/tab verbs and rejects executable URLs and flags", () => {
     expect(parseBrowserLiveAction({ type: "navigate", url: "https://example.com/?q=hi", command: "eval", args: ["secret"] })).toEqual({ type: "command", args: ["open", "https://example.com/?q=hi"] });
     expect(parseBrowserLiveAction({ type: "tab-new" })).toEqual({ type: "command", args: ["tab", "new"] });
@@ -216,6 +220,14 @@ describe("authenticated browser viewer relay", () => {
     await expect(live.action({ viewerId: res.id, botId: "bot-a", owner: "another-admin", body: { type: "take" } })).rejects.toThrow("no longer available");
     await expect(live.action({ viewerId: res.id, botId: "other-bot", owner: "admin-a", body: { type: "take" } })).rejects.toThrow("no longer available");
   });
+  it("relays frames with the probed page viewport so panel taps map to true input coordinates", async () => {
+    const { res, socket, action } = await open();
+    execute.mockResolvedValueOnce(output({ result: "{\"w\":1920,\"h\":968}" }));
+    await action({ type: "take" });
+    expect(execute.mock.calls.at(-1)?.[1][0]).toBe("eval");
+    socket.receive({ ...frame, seq: 2 });
+    expect(res.events("frame").at(-1)?.metadata).toMatchObject({ deviceWidth: 1920, deviceHeight: 968 });
+  });
   it.each([1, 2])("accepts a rendered ACK for identical image bytes with frame sequence %s without timing out", async (seq) => {
     vi.useFakeTimers();
     const a = await open();
@@ -259,7 +271,7 @@ describe("authenticated browser viewer relay", () => {
     expect(JSON.parse(nativeInput.mock.calls[0]?.[1].body)).toEqual({ action: "input_keyboard", type: "keyDown", key: "a", text: "a" });
     expect(a.socket.messages).toHaveLength(0);
     a.socket.close(); expect(held.has("profile-a")).toBe(false);
-    expect(execute).toHaveBeenCalledTimes(2); // No close command: logins/browser survive viewers.
+    expect(execute).toHaveBeenCalledTimes(3); // Two stream-status plus the take-triggered viewport probe. No close command: logins/browser survive viewers.
   });
   it("withholds login frames/tabs/URLs from other views, advances their upstream ACK and restores the newest frame on release", async () => {
     const a = await open(); const b = await open({ botId: "bot-b" });
@@ -289,6 +301,20 @@ describe("authenticated browser viewer relay", () => {
     const noAck = await open(); noAck.socket.receive(frame);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(noAck.res.writableEnded).toBe(true);
+  });
+  it("reaps viewers that never receive a frame so the panel reconnects instead of spinning on Opening", async () => {
+    vi.useFakeTimers();
+    const waiting = await open();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(waiting.res.writableEnded).toBe(true);
+    expect(held.has("profile-a")).toBe(false);
+    const watching = await open();
+    watching.socket.receive(frame);
+    await watching.action({ type: "ack", seq: 1 });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(watching.res.writableEnded).toBe(false);
+    expect(watching.res.destroyed).toBe(false);
+    expect(watching.res.events("heartbeat").length).toBeGreaterThan(0);
   });
   it("caps views per profile and closes all associated viewers on profile deletion", async () => {
     const a = await open(); const b = await open({ botId: "b" });

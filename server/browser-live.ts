@@ -9,6 +9,10 @@ const execute = promisify(execFile);
 const MAX_FRAME = 3 * 1024 * 1024;
 const MAX_BUFFER = 4 * 1024 * 1024;
 const HEARTBEAT_MS = 10_000;
+// A viewer that never receives a first frame would otherwise sit on
+// "Opening the live browser" forever: the stale-frame check only covers
+// viewers that already rendered. Fail it so the panel reconnects.
+const FIRST_FRAME_TIMEOUT_MS = 30_000;
 // The native press resolver supplies the virtual key codes and Enter/Tab text
 // that its raw input_keyboard relay omits. Keep unknown keys literal.
 const DISCRETE_KEYS = new Set(["Backspace", "Enter", "Tab", "Escape", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"]);
@@ -81,6 +85,21 @@ export function browserStreamPort(value: unknown): number {
   return data.port;
 }
 
+// The daemon reports its capture viewport in frame metadata, but its input
+// path targets the page's CSS viewport. Probing the page size keeps the
+// panel's tap mapping on the coordinates input actually hits.
+const PAGE_VIEWPORT_JS = "JSON.stringify({w:window.innerWidth,h:window.innerHeight})";
+
+export function parsePageViewport(value: unknown): { width: number; height: number } | null {
+  const data = object(value);
+  if (!data || typeof data.result !== "string") return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(data.result); } catch { return null; }
+  const dims = object(parsed);
+  if (!dims || !integer(dims.w, 1, 8192) || !integer(dims.h, 1, 8192) || dims.w * dims.h > 16_777_216) return null;
+  return { width: dims.w, height: dims.h };
+}
+
 type Action = { type: "take" | "release" | "restart" } | { type: "ack"; seq: number }
   | { type: "command"; args: string[] } | { type: "input"; message: ObjectValue };
 
@@ -147,6 +166,8 @@ interface Viewer extends OpenOptions {
   drainTimer?: NodeJS.Timeout;
   frameSeq?: number;
   frameAt?: number;
+  receivedFrame: boolean;
+  waitingSince: number;
   hiddenFrame?: ObjectValue;
   pendingFrame?: ObjectValue;
   pendingActions: number;
@@ -154,6 +175,7 @@ interface Viewer extends OpenOptions {
   pressedButtons: Set<string>;
   port?: number;
   restarting: boolean;
+  page?: { width: number; height: number };
 }
 
 export class BrowserLive {
@@ -207,8 +229,21 @@ export class BrowserLive {
     }
   }
 
+  private async refreshPageViewport(viewer: Viewer): Promise<void> {
+    try {
+      const page = parsePageViewport(await this.command(viewer, ["eval", PAGE_VIEWPORT_JS]));
+      if (page && this.current(viewer)) viewer.page = page;
+    } catch { /* Keep the last known viewport; daemon metadata stays as fallback. */ }
+  }
+
   private frame(viewer: Viewer, frame: ObjectValue): void {
     if (!this.current(viewer)) { this.close(viewer); return; }
+    // Any upstream frame, rendered or withheld, proves this viewer's stream is alive.
+    viewer.receivedFrame = true;
+    if (viewer.page) {
+      const metadata = object(frame.metadata);
+      if (metadata) frame.metadata = { ...metadata, deviceWidth: viewer.page.width, deviceHeight: viewer.page.height };
+    }
     const holder = this.runtime.heldBy(viewer.session);
     if (holder && holder !== viewer.id) {
       viewer.hiddenFrame = frame;
@@ -321,7 +356,7 @@ export class BrowserLive {
     if (this.viewers.size >= 8 || [...this.viewers.values()].filter((v) => v.session === options.session).length >= 2) {
       throw new BrowserLiveError("Too many browser views are open. Close another browser panel first.", 429);
     }
-    const viewer: Viewer = { ...options, id: randomUUID(), closed: false, blocked: false, pendingActions: 0, restarting: false, pressedKeys: new Set(), pressedButtons: new Set() };
+    const viewer: Viewer = { ...options, id: randomUUID(), closed: false, blocked: false, pendingActions: 0, restarting: false, receivedFrame: false, waitingSince: Date.now(), pressedKeys: new Set(), pressedButtons: new Set() };
     if (!this.current(viewer)) throw new BrowserLiveError("This browser view is no longer available.", 409);
     this.viewers.set(viewer.id, viewer);
     options.res.once("close", () => this.close(viewer));
@@ -352,7 +387,10 @@ export class BrowserLive {
         const heldBy = this.runtime.heldBy(viewer.session);
         if (heldBy && heldBy !== viewer.id && ["tabs", "url"].includes(String(message.type))) return;
         if (message.type === "frame") this.frame(viewer, message);
-        else this.send(viewer, message);
+        else {
+          if (message.type === "url") void this.refreshPageViewport(viewer);
+          this.send(viewer, message);
+        }
       });
       socket.addEventListener("error", () => { if (!viewer.restarting) { this.send(viewer, { type: "error", retryable: true, message: "The browser stream disconnected." }); this.close(viewer); } });
       socket.addEventListener("close", () => { if (!viewer.restarting) this.close(viewer); });
@@ -367,6 +405,9 @@ export class BrowserLive {
       });
       if (!this.current(viewer)) { this.close(viewer); return; }
       viewer.heartbeat = setInterval(() => {
+        // A view that never receives an upstream frame spins in "Opening the
+        // live browser" forever. Reap it so the panel reconnects instead.
+        if (!viewer.receivedFrame && Date.now() - viewer.waitingSince > FIRST_FRAME_TIMEOUT_MS) { this.close(viewer); return; }
         if (!this.current(viewer) || (viewer.frameAt && Date.now() - viewer.frameAt > 2 * HEARTBEAT_MS)) { this.close(viewer); return; }
         this.control(viewer.session);
         this.send(viewer, { type: "heartbeat" });
@@ -424,8 +465,21 @@ export class BrowserLive {
         this.control(viewer.session);
         await taking;
         if (!this.current(viewer)) { this.close(viewer); throw new BrowserLiveError("This browser view closed.", 409); }
+        // The first tap after take must map to true input coordinates.
+        await this.refreshPageViewport(viewer);
         return { ok: true };
-      } catch { throw new BrowserLiveError("Another browser view or bot action is using this browser. Try again shortly.", 409); }
+      } catch (error) {
+        // Take() fails for distinct actionable reasons; surfacing them beats a
+        // generic "try again", which misleads when Restart is actually required.
+        const reason = error instanceof Error ? error.message : "";
+        if (/still be running|Restart this browser/i.test(reason))
+          throw new BrowserLiveError("A browser action may still be running. Restart this browser before taking control.", 409);
+        if (/still finishing|hand it back/i.test(reason))
+          throw new BrowserLiveError("A bot browser action is still finishing. Wait for it to finish, then retry taking control.", 409);
+        if (/changing|cancelled/i.test(reason))
+          throw new BrowserLiveError("Browser control is changing. Try again shortly.", 409);
+        throw new BrowserLiveError("Another browser view or bot action is using this browser. Try again shortly.", 409);
+      }
       finally { this.control(viewer.session); }
     }
     if (!this.runtime.canControl(viewer.session, viewer.id)) throw new BrowserLiveError("Take control of this browser before interacting.", 409);
