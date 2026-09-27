@@ -137,6 +137,11 @@ describe("computerPrompt", () => {
     expect(BUILT_IN_BROWSER_SYSTEM_PROMPT.endsWith(SIGN_IN_PROMPT)).toBe(true);
   });
 
+  it("tells the agent to check status, wait, and retry a held browser instead of reporting blocked", () => {
+    expect(BUILT_IN_BROWSER_SYSTEM_PROMPT).toContain("agent_browser_status");
+    expect(BUILT_IN_BROWSER_SYSTEM_PROMPT).toContain("retry the same action for several minutes before reporting it blocked");
+  });
+
   it("allows authorized login without granting secret discovery or removing human handoff", () => {
     expect(SIGN_IN_PROMPT).toContain("sign-ins explicitly authorized by the user");
     expect(SIGN_IN_PROMPT).toContain("enter credentials the user supplied or designated for that site and account");

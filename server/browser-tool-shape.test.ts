@@ -29,6 +29,16 @@ describe("browser tool shaping", () => {
     expect(snapshotTool.inputSchema.properties).toHaveProperty("session"); // input untouched
   });
 
+  it("advertises the read-only hold-status tool exactly once", () => {
+    const slim = slimBrowserToolList({ tools: [snapshotTool] }) as { tools: Array<{ name: string; inputSchema?: { properties?: Record<string, unknown> } }> };
+    const names = slim.tools.map((tool) => tool.name);
+    expect(names).toContain("agent_browser_status");
+    expect(names.filter((name) => name === "agent_browser_status")).toHaveLength(1);
+    expect(Object.keys(slim.tools.find((tool) => tool.name === "agent_browser_status")!.inputSchema!.properties!)).toEqual([]);
+    const deduped = slimBrowserToolList({ tools: [{ name: "agent_browser_status" }] }) as { tools: Array<{ name: string }> };
+    expect(deduped.tools.filter((tool) => tool.name === "agent_browser_status")).toHaveLength(1);
+  });
+
   it("drops harness-owned arguments from a call and leaves ordinary calls identical", () => {
     const ordinary = { name: "agent_browser_click", arguments: { ref: "@e3" } };
     expect(stripHarnessOwnedArguments(ordinary)).toBe(ordinary);
@@ -59,3 +69,4 @@ describe("browser tool shaping", () => {
     expect(custom.content[0].text.length).toBeLessThan(1_600);
   });
 });
+

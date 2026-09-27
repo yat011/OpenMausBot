@@ -26,6 +26,16 @@ export const HARNESS_OWNED_BROWSER_PARAMS: ReadonlySet<string> = new Set([
  * (21k chars) fits; a whole product page read as markdown (79k) does not. */
 export const DEFAULT_BROWSER_RESULT_BUDGET = 32_000;
 
+/** Harness-owned diagnostic, answered by the runtime — never forwarded to
+ * the engine. Injected into every advertised list so a blocked agent can
+ * inspect the wait instead of guessing. */
+export const BROWSER_STATUS_TOOL = "agent_browser_status";
+export const BROWSER_STATUS_TOOL_DEFINITION = {
+  name: BROWSER_STATUS_TOOL,
+  description: "Check whether this browser is idle, held by a person, or needs a restart. Read-only: works even while a person holds control. Call it before reporting the browser blocked, then wait and retry while held.",
+  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+} as const;
+
 const BROWSER_NARROWING_HINT =
   " For a snapshot, pass selector or depth, or set compact; for one value such as a price, use agent_browser_get_text or agent_browser_find instead of reading the whole page.";
 
@@ -49,6 +59,9 @@ export function slimBrowserToolList(result: unknown): unknown {
       : schema.required;
     return { ...tool, inputSchema: { ...schema, ...(properties === undefined ? {} : { properties }), ...(required === undefined ? {} : { required }) } };
   });
+  if (!tools.some((tool) => isRecord(tool) && tool.name === BROWSER_STATUS_TOOL)) {
+    tools.push({ ...BROWSER_STATUS_TOOL_DEFINITION });
+  }
   return { ...result, tools };
 }
 

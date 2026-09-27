@@ -210,6 +210,10 @@ export class BrowserLive {
   }
 
   private control(session: string): void {
+    // Heartbeats and actions both land here, so a forgotten hold clears on
+    // the panel even when no agent is waiting on it. Reaping never touches
+    // active input, a hand-back, an uncertain latch, or a close.
+    this.runtime.reapStaleHold(session);
     for (const viewer of this.viewers.values()) {
       if (viewer.session !== session) continue;
       const held = Boolean(this.runtime.heldBy(session));

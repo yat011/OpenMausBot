@@ -1,5 +1,5 @@
 import { killCliTree, spawnCli } from "./procs.ts";
-import { DEFAULT_BROWSER_RESULT_BUDGET, shapeBrowserToolResult, slimBrowserToolList, stripHarnessOwnedArguments } from "./browser-tool-shape.ts";
+import { BROWSER_STATUS_TOOL, DEFAULT_BROWSER_RESULT_BUDGET, shapeBrowserToolResult, slimBrowserToolList, stripHarnessOwnedArguments } from "./browser-tool-shape.ts";
 
 export interface BrowserSpawnSpec {
   command: string;
@@ -7,7 +7,7 @@ export interface BrowserSpawnSpec {
   env: Record<string, string | undefined>;
 }
 
-export const BROWSER_CONTROL_REFUSAL = "Browser tools are paused while a person controls this browser. Wait for them to hand control back; do not try another browser or execution tool.";
+export const BROWSER_CONTROL_REFUSAL = "Browser tools are paused while a person controls this browser. Check agent_browser_status, wait about 30 seconds, and retry the same action for several minutes before reporting blocked; a hold with no input for several minutes releases itself. Do not try another browser or execution tool.";
 const MAX_REQUEST_BYTES = 1_048_576;
 const MAX_RESPONSE_BYTES = 16_777_216;
 /** Startup, not per-request work: a cold engine spawn can exceed a tight
@@ -200,7 +200,37 @@ interface Gate {
   humans: number;
   uncertain: boolean;
   closing: boolean;
+  heldSince: number | null;
+  lastActivityAt: number | null;
   changed: Set<() => void>;
+}
+
+/** Read-only gate state for agents: idle, a person's hold with its age,
+ * an interrupted action that needs a restart, or a close in flight. */
+export type BrowserGateState = "idle" | "held" | "uncertain" | "closing";
+export interface BrowserGateStatus {
+  state: BrowserGateState;
+  heldByPerson: boolean;
+  releasing: boolean;
+  agents: number;
+  humans: number;
+  /** ms since take(); present while a person holds the browser. */
+  heldMs?: number;
+  /** ms since the last take/human action; present while held. */
+  quietMs?: number;
+}
+
+export function isBrowserStatusCall(params: unknown): boolean {
+  return !!params && typeof params === "object"
+    && (params as { name?: unknown }).name === BROWSER_STATUS_TOOL;
+}
+
+function formatGateDuration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 /** Agent `close --all` is the complete Chrome restart for this bot session. */
@@ -216,17 +246,18 @@ export function isCompleteBrowserClose(params: unknown): boolean {
 export class BrowserRuntime {
   private gates = new Map<string, Gate>();
   private clients = new Map<string, { key: string; client: BrowserClient }>();
-  private options: { requestTimeoutMs: number; takeoverTimeoutMs: number; idleMs: number; maxPending: number; resultBudget: number };
+  private options: { requestTimeoutMs: number; takeoverTimeoutMs: number; idleMs: number; maxPending: number; resultBudget: number; holdIdleMs: number };
 
   constructor(options: Partial<BrowserRuntime["options"]> = {}) {
     const budget = Number(process.env.OMB_BROWSER_RESULT_BUDGET);
-    this.options = { requestTimeoutMs: 120_000, takeoverTimeoutMs: 15_000, idleMs: 60_000, maxPending: 16, resultBudget: Number.isFinite(budget) && budget > 0 ? budget : DEFAULT_BROWSER_RESULT_BUDGET, ...options };
+    const holdIdle = Number(process.env.OMB_BROWSER_HOLD_IDLE_MS);
+    this.options = { requestTimeoutMs: 120_000, takeoverTimeoutMs: 15_000, idleMs: 60_000, maxPending: 16, resultBudget: Number.isFinite(budget) && budget > 0 ? budget : DEFAULT_BROWSER_RESULT_BUDGET, holdIdleMs: Number.isFinite(holdIdle) && holdIdle > 0 ? holdIdle : 600_000, ...options };
   }
 
   private gate(session: string): Gate {
     let gate = this.gates.get(session);
     if (!gate) {
-      gate = { owner: null, ready: false, releasing: false, agents: 0, humans: 0, uncertain: false, closing: false, changed: new Set() };
+      gate = { owner: null, ready: false, releasing: false, agents: 0, humans: 0, uncertain: false, closing: false, heldSince: null, lastActivityAt: null, changed: new Set() };
       this.gates.set(session, gate);
     }
     return gate;
@@ -237,11 +268,70 @@ export class BrowserRuntime {
       gate.owner = null;
       gate.releasing = false;
       gate.ready = false;
+      gate.heldSince = null;
+      gate.lastActivityAt = null;
     }
     for (const notify of gate.changed) notify();
   }
 
+  /** Release a forgotten hold: a person owns the gate, nothing is in flight,
+   * nothing needs recovery, and no input arrived within holdIdleMs. Never
+   * touches active control (humans > 0 or recent input), a hand-back in
+   * progress, an uncertain latch, or a close. Lazy: callers reap before
+   * refusing, so a stale morning-after hold never blocks the first retry. */
+  reapStaleHold(session: string, now = Date.now()): boolean {
+    const gate = this.gates.get(session);
+    if (!gate || gate.owner === null || gate.releasing || gate.closing || gate.uncertain) return false;
+    if (!Number.isFinite(now)) return false;
+    if (gate.agents !== 0 || gate.humans !== 0) return false;
+    const last = gate.lastActivityAt ?? gate.heldSince;
+    if (last === null) return false;
+    if (now - last < this.options.holdIdleMs) return false;
+    gate.owner = null;
+    gate.ready = false;
+    gate.heldSince = null;
+    gate.lastActivityAt = null;
+    this.changed(gate);
+    return true;
+  }
+
+  /** Read-only gate state for the agent status tool. Reaps a stale hold
+   * first, so the reported state matches what the next action would see. */
+  status(session: string, now = Date.now()): BrowserGateStatus {
+    this.reapStaleHold(session, now);
+    const gate = this.gates.get(session);
+    const base = { releasing: gate?.releasing ?? false, agents: gate?.agents ?? 0, humans: gate?.humans ?? 0 };
+    if (!gate) return { state: "idle", heldByPerson: false, ...base };
+    if (gate.closing) return { state: "closing", heldByPerson: gate.owner !== null, ...base };
+    if (gate.uncertain) return { state: "uncertain", heldByPerson: gate.owner !== null, ...base };
+    if (gate.owner === null) return { state: "idle", heldByPerson: false, ...base };
+    return {
+      state: "held", heldByPerson: true, ...base,
+      heldMs: gate.heldSince === null ? 0 : Math.max(0, now - gate.heldSince),
+      quietMs: gate.lastActivityAt === null ? 0 : Math.max(0, now - gate.lastActivityAt),
+    };
+  }
+
+  /** One agent-facing paragraph for the reported status, including how long
+   * to wait before treating the browser as blocked. */
+  describeStatus(session: string, now = Date.now()): string {
+    const observed = this.status(session, now);
+    const releaseMinutes = Math.max(1, Math.round(this.options.holdIdleMs / 60_000));
+    if (observed.state === "idle") return "Browser is idle: no person holds control and no recovery is needed. Proceed with browser actions.";
+    if (observed.state === "closing") return "The browser is closing or restarting. Wait about 30 seconds and retry the same action.";
+    if (observed.state === "uncertain" && !observed.heldByPerson) {
+      return "A browser action was interrupted and the browser needs a restart. Restart it with agent_browser_close all=true before continuing; do not report success without restarting.";
+    }
+    if (observed.state === "uncertain") {
+      return "A browser action was interrupted and a person holds control. Wait for them to hand control back or restart the browser from the panel, then restart it with agent_browser_close all=true before continuing.";
+    }
+    const held = formatGateDuration(observed.heldMs ?? 0);
+    const quiet = formatGateDuration(observed.quietMs ?? 0);
+    return `A person holds this browser (held ${held}, last input ${quiet} ago). Wait about 30 seconds and retry the same action; keep waiting and retrying for several minutes before reporting blocked. A hold with no input for ${releaseMinutes} minutes releases itself. Do not try another browser or execution tool.`;
+  }
+
   async withAgentAction<T>(session: string, fn: () => Promise<T>): Promise<T> {
+    this.reapStaleHold(session);
     const gate = this.gate(session);
     if (gate.owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
     if (gate.uncertain) throw new Error("A browser action was interrupted. Restart this browser before continuing.");
@@ -260,6 +350,11 @@ export class BrowserRuntime {
 
   async agentRpc(session: string, spec: BrowserSpawnSpec, method: "tools/list" | "tools/call", params: unknown, beforeDispatch?: () => void, recoverNative?: () => Promise<void>): Promise<unknown> {
     if (method !== "tools/list" && method !== "tools/call") throw new Error("Unsupported browser method.");
+    // Read-only diagnostic: bypasses the gate, the capability checks, and
+    // the turn resource claim, so a blocked agent can always inspect the wait.
+    if (method === "tools/call" && isBrowserStatusCall(params)) {
+      return { content: [{ type: "text", text: this.describeStatus(session) }] };
+    }
     if (method === "tools/call" && isCompleteBrowserClose(params)) {
       if (!recoverNative) throw new Error("Browser recovery is not configured.");
       beforeDispatch?.();
@@ -350,11 +445,14 @@ export class BrowserRuntime {
 
   async take(session: string, owner: string): Promise<void> {
     if (!owner) throw new Error("Browser control requires an owner.");
+    this.reapStaleHold(session);
     const gate = this.gate(session);
     if (gate.closing || gate.releasing) throw new Error("Browser control is changing. Try again shortly.");
     if (gate.owner !== null && gate.owner !== owner) throw new Error("Another person controls this browser.");
     gate.owner = owner; // synchronous: no new agent work slips in while draining.
     gate.ready = false;
+    gate.heldSince = Date.now();
+    gate.lastActivityAt = Date.now();
     await new Promise<void>((resolve, reject) => {
       const finish = (error?: Error) => {
         clearTimeout(timer);
@@ -402,6 +500,7 @@ export class BrowserRuntime {
   async withHumanAction<T>(session: string, owner: string, fn: () => Promise<T>): Promise<T> {
     if (!this.canControl(session, owner)) throw new Error("Take control of this browser before interacting.");
     const gate = this.gate(session);
+    gate.lastActivityAt = Date.now();
     gate.humans++;
     try { return await fn(); }
     catch (error) {
@@ -417,6 +516,7 @@ export class BrowserRuntime {
   /** Agent recovery for `close --all`. Does not take human control; refuses
    * if a person already holds the panel. Native close is the safety barrier. */
   async agentRestart(session: string, closeBrowser: () => Promise<void>): Promise<void> {
+    this.reapStaleHold(session);
     const gate = this.gate(session);
     if (gate.owner !== null && gate.owner !== "agent") throw new Error(BROWSER_CONTROL_REFUSAL);
     await this.restart(session, "agent", closeBrowser);
@@ -426,6 +526,7 @@ export class BrowserRuntime {
    * or admits human input; a successful native close is its safety barrier. */
   async restart(session: string, owner: string, closeBrowser: () => Promise<void>): Promise<void> {
     if (!owner) throw new Error("Browser recovery requires an owner.");
+    this.reapStaleHold(session);
     const gate = this.gate(session);
     if (gate.closing || gate.releasing || gate.agents || gate.humans) throw new Error("The browser is busy. Wait for current work to finish before restarting.");
     if (gate.owner !== null && gate.owner !== owner) throw new Error("Another person controls this browser.");
@@ -443,6 +544,8 @@ export class BrowserRuntime {
       gate.uncertain = false;
       gate.owner = null;
       gate.releasing = false;
+      gate.heldSince = null;
+      gate.lastActivityAt = null;
     } catch (error) {
       gate.owner = owner;
       gate.uncertain = true;

@@ -313,7 +313,7 @@ describe("server-owned browser MCP runtime", () => {
     expect(other.pid).not.toBe(list.pid);
     await value.take("one", "owner");
     await expect(value.agentRpc("one", spec(), "tools/call", { name: "echo" })).rejects.toThrow(/paused/);
-    await expect(value.agentRpc("one", spec(), "tools/list", {})).resolves.toMatchObject({ tools: [{ name: "echo" }] });
+    await expect(value.agentRpc("one", spec(), "tools/list", {})).resolves.toMatchObject({ tools: [{ name: "echo" }, { name: "agent_browser_status" }] });
   });
 
   it("keeps completed MCP refusals distinct from uncertain transport failure", async () => {
@@ -446,5 +446,91 @@ describe("browser MCP shaping at the runtime boundary", () => {
       expect(bulky.content[0].text).toContain("trimmed this tool result");
       expect(bulky.content[1]).toMatchObject({ type: "image" });
     } finally { await value.closeAll(); }
+  });
+});
+
+describe("browser hold status and idle release", () => {
+  it("reports an unknown session as idle", async () => {
+    const value = runtime();
+    expect(value.status("fresh")).toMatchObject({ state: "idle", heldByPerson: false });
+    expect(value.describeStatus("fresh")).toContain("idle");
+  });
+
+  it("reports who holds the browser and how long the hold has sat quiet", async () => {
+    const value = runtime();
+    await value.take("s", "person");
+    const seen = value.status("s", Date.now() + 65_000);
+    expect(seen).toMatchObject({ state: "held", heldByPerson: true });
+    expect(seen.heldMs).toBeGreaterThanOrEqual(65_000);
+    expect(seen.quietMs).toBeGreaterThanOrEqual(65_000);
+    expect(value.describeStatus("s", Date.now() + 65_000)).toMatch(/holds this browser.*1m/);
+  });
+
+  it("releases a forgotten hold once it has sat quiet past the idle timeout", async () => {
+    const value = runtime({ holdIdleMs: 40 });
+    await value.take("s", "owner");
+    await expect(value.withAgentAction("s", async () => "snapshot")).rejects.toThrow(/paused/);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await expect(value.withAgentAction("s", async () => "snapshot")).resolves.toBe("snapshot");
+    expect(value.heldBy("s")).toBeNull();
+    expect(value.status("s")).toMatchObject({ state: "idle" });
+  });
+
+  it("lets the next person take a session whose earlier hold went stale", async () => {
+    const value = runtime({ holdIdleMs: 40 });
+    await value.take("s", "first");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await value.take("s", "second");
+    expect(value.heldBy("s")).toBe("second");
+    expect(value.canControl("s", "second")).toBe(true);
+  });
+
+  it("does not release a hold while a human action is in flight", async () => {
+    const value = runtime();
+    await value.take("s", "owner");
+    const action = deferred<string>();
+    const pending = value.withHumanAction("s", "owner", () => action.promise);
+    expect(value.reapStaleHold("s", Date.now() + 3_600_000)).toBe(false);
+    expect(value.heldBy("s")).toBe("owner");
+    action.resolve("done");
+    await pending;
+    expect(value.reapStaleHold("s", Date.now() + 3_600_000)).toBe(true);
+    expect(value.heldBy("s")).toBeNull();
+  });
+
+  it("treats a fresh human click as activity that restarts the idle clock", async () => {
+    const value = runtime({ holdIdleMs: 200 });
+    await value.take("s", "owner");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await value.withHumanAction("s", "owner", async () => "click");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await expect(value.withAgentAction("s", async () => "snapshot")).rejects.toThrow(/paused/);
+    expect(value.heldBy("s")).toBe("owner");
+  });
+
+  it("never releases an uncertain hold, even when it is old", async () => {
+    const value = runtime();
+    await value.agentRpc("s", spec(), "tools/list", {});
+    await value.take("s", "owner");
+    await expect(value.withHumanAction("s", "owner", async () => { throw new Error("navigation timed out"); })).rejects.toThrow(/timed out/);
+    expect(value.reapStaleHold("s", Date.now() + 86_400_000)).toBe(false);
+    expect(value.status("s")).toMatchObject({ state: "uncertain", heldByPerson: true });
+    expect(value.describeStatus("s")).toMatch(/hand control back|agent_browser_close/);
+  });
+
+  it("answers the status tool while held, without spawning an engine or claiming the gate", async () => {
+    const value = runtime();
+    await value.take("s", "owner");
+    const held = await value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_status" }) as { content: Array<{ text: string }> };
+    expect(held.content[0].text).toContain("holds this browser");
+    expect(value.heldBy("s")).toBe("owner");
+    const idle = await value.agentRpc("fresh", spec(), "tools/call", { name: "agent_browser_status" }) as { content: Array<{ text: string }> };
+    expect(idle.content[0].text).toContain("idle");
+  });
+
+  it("mentions the status tool in the held-browser refusal", async () => {
+    const value = runtime();
+    await value.take("s", "owner");
+    await expect(value.withAgentAction("s", async () => "snapshot")).rejects.toThrow(/agent_browser_status/);
   });
 });

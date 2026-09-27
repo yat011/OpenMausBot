@@ -71,6 +71,7 @@ beforeEach(() => {
     release: vi.fn((session: string, owner: string) => { if (held.get(session) === owner) held.delete(session); }),
     abandonHumanInput: vi.fn(),
     withHumanAction: vi.fn(async (_session: string, _owner: string, fn: () => unknown) => fn()),
+    reapStaleHold: vi.fn(() => false),
   } as unknown as BrowserRuntime;
   live = new BrowserLive({ runtime });
   SocketFixture.instances = [];
