@@ -532,5 +532,14 @@ describe("browser hold status and idle release", () => {
     const value = runtime();
     await value.take("s", "owner");
     await expect(value.withAgentAction("s", async () => "snapshot")).rejects.toThrow(/agent_browser_status/);
+    await expect(value.withAgentAction("s", async () => "snapshot")).rejects.toThrow(/for 5 minutes/);
+    expect(value.describeStatus("s")).toContain("for 5 minutes");
+  });
+
+  it("states the configured hold timeout in the refusal and status", async () => {
+    const value = runtime({ holdIdleMs: 600_000 });
+    await value.take("s", "owner");
+    await expect(value.withAgentAction("s", async () => "snapshot")).rejects.toThrow(/for 10 minutes/);
+    expect(value.describeStatus("s")).toContain("for 10 minutes");
   });
 });

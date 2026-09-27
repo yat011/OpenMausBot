@@ -7,7 +7,12 @@ export interface BrowserSpawnSpec {
   env: Record<string, string | undefined>;
 }
 
-export const BROWSER_CONTROL_REFUSAL = "Browser tools are paused while a person controls this browser. Check agent_browser_status, wait about 30 seconds, and retry the same action for several minutes before reporting blocked; a hold with no input for several minutes releases itself. Do not try another browser or execution tool.";
+/** Refusal text for a held browser. The wait matches the configured hold
+ * idle timeout, so an OMB_BROWSER_HOLD_IDLE_MS override stays truthful. */
+export function browserControlRefusal(holdIdleMs: number): string {
+  const minutes = Math.max(1, Math.round(holdIdleMs / 60_000));
+  return `Browser tools are paused while a person controls this browser. Check agent_browser_status, wait about 30 seconds, and retry the same action for ${minutes} minutes before reporting blocked; a hold with no input for ${minutes} minutes releases itself. Do not try another browser or execution tool.`;
+}
 const MAX_REQUEST_BYTES = 1_048_576;
 const MAX_RESPONSE_BYTES = 16_777_216;
 /** Startup, not per-request work: a cold engine spawn can exceed a tight
@@ -251,7 +256,7 @@ export class BrowserRuntime {
   constructor(options: Partial<BrowserRuntime["options"]> = {}) {
     const budget = Number(process.env.OMB_BROWSER_RESULT_BUDGET);
     const holdIdle = Number(process.env.OMB_BROWSER_HOLD_IDLE_MS);
-    this.options = { requestTimeoutMs: 120_000, takeoverTimeoutMs: 15_000, idleMs: 60_000, maxPending: 16, resultBudget: Number.isFinite(budget) && budget > 0 ? budget : DEFAULT_BROWSER_RESULT_BUDGET, holdIdleMs: Number.isFinite(holdIdle) && holdIdle > 0 ? holdIdle : 600_000, ...options };
+    this.options = { requestTimeoutMs: 120_000, takeoverTimeoutMs: 15_000, idleMs: 60_000, maxPending: 16, resultBudget: Number.isFinite(budget) && budget > 0 ? budget : DEFAULT_BROWSER_RESULT_BUDGET, holdIdleMs: Number.isFinite(holdIdle) && holdIdle > 0 ? holdIdle : 300_000, ...options };
   }
 
   private gate(session: string): Gate {
@@ -327,20 +332,24 @@ export class BrowserRuntime {
     }
     const held = formatGateDuration(observed.heldMs ?? 0);
     const quiet = formatGateDuration(observed.quietMs ?? 0);
-    return `A person holds this browser (held ${held}, last input ${quiet} ago). Wait about 30 seconds and retry the same action; keep waiting and retrying for several minutes before reporting blocked. A hold with no input for ${releaseMinutes} minutes releases itself. Do not try another browser or execution tool.`;
+    return `A person holds this browser (held ${held}, last input ${quiet} ago). Wait about 30 seconds and retry the same action; keep waiting and retrying for ${releaseMinutes} minutes before reporting blocked. A hold with no input for ${releaseMinutes} minutes releases itself. Do not try another browser or execution tool.`;
+  }
+
+  private refusal(): Error {
+    return new Error(browserControlRefusal(this.options.holdIdleMs));
   }
 
   async withAgentAction<T>(session: string, fn: () => Promise<T>): Promise<T> {
     this.reapStaleHold(session);
     const gate = this.gate(session);
-    if (gate.owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
+    if (gate.owner !== null) throw this.refusal();
     if (gate.uncertain) throw new Error("A browser action was interrupted. Restart this browser before continuing.");
     if (gate.closing) throw new Error("The browser is closing. Try again shortly.");
     gate.agents++;
     try {
       const result = await fn();
       // Discard observations completed after takeover was requested.
-      if (gate.owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
+      if (gate.owner !== null) throw this.refusal();
       return result;
     } finally {
       gate.agents--;
@@ -384,7 +393,7 @@ export class BrowserRuntime {
       }
       await entry.client.ready;
       beforeDispatch?.();
-      if (method === "tools/call" && this.gate(session).owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
+      if (method === "tools/call" && this.gate(session).owner !== null) throw this.refusal();
       try {
         // The model sees slimmed schemas and text-only, bounded results; the
         // launch/session parameters OMB owns never reach the engine from a call.
@@ -398,7 +407,7 @@ export class BrowserRuntime {
           // Navigation alone does not prove that the requested page loaded.
           // Observe in the same scoped session, without replaying the action.
           beforeDispatch?.();
-          if (this.gate(session).owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
+          if (this.gate(session).owner !== null) throw this.refusal();
           let observation: unknown;
           try {
             observation = await entry.client.rpc("tools/call", {
@@ -518,7 +527,7 @@ export class BrowserRuntime {
   async agentRestart(session: string, closeBrowser: () => Promise<void>): Promise<void> {
     this.reapStaleHold(session);
     const gate = this.gate(session);
-    if (gate.owner !== null && gate.owner !== "agent") throw new Error(BROWSER_CONTROL_REFUSAL);
+    if (gate.owner !== null && gate.owner !== "agent") throw this.refusal();
     await this.restart(session, "agent", closeBrowser);
   }
 

@@ -1,7 +1,7 @@
 # Team incidents: a broken run reaches the Chief of Staff
 
 A bot's run can fail (the engine exits before a result), stall (no activity
-for twenty minutes), fail to start (a setting, a missing engine), or a
+for thirty minutes), fail to start (a setting, a missing engine), or a
 scheduled routine can fail. Each used to leave one chip in the thread it died
 in and nothing anywhere else — the person found it hours later, from a phone,
 by opening the desktop and reading every thread, then retried by hand.

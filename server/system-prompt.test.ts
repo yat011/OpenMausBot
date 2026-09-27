@@ -139,7 +139,7 @@ describe("computerPrompt", () => {
 
   it("tells the agent to check status, wait, and retry a held browser instead of reporting blocked", () => {
     expect(BUILT_IN_BROWSER_SYSTEM_PROMPT).toContain("agent_browser_status");
-    expect(BUILT_IN_BROWSER_SYSTEM_PROMPT).toContain("retry the same action for several minutes before reporting it blocked");
+    expect(BUILT_IN_BROWSER_SYSTEM_PROMPT).toContain("retry the same action for 5 minutes before reporting it blocked");
   });
 
   it("allows authorized login without granting secret discovery or removing human handoff", () => {
