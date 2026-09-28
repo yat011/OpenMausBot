@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BrowserRuntime, TransportError, browserRuntimeEnv, isCompleteBrowserClose, type BrowserSpawnSpec } from "./browser-runtime.ts";
+import { BrowserRefusedError, BrowserRuntime, TransportError, browserRuntimeEnv, isCompleteBrowserClose, type BrowserSpawnSpec } from "./browser-runtime.ts";
 
 const runtimes: BrowserRuntime[] = [];
 function runtime(options: ConstructorParameters<typeof BrowserRuntime>[0] = {}) {
@@ -99,6 +99,21 @@ describe("browser takeover gate", () => {
     await expect(value.withAgentAction("s", async () => "snapshot")).rejects.toThrow(/Restart/);
     await expect(value.take("s", "owner")).rejects.toThrow(/may still be running/);
     await value.close("s");
+    value.release("s", "owner");
+    await expect(value.withAgentAction("s", async () => "recovered")).resolves.toBe("recovered");
+  });
+
+  it("keeps control when the daemon refuses work it never accepted", async () => {
+    // tab_gone (OAuth jumps close the daemon's target): nothing executed,
+    // so the refusal must not latch uncertainty or drop the holder — the
+    // viewer rebinds a tab and retries instead of wedging on Restart.
+    const value = runtime();
+    await value.take("s", "owner");
+    await expect(value.withHumanAction("s", "owner", async () => {
+      throw new BrowserRefusedError("The browser tab closed during navigation.", "tab_gone");
+    })).rejects.toThrow(/tab closed/);
+    expect(value.status("s")).toMatchObject({ state: "held", heldByPerson: true });
+    expect(value.canControl("s", "owner")).toBe(true);
     value.release("s", "owner");
     await expect(value.withAgentAction("s", async () => "recovered")).resolves.toBe("recovered");
   });

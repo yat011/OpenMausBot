@@ -28,6 +28,21 @@ export function browserRuntimeEnv(overrides: Record<string, string | undefined>)
 }
 
 export class TransportError extends Error {}
+
+/** The daemon positively declined an action it never accepted — its bound
+ * tab is gone after a page-driven jump (OAuth popups close their own
+ * target), not a timeout. Nothing executed, so — unlike a transport
+ * failure — there is nothing to be uncertain about: human-action callers
+ * rethrow it past the uncertainty latch and recover by rebinding a tab. */
+export class BrowserRefusedError extends Error {
+  readonly status = 503;
+  readonly code?: string;
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = "BrowserRefusedError";
+    this.code = code;
+  }
+}
 type Pending = { resolve: (result: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 
 /** A server-owned JSONL client. Neither child stderr nor its environment is
@@ -551,6 +566,10 @@ export class BrowserRuntime {
     gate.humans++;
     try { return await fn(); }
     catch (error) {
+      // A refusal names work the daemon never accepted (its tab is gone):
+      // latching here would wedge the panel on Restart for input that never
+      // ran, with no holder left to recover it.
+      if (error instanceof BrowserRefusedError) throw error;
       // Validation happens before entry. A failed accepted command might still
       // be executing in the daemon; hand-back must not race its completion.
       gate.uncertain = true;

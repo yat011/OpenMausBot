@@ -493,4 +493,69 @@ describe("authenticated browser viewer relay", () => {
     await a.action({ type: "restart" });
     await expect(runtime.withAgentAction("profile-a", async () => true)).resolves.toBe(true);
   });
+  it("rebinds a tab the page closed under the viewer and confirms the input without latching", async () => {
+    // OAuth jumps destroy the daemon's bound target (tab_gone): the relay
+    // refuses fast with success:false instead of hanging, so the input was
+    // never accepted and must not latch uncertainty. Rebind and retry once.
+    runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
+    const a = await open(); await a.action({ type: "take" });
+    nativeInput.mockImplementationOnce(async () => Response.json({ success: false, code: "tab_gone", error: "tab_gone: bound tab is gone" }));
+    execute
+      .mockResolvedValueOnce(output({ tabs: [
+        { tabId: "t1", title: "blank", url: "about:blank", active: false },
+        { tabId: "t2", title: "X", url: "https://x.com/i/flow/login", active: false },
+      ] }))
+      .mockResolvedValueOnce(output({ tabId: "t2" }));
+    await expect(a.action({ type: "input_mouse", eventType: "mousePressed", x: 12, y: 20, button: "left", clickCount: 1 })).resolves.toEqual({ ok: true });
+    expect(execute.mock.calls.map((call) => call[1].slice(0, 2))).toContainEqual(["tab", "list"]);
+    expect(execute.mock.calls.map((call) => call[1].slice(0, 2))).toContainEqual(["tab", "t2"]);
+    expect(nativeInput).toHaveBeenCalledTimes(2);
+    await expect(a.action({ type: "input_mouse", eventType: "mouseReleased", x: 12, y: 20, button: "left" })).resolves.toEqual({ ok: true });
+    expect(runtime.status("profile-a")).toMatchObject({ state: "held", heldByPerson: true });
+    expect(runtime.canControl("profile-a", a.res.id)).toBe(true);
+    await a.action({ type: "release" });
+    await expect(runtime.withAgentAction("profile-a", async () => true)).resolves.toBe(true);
+  });
+  it("refuses without latching when no tab survives to rebind to", async () => {
+    runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
+    const a = await open(); await a.action({ type: "take" });
+    nativeInput.mockImplementation(async () => Response.json({ success: false, code: "tab_gone", error: "tab_gone: bound tab is gone" }));
+    execute.mockResolvedValueOnce(output({ tabs: [] }));
+    await expect(a.action({ type: "input_mouse", eventType: "mousePressed", x: 12, y: 20, button: "left", clickCount: 1 })).rejects.toThrow(/tab closed/);
+    // No uncertainty: the holder keeps control, the tabs stay listed, and
+    // the next input retries the rebind instead of wedging on Restart.
+    expect(runtime.status("profile-a")).toMatchObject({ state: "held", heldByPerson: true });
+    expect(runtime.canControl("profile-a", a.res.id)).toBe(true);
+    await a.action({ type: "release" });
+    await expect(runtime.withAgentAction("profile-a", async () => true)).resolves.toBe(true);
+  });
+  it("refuses viewer commands the dead tab cannot run without latching uncertainty", async () => {
+    runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
+    const a = await open(); await a.action({ type: "take" });
+    // The daemon reports tab_gone as a nonzero exit with JSON on stdout; an
+    // exit-zero success:false envelope refuses the same way.
+    const failed = (payload: unknown) => Object.assign(new Error("Command failed"), { stdout: JSON.stringify(payload) });
+    execute.mockRejectedValueOnce(failed({ success: false, code: "tab_gone", error: "tab_gone: bound tab is gone" }));
+    await expect(a.action({ type: "navigate", url: "https://example.com" })).rejects.toThrow(/tab closed/);
+    execute.mockResolvedValueOnce({ stdout: JSON.stringify({ success: false, code: "tab_gone", error: "tab_gone: bound tab is gone" }), stderr: "" });
+    await expect(a.action({ type: "navigate", url: "https://example.org" })).rejects.toThrow(/tab closed/);
+    expect(runtime.status("profile-a")).toMatchObject({ state: "held", heldByPerson: true });
+    expect(runtime.canControl("profile-a", a.res.id)).toBe(true);
+  });
+  it("still latches uncertainty when a viewer command cannot reach the daemon", async () => {
+    runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
+    const a = await open(); await a.action({ type: "take" });
+    execute.mockRejectedValueOnce(new Error("spawn ENOENT"));
+    await expect(a.action({ type: "navigate", url: "https://example.com" })).rejects.toThrow("could not complete this action");
+    expect(runtime.status("profile-a")).toMatchObject({ state: "uncertain" });
+  });
+  it("still latches uncertainty when the input relay itself is unreachable", async () => {
+    runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
+    const a = await open(); await a.action({ type: "take" });
+    nativeInput.mockRejectedValueOnce(new Error("socket hang up"));
+    await expect(a.action({ type: "input_keyboard", eventType: "keyDown", key: "Enter" })).rejects.toThrow("could not confirm this input");
+    expect(runtime.status("profile-a")).toMatchObject({ state: "uncertain" });
+    await a.action({ type: "release" });
+    await expect(runtime.withAgentAction("profile-a", async () => true)).rejects.toThrow("Restart");
+  });
 });

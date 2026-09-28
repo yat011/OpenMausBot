@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import { promisify } from "node:util";
-import { browserRuntimeEnv, type BrowserRuntime } from "./browser-runtime.ts";
+import { BrowserRefusedError, browserRuntimeEnv, type BrowserRuntime } from "./browser-runtime.ts";
 import { closeBrowserSession } from "./browser-engine.ts";
 
 const execute = promisify(execFile);
@@ -75,6 +75,27 @@ export function normalizeBrowserLiveMessage(value: unknown): ObjectValue | null 
       scrollOffsetX: number(meta.scrollOffsetX, -1e8, 1e8) ? meta.scrollOffsetX : 0,
       scrollOffsetY: number(meta.scrollOffsetY, -1e8, 1e8) ? meta.scrollOffsetY : 0,
       timestamp: number(meta.timestamp, 0, Number.MAX_SAFE_INTEGER) ? meta.timestamp : 0 } };
+}
+
+/** The daemon names a dead bound tab (OAuth jumps close their own target)
+ * with code tab_gone; older replies carry it only in the error text. Either
+ * shape proves the action was never accepted, so it must not latch. */
+function isTabGoneReply(reply: unknown): boolean {
+  const data = object(reply);
+  if (!data) return false;
+  if (data.code === "tab_gone") return true;
+  return typeof data.error === "string" && data.error.includes("tab_gone");
+}
+
+function tabGoneRefusal(): BrowserRefusedError {
+  return new BrowserRefusedError("The browser tab closed during navigation. Select a tab in the panel and try again.", "tab_gone");
+}
+
+/** Best-effort parse of a failed exec's stdout for a daemon envelope. */
+function parseExecOutput(error: unknown): unknown {
+  const stdout = (error as { stdout?: unknown } | null)?.stdout;
+  if (typeof stdout !== "string" || !stdout) return null;
+  try { return JSON.parse(stdout); } catch { return null; }
 }
 
 export function browserStreamPort(value: unknown): number {
@@ -303,12 +324,37 @@ export class BrowserLive {
       if (!this.current(viewer)) throw new Error("stale viewer");
       const result = object(JSON.parse(stdout));
       const data = object(result?.data);
-      if (result?.success !== true || !data) throw new Error("browser command failed");
+      if (result?.success !== true || !data) {
+        if (isTabGoneReply(result)) throw tabGoneRefusal();
+        throw new Error("browser command failed");
+      }
       return data;
     } catch (error) {
+      // A refusal is routine recovery (rebind and retry), not a daemon fault.
+      if (error instanceof BrowserRefusedError) throw error;
+      // Daemon failures arrive as a nonzero exit with the JSON envelope on
+      // stdout, so a refusal never reaches the parse above — recover it here.
+      if (isTabGoneReply(parseExecOutput(error))) throw tabGoneRefusal();
       console.warn("browser-live:", error);
       throw new BrowserLiveError("The browser could not complete this action. Check that the browser engine is installed, then reconnect.", 503);
     }
+  }
+
+  /** Bind the daemon to a live tab after the page closed its target under
+   * the viewer. The daemon names the condition but never recovers itself,
+   * and `open` relaunches instead of rebinding — only an explicit tab
+   * select clears it. Foreground tab first, else the first real page. */
+  private async rebindTab(viewer: Viewer): Promise<void> {
+    const data = await this.command(viewer, ["tab", "list"]);
+    const tabs = (Array.isArray(data.tabs) ? data.tabs : []).flatMap((entry) => {
+      const tab = object(entry);
+      if (!tab || typeof tab.tabId !== "string" || !/^t[1-9]\d{0,8}$/.test(tab.tabId)) return [];
+      return [{ tabId: tab.tabId, url: tab.url, active: tab.active === true }];
+    });
+    const http = (value: unknown) => typeof value === "string" && (value.startsWith("http://") || value.startsWith("https://"));
+    const pick = tabs.find((tab) => tab.active) ?? tabs.find((tab) => http(tab.url)) ?? tabs[0];
+    if (!pick) throw tabGoneRefusal();
+    await this.command(viewer, ["tab", pick.tabId]);
   }
 
   private async input(viewer: Viewer, message: ObjectValue): Promise<void> {
@@ -331,15 +377,53 @@ export class BrowserLive {
       command = { action: "press", key: [...chord.filter(([bit]) => modifiers & bit).map(([, key]) => key), fields.key].join("+") };
     } else command = { action: "input_keyboard", type: eventType, key: fields.key,
       ...(fields.code === undefined ? {} : { code: fields.code }), ...(fields.text === undefined ? {} : { text: fields.text }) };
+    // Only this call's own additions roll back on a refusal: an earlier
+    // confirmed hold stays tracked so hand-back still abandons it.
+    const hadKey = viewer.pressedKeys.has(key);
     if (command.action === "input_keyboard" && eventType === "keyDown") {
       if (viewer.pressedKeys.size >= 64 && !viewer.pressedKeys.has(key)) throw new BrowserLiveError("Too many keys are held. Restart the browser before continuing.", 409);
       viewer.pressedKeys.add(key);
     }
+    const addedKey = command.action === "input_keyboard" && eventType === "keyDown" && !hadKey;
+    const addedButton = type === "input_mouse" && eventType === "mousePressed" && !viewer.pressedButtons.has(String(fields.button));
     if (type === "input_mouse" && eventType === "mousePressed") viewer.pressedButtons.add(String(fields.button));
     const origin = `http://127.0.0.1:${viewer.port}`;
+    const rollback = () => {
+      // A refusal proves the daemon never dispatched: the input tracked as
+      // held never went down.
+      if (addedKey) viewer.pressedKeys.delete(key);
+      if (addedButton) viewer.pressedButtons.delete(String(fields.button));
+    };
+    let reply = await this.postInput(origin, command);
+    if (reply?.success !== true) {
+      if (!isTabGoneReply(reply)) throw new BrowserLiveError("The browser could not confirm this input. Restart the browser before continuing.", 503);
+      // The page closed the daemon's tab under the viewer (OAuth jumps do
+      // this): bind a live tab and retry the input once instead of wedging
+      // the panel on Restart for input that never ran.
+      try {
+        await this.rebindTab(viewer);
+        reply = await this.postInput(origin, command);
+      } catch (error) {
+        if (error instanceof BrowserRefusedError) rollback();
+        throw error;
+      }
+      if (reply?.success !== true) {
+        if (isTabGoneReply(reply)) { rollback(); throw tabGoneRefusal(); }
+        throw new BrowserLiveError("The browser could not confirm this input. Restart the browser before continuing.", 503);
+      }
+    }
+    if (command.action === "press" || (command.action === "input_keyboard" && eventType === "keyUp")) viewer.pressedKeys.delete(key);
+    if (type === "input_mouse" && eventType === "mouseReleased") viewer.pressedButtons.delete(String(fields.button));
+  }
+
+  /** POST one input command to the daemon relay and return its parsed reply.
+   * Transport problems (unreachable, oversized, unparseable) throw the
+   * confirm error, which latches uncertainty; a parsed success:false reply
+   * returns for the caller to classify — tab_gone never latches. */
+  private async postInput(origin: string, command: ObjectValue): Promise<ObjectValue | null> {
+    // The native command relay awaits the daemon's CDP reply. A WS send is
+    // only an enqueue, so it cannot serve as the human hand-back barrier.
     try {
-      // The native command relay awaits the daemon's CDP reply. A WS send is
-      // only an enqueue, so it cannot serve as the human hand-back barrier.
       const response = await fetch(`${origin}/api/command`, { method: "POST", redirect: "error",
         headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify(command), signal: AbortSignal.timeout(30_000) });
       if (!response.ok || !response.body) { await response.body?.cancel(); throw new Error("input rejected"); }
@@ -350,9 +434,7 @@ export class BrowserLive {
         if (size > 65536) throw new Error("input response too large");
         chunks.push(chunk);
       }
-      if (object(JSON.parse(Buffer.concat(chunks).toString("utf8")))?.success !== true) throw new Error("input failed");
-      if (command.action === "press" || (command.action === "input_keyboard" && eventType === "keyUp")) viewer.pressedKeys.delete(key);
-      if (type === "input_mouse" && eventType === "mouseReleased") viewer.pressedButtons.delete(String(fields.button));
+      return object(JSON.parse(Buffer.concat(chunks).toString("utf8")));
     } catch { throw new BrowserLiveError("The browser could not confirm this input. Restart the browser before continuing.", 503); }
   }
 
@@ -496,7 +578,7 @@ export class BrowserLive {
         else if (action.type === "command") await this.command(viewer, action.args);
       });
       return { ok: true };
-    } catch (error) { throw error instanceof BrowserLiveError ? error : new BrowserLiveError("Browser control changed. Take control again to continue.", 409); }
+    } catch (error) { throw error instanceof BrowserLiveError || error instanceof BrowserRefusedError ? error : new BrowserLiveError("Browser control changed. Take control again to continue.", 409); }
     finally { viewer.pendingActions -= 1; this.control(viewer.session); }
   }
 
