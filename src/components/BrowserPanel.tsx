@@ -27,7 +27,7 @@ export function LiveBrowser({ bot }: { bot: Bot }) {
   const [tabs, setTabs] = useState<BrowserTab[]>([]);
   const [address, setAddress] = useState("");
   const [connected, setConnected] = useState(false);
-  const [control, setControl] = useState({ held: false, controlling: false, owned: false });
+  const [control, setControl] = useState({ held: false, controlling: false, owned: false, needsRestart: false });
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [showProfiles, setShowProfiles] = useState(false);
@@ -85,7 +85,7 @@ export function LiveBrowser({ bot }: { bot: Bot }) {
     viewer.current = ""; pendingOperation.current = null; haltMessage.current = "";
     urlEditing.current = false;
     setFrame(null); setTabs([]); setAddress(""); setConnected(false); setError("");
-    setControl({ held: false, controlling: false, owned: false }); setPending(false);
+    setControl({ held: false, controlling: false, owned: false, needsRestart: false }); setPending(false);
     const source = new EventSource(`/api/bots/${encodeURIComponent(bot.id)}/browser/live`);
     const listen = (name: string, handler: (data: any) => void) => source.addEventListener(name, (event) => {
       if (stopped || !ownsConnection()) return;
@@ -147,7 +147,7 @@ export function LiveBrowser({ bot }: { bot: Bot }) {
           setAttempt((value) => value + 1);
         }, delay);
       }
-      setError(message); setConnected(false); setFrame(null); setControl({ held: false, controlling: false, owned: false });
+      setError(message); setConnected(false); setFrame(null); setControl({ held: false, controlling: false, owned: false, needsRestart: false });
       // Keep this generation alive: a successful restart closes its stream
       // before the action reply arrives, and must still reconnect afterward.
       viewer.current = ""; inputQueue.current?.clear(); inputQueue.current = null; source.close();
@@ -186,6 +186,10 @@ export function LiveBrowser({ bot }: { bot: Bot }) {
       }
     }
   };
+  const restartBrowser = () => {
+    if (!window.confirm("Restart this profile’s browser? Open tabs will close. Saved logins are kept. Stop any bots using it first.")) return;
+    void execute({ type: "restart" });
+  };
   const driving = control.controlling && connected && !pending;
   const reconnecting = error === RECONNECT_MESSAGE;
   return <div ref={panel} className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-hairline/40 bg-card text-ink">
@@ -219,13 +223,13 @@ export function LiveBrowser({ bot }: { bot: Bot }) {
           <button type="button" className="rounded-md px-3 py-2 text-left hover:bg-inset" onClick={(e) => { e.currentTarget.closest("details")?.removeAttribute("open"); reconnect(); }}>Reconnect view</button>
           <button type="button" className="rounded-md px-3 py-2 text-left hover:bg-inset disabled:opacity-40" disabled={!connected || pending} onClick={(e) => {
             e.currentTarget.closest("details")?.removeAttribute("open");
-            if (!window.confirm("Restart this profile’s browser? Open tabs will close. Saved logins are kept. Stop any bots using it first.")) return;
-            void execute({ type: "restart" });
+            restartBrowser();
           }}>Restart browser…</button>
         </div>
       </details>
     </form>
     {error && <div role={reconnecting ? "status" : "alert"} className={`flex items-center justify-between gap-2 border-b border-hairline/30 px-3 py-2 text-[12px] ${reconnecting ? "text-ink-secondary" : "text-danger"}`}><span>{error}</span>{shouldOfferBrowserReconnect(connected, inputQueue.current?.stopped() ?? false) && <button className="shrink-0 underline" onClick={reconnect}>Reconnect</button>}</div>}
+    {control.needsRestart && <div role="alert" className="flex items-center justify-between gap-2 border-b border-hairline/30 px-3 py-2 text-[12px] text-danger"><span>The browser needs a restart to recover.</span><button className="shrink-0 underline" onClick={restartBrowser}>Restart browser</button></div>}
     <div className="min-h-0 flex-1 overflow-hidden bg-inset/40">
       {frame ? <BrowserViewport frame={frame} {...viewport} driving={driving} input={input}
         onReturnToToolbar={() => addressInput.current?.focus()}

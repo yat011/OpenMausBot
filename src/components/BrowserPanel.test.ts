@@ -7,7 +7,7 @@ const fixture = vi.hoisted(() => ({
   effects: [] as EffectCallback[],
   refs: [] as RefObject<unknown>[],
   setters: [] as Array<ReturnType<typeof vi.fn>>,
-  control: { held: false, controlling: false, owned: false },
+  control: { held: false, controlling: false, owned: false, needsRestart: false },
   frame: null as { seq: number; data: string; viewerId: string; generation: number } | null,
   queues: [] as Array<{ enqueue: ReturnType<typeof vi.fn>; clear: ReturnType<typeof vi.fn>; drain: ReturnType<typeof vi.fn>; stopped: ReturnType<typeof vi.fn> }>,
   halts: [] as Array<(cause: unknown) => void>,
@@ -81,7 +81,7 @@ const deferred = () => {
 const settle = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
 beforeEach(() => {
   fixture.effects = []; fixture.refs = []; fixture.queues = []; fixture.setters = []; fixture.halts = [];
-  fixture.control = { held: false, controlling: false, owned: false };
+  fixture.control = { held: false, controlling: false, owned: false, needsRestart: false };
   fixture.frame = null;
   FixtureEventSource.instances = [];
   vi.stubGlobal("EventSource", FixtureEventSource);
@@ -395,10 +395,26 @@ describe("live browser control affordance", () => {
   });
 
   it("visibly labels hand-back when this viewer owns control", () => {
-    fixture.control = { held: true, controlling: true, owned: true };
+    fixture.control = { held: true, controlling: true, owned: true, needsRestart: false };
     const html = render();
     expect(html).toContain('<span>Return to bot</span>');
     expect(html).toContain('aria-label="Return to bot" aria-pressed="true"');
     expect(html).not.toContain('<span>Take control</span>');
+  });
+
+  it("offers restart when the server reports the browser needs one", async () => {
+    fixture.control = { held: true, controlling: false, owned: false, needsRestart: true };
+    const nodes = renderElements();
+    expect(nodes.some((node) => node.props.children === "The browser needs a restart to recover.")).toBe(true);
+    const cleanup = fixture.effects[2]!();
+    FixtureEventSource.instances[0]!.emit("ready", { viewerId: "current-viewer" });
+    click(nodes, "Restart browser");
+    await settle();
+    expect(window.confirm).toHaveBeenCalled();
+    expect(api).toHaveBeenCalledWith("/api/bots/pepper/browser/action", {
+      method: "POST", body: JSON.stringify({ type: "restart", viewerId: "current-viewer" }),
+      timeoutMs: 120_000,
+    });
+    cleanup?.();
   });
 });

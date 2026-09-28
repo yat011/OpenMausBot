@@ -72,6 +72,7 @@ beforeEach(() => {
     abandonHumanInput: vi.fn(),
     withHumanAction: vi.fn(async (_session: string, _owner: string, fn: () => unknown) => fn()),
     reapStaleHold: vi.fn(() => false),
+    status: (session: string) => ({ state: held.has(session) ? "held" : "idle", heldByPerson: held.has(session), releasing: false, agents: 0, humans: 0 }),
   } as unknown as BrowserRuntime;
   live = new BrowserLive({ runtime });
   SocketFixture.instances = [];
@@ -285,7 +286,7 @@ describe("authenticated browser viewer relay", () => {
     expect(b.res.events("tabs")).toHaveLength(0);
     expect(b.res.events("url")).toHaveLength(0);
     expect(b.socket.messages).toEqual([{ type: "ack", seq: 1 }]);
-    expect(b.res.events("control").at(-1)).toEqual({ held: true, owned: false, controlling: false });
+    expect(b.res.events("control").at(-1)).toEqual({ held: true, owned: false, controlling: false, needsRestart: false });
     await a.action({ type: "release" });
     expect(b.res.events("frame")).toHaveLength(1);
   });
@@ -484,7 +485,7 @@ describe("authenticated browser viewer relay", () => {
     runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
     const a = await open(); const b = await open({ botId: "bot-b" });
     await a.action({ type: "take" });
-    await expect(b.action({ type: "restart" })).rejects.toThrow("could not restart");
+    await expect(b.action({ type: "restart" })).rejects.toThrow("Another person controls this browser");
     nativeClose.mockResolvedValueOnce(false);
     await expect(a.action({ type: "restart" })).rejects.toThrow("could not restart");
     expect(runtime.heldBy("profile-a")).toBe(a.res.id);
@@ -572,6 +573,17 @@ describe("authenticated browser viewer relay", () => {
     expect(a.res.events("tabs").at(-1)).toEqual({ tabs: [
       { tabId: "t1", title: "blank", url: "about:blank", active: true },
     ] });
+  });
+  it("tells the panel the browser needs a restart once uncertainty latches", async () => {
+    // Without the flag the wedge renders as "paused for human control" with
+    // Take disabled and no path forward; with it the panel offers Restart.
+    runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
+    const a = await open(); await a.action({ type: "take" });
+    expect(a.res.events("control").at(-1)).toMatchObject({ held: true, controlling: true, needsRestart: false });
+    execute.mockRejectedValueOnce(new Error("spawn ENOENT"));
+    await expect(a.action({ type: "navigate", url: "https://example.com" })).rejects.toThrow("could not complete this action");
+    expect(runtime.status("profile-a")).toMatchObject({ state: "uncertain" });
+    expect(a.res.events("control").at(-1)).toMatchObject({ held: true, controlling: false, needsRestart: true });
   });
   it("still latches uncertainty when a viewer command cannot reach the daemon", async () => {
     runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });

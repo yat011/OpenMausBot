@@ -180,6 +180,49 @@ describe("browser takeover gate", () => {
     await expect(value.restart("s", "recovery", nativeClose)).rejects.toThrow(/Another person/);
     expect(nativeClose).not.toHaveBeenCalled();
   });
+
+  it("lets a stranger restart an uncertain gate its holder abandoned quietly", async () => {
+    // The wedge: a failed action latches uncertain while a panel holds the
+    // gate; the panel is then closed, leaked, or forgotten, so take refuses
+    // (held by other), restart and agent close-all refuse (another person),
+    // and agents see paused — with no live viewer left to recover it. A
+    // quiet uncertain hold is abandoned recovery, not active driving: the
+    // native close stays the safety barrier.
+    const value = runtime();
+    await value.take("s", "gone-viewer");
+    await expect(value.withHumanAction("s", "gone-viewer", async () => { throw new Error("relay timeout"); })).rejects.toThrow("relay timeout");
+    expect(value.status("s")).toMatchObject({ state: "uncertain", heldByPerson: true });
+    const nativeClose = vi.fn(async () => {});
+    await expect(value.restart("s", "live-viewer", nativeClose)).rejects.toThrow(/moments ago/);
+    expect(nativeClose).not.toHaveBeenCalled();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      // Past the 60s recovery quiet window but far short of the 5-minute
+      // stale-hold reap (which refuses uncertain gates anyway).
+      await vi.advanceTimersByTimeAsync(61_000);
+      await value.restart("s", "live-viewer", nativeClose);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(nativeClose).toHaveBeenCalledOnce();
+    expect(value.status("s")).toMatchObject({ state: "idle", heldByPerson: false });
+    await expect(value.withAgentAction("s", async () => "recovered")).resolves.toBe("recovered");
+  });
+
+  it("lets the bot close-all recover an uncertain gate with a quiet stale owner", async () => {
+    const value = runtime();
+    await value.take("s", "gone-viewer");
+    await expect(value.withHumanAction("s", "gone-viewer", async () => { throw new Error("relay timeout"); })).rejects.toThrow("relay timeout");
+    await expect(value.agentRestart("s", async () => {})).rejects.toThrow(/paused/);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await vi.advanceTimersByTimeAsync(61_000);
+      await value.agentRestart("s", async () => {});
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(value.status("s")).toMatchObject({ state: "idle", heldByPerson: false });
+  });
 });
 
 const FAKE_MCP = `

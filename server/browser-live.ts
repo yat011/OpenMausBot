@@ -260,7 +260,9 @@ export class BrowserLive {
         const pending = viewer.pendingFrame; viewer.pendingFrame = undefined;
         this.frame(viewer, pending);
       }
-      this.send(viewer, { type: "control", held, owned: this.runtime.heldBy(session) === viewer.id, controlling: this.runtime.canControl(session, viewer.id) });
+      // needsRestart names the uncertain latch the take button cannot: without
+      // it the wedge renders as "paused for human control" with no path on.
+      this.send(viewer, { type: "control", held, owned: this.runtime.heldBy(session) === viewer.id, controlling: this.runtime.canControl(session, viewer.id), needsRestart: this.runtime.status(session).state === "uncertain" });
       if (!held && viewer.hiddenFrame) {
         const frame = viewer.hiddenFrame; viewer.hiddenFrame = undefined;
         this.frame(viewer, frame);
@@ -565,7 +567,10 @@ export class BrowserLive {
         await restarting;
         this.closeForSession(viewer.session);
         return { ok: true };
-      } catch { throw new BrowserLiveError("The browser could not restart. Wait for active work to finish and try again.", 409); }
+      } catch (error) {
+        if (error instanceof Error && (error as { status?: unknown }).status === 409) throw new BrowserLiveError(error.message, 409);
+        throw new BrowserLiveError("The browser could not restart. Wait for active work to finish and try again.", 409);
+      }
       finally { viewer.restarting = false; if (viewer.closed) this.runtime.release(viewer.session, viewer.id); this.control(viewer.session); }
     }
     if (action.type === "ack") {

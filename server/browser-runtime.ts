@@ -19,6 +19,9 @@ const MAX_RESPONSE_BYTES = 16_777_216;
  * per-request budget before anything has been accepted to guard. */
 const HANDSHAKE_TIMEOUT_MS = 1_000;
 const HOST_ENV = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PATH", "Path", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"];
+/** Quiet window after which an uncertain hold counts as abandoned recovery
+ * rather than active driving, so a stranger's restart can clear the wedge. */
+const RESTART_QUIET_MS = 60_000;
 
 /** MCP, viewer commands, and cleanup must resolve the same HOME/socket paths.
  * Inherit OS plumbing, never the harness's model-provider credentials. */
@@ -579,12 +582,33 @@ export class BrowserRuntime {
     finally { gate.humans--; this.changed(gate); }
   }
 
+  /** An uncertain hold its panel abandoned: closed, leaked, or forgotten, so
+   * take refuses (held by other), restart and agent close-all refuse
+   * (another person), and agents see paused — with nobody left to recover.
+   * Quiet is measured from the last take or human action; the native close
+   * stays the safety barrier, and certain or freshly-driven gates refuse. */
+  private isAbandonedRecoveryHold(gate: Gate, caller: string): boolean {
+    if (gate.owner === null || gate.owner === caller || !gate.uncertain) return false;
+    const last = gate.lastActivityAt ?? gate.heldSince;
+    return last !== null && Date.now() - last >= RESTART_QUIET_MS;
+  }
+
+  private releaseAbandonedRecoveryHold(session: string, caller: string): void {
+    const gate = this.gate(session);
+    if (!this.isAbandonedRecoveryHold(gate, caller)) return;
+    gate.owner = null; gate.ready = false; gate.heldSince = null; gate.lastActivityAt = null;
+    this.changed(gate);
+  }
+
   /** Agent recovery for `close --all`. Does not take human control; refuses
    * if a person already holds the panel. Native close is the safety barrier. */
   async agentRestart(session: string, closeBrowser: () => Promise<void>): Promise<void> {
     this.reapStaleHold(session);
     const gate = this.gate(session);
-    if (gate.owner !== null && gate.owner !== "agent") throw this.refusal();
+    if (gate.owner !== null && gate.owner !== "agent") {
+      this.releaseAbandonedRecoveryHold(session, "agent");
+      if (this.gate(session).owner !== null) throw this.refusal();
+    }
     await this.restart(session, "agent", closeBrowser);
   }
 
@@ -594,8 +618,19 @@ export class BrowserRuntime {
     if (!owner) throw new Error("Browser recovery requires an owner.");
     this.reapStaleHold(session);
     const gate = this.gate(session);
-    if (gate.closing || gate.releasing || gate.agents || gate.humans) throw new Error("The browser is busy. Wait for current work to finish before restarting.");
-    if (gate.owner !== null && gate.owner !== owner) throw new Error("Another person controls this browser.");
+    // Refusals carry their message to the panel (status-marked, like the
+    // managed-policy errors): the generic restart failure misleads when
+    // nothing is actually running. Native-close failures stay generic.
+    const refused = (message: string): Error => Object.assign(new Error(message), { status: 409 });
+    if (gate.closing || gate.releasing || gate.agents || gate.humans) throw refused("The browser is busy. Wait for current work to finish before restarting.");
+    if (gate.owner !== null && gate.owner !== owner) {
+      this.releaseAbandonedRecoveryHold(session, owner);
+      if (this.gate(session).owner !== null) {
+        throw refused(gate.uncertain
+          ? "The browser needs a restart, but its holder was active moments ago. Wait a minute with the panel idle and try again."
+          : "Another person controls this browser.");
+      }
+    }
     gate.owner = owner;
     gate.ready = false;
     gate.closing = true;
