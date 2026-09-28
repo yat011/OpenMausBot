@@ -106,6 +106,25 @@ describe.skipIf(!posix)("desktop sidecar browser wrapper", () => {
     }
   });
 
+  it("attaches tab close to the sidecar instead of treating it as session management", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-wrapper-"));
+    try {
+      await withCdpServer(async (url) => {
+        // Matching any arg detached every tab close from the shared Chrome,
+        // so close failed "not found" for tabs tab list just showed.
+        const seen = await runWrapper(["tab", "close", "t2"], cleanEnv({
+          OMB_AGENT_BROWSER_REAL: fixtureReal(dir),
+          OMB_DESKTOP_CDP: url,
+        }));
+        expect(seen.args).toEqual(["--cdp", url, "tab", "close", "t2"]);
+        expect(seen.cdp).toBe(url);
+        expect(seen.pinTab).toBe("1");
+      });
+    } finally {
+      removeTempDir(dir);
+    }
+  });
+
   it("keeps a caller-set AGENT_BROWSER_CDP instead of overriding it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-wrapper-"));
     try {

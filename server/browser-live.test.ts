@@ -542,6 +542,37 @@ describe("authenticated browser viewer relay", () => {
     expect(runtime.status("profile-a")).toMatchObject({ state: "held", heldByPerson: true });
     expect(runtime.canControl("profile-a", a.res.id)).toBe(true);
   });
+  it("refuses a tab-close on a dead id without latching and refreshes the strip", async () => {
+    // Tab ids die with their tabs (never reused), so a strip rendered
+    // before a close names a dead id. A close on it fails as "Tab tX not
+    // found" (exit 1, no code): certain non-execution, never
+    // uncertainty — and the strip must refresh so the retry lands live.
+    runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
+    const a = await open(); await a.action({ type: "take" });
+    const failed = (payload: unknown) => Object.assign(new Error("Command failed"), { stdout: JSON.stringify(payload) });
+    execute
+      .mockResolvedValueOnce(output({ closed: true, tabId: "t2" }))
+      .mockResolvedValueOnce(output({ tabs: [
+        { tabId: "t1", title: "blank", url: "about:blank", active: false },
+        { tabId: "t2", title: "X", url: "https://x.com/", active: true, targetId: "private" },
+      ] }));
+    await expect(a.action({ type: "tab-close", tabId: "t2" })).resolves.toEqual({ ok: true });
+    expect(a.res.events("tabs").at(-1)).toEqual({ tabs: [
+      { tabId: "t1", title: "blank", url: "about:blank", active: false },
+      { tabId: "t2", title: "X", url: "https://x.com/", active: true },
+    ] });
+    execute
+      .mockRejectedValueOnce(failed({ success: false, error: "Tab t3 not found; run `agent-browser tab` to list open tabs" }))
+      .mockResolvedValueOnce(output({ tabs: [
+        { tabId: "t1", title: "blank", url: "about:blank", active: true },
+      ] }));
+    await expect(a.action({ type: "tab-close", tabId: "t3" })).rejects.toThrow(/already closed|try again/);
+    expect(runtime.status("profile-a")).toMatchObject({ state: "held", heldByPerson: true });
+    expect(runtime.canControl("profile-a", a.res.id)).toBe(true);
+    expect(a.res.events("tabs").at(-1)).toEqual({ tabs: [
+      { tabId: "t1", title: "blank", url: "about:blank", active: true },
+    ] });
+  });
   it("still latches uncertainty when a viewer command cannot reach the daemon", async () => {
     runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
     const a = await open(); await a.action({ type: "take" });

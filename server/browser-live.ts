@@ -91,6 +91,20 @@ function tabGoneRefusal(): BrowserRefusedError {
   return new BrowserRefusedError("The browser tab closed during navigation. Select a tab in the panel and try again.", "tab_gone");
 }
 
+/** Tab ids die with their tabs and are never reused, so a strip rendered
+ * before a close names a dead id ("Tab tX not found", exit 1, no code).
+ * Like tab_gone this names a target the daemon never accepted, so it
+ * must not latch — the strip just needs a refresh and a retry. */
+function isStaleTabReply(reply: unknown): boolean {
+  const data = object(reply);
+  if (!data) return false;
+  return typeof data.error === "string" && /\btab\s+\S+\s+not found\b/i.test(data.error);
+}
+
+function staleTabRefusal(): BrowserRefusedError {
+  return new BrowserRefusedError("That tab is already closed. The tab list changed — try again.", "tab_stale");
+}
+
 /** Best-effort parse of a failed exec's stdout for a daemon envelope. */
 function parseExecOutput(error: unknown): unknown {
   const stdout = (error as { stdout?: unknown } | null)?.stdout;
@@ -326,6 +340,7 @@ export class BrowserLive {
       const data = object(result?.data);
       if (result?.success !== true || !data) {
         if (isTabGoneReply(result)) throw tabGoneRefusal();
+        if (isStaleTabReply(result)) throw staleTabRefusal();
         throw new Error("browser command failed");
       }
       return data;
@@ -334,8 +349,16 @@ export class BrowserLive {
       if (error instanceof BrowserRefusedError) throw error;
       // Daemon failures arrive as a nonzero exit with the JSON envelope on
       // stdout, so a refusal never reaches the parse above — recover it here.
-      if (isTabGoneReply(parseExecOutput(error))) throw tabGoneRefusal();
-      console.warn("browser-live:", error);
+      const failed = parseExecOutput(error);
+      if (isTabGoneReply(failed)) throw tabGoneRefusal();
+      if (isStaleTabReply(failed)) throw staleTabRefusal();
+      // The exec error alone names only the command line; without the
+      // daemon's envelope the next failure of this shape costs another
+      // live repro to identify. The tail carries tab URLs and titles —
+      // the same class the command line already logs — capped at 500.
+      const output = (value: unknown) => typeof value === "string" && value ? ` ${value.slice(-500)}` : "";
+      const streams = error as { stdout?: unknown; stderr?: unknown } | null;
+      console.warn(`browser-live: ${JSON.stringify(args)} failed:${output(streams?.stdout)}${output(streams?.stderr)}`, error);
       throw new BrowserLiveError("The browser could not complete this action. Check that the browser engine is installed, then reconnect.", 503);
     }
   }
@@ -355,6 +378,18 @@ export class BrowserLive {
     const pick = tabs.find((tab) => tab.active) ?? tabs.find((tab) => http(tab.url)) ?? tabs[0];
     if (!pick) throw tabGoneRefusal();
     await this.command(viewer, ["tab", pick.tabId]);
+  }
+
+  /** A tab mutation kills ids the acting strip still shows, and a refusal
+   * names one already dead. Push a fresh list through the same projection
+   * the upstream tabs messages pass, so the next click lands. Best-effort:
+   * a failed refresh must never fail the action that triggered it. */
+  private async pushTabs(viewer: Viewer): Promise<void> {
+    try {
+      const data = await this.command(viewer, ["tab", "list"]);
+      const message = normalizeBrowserLiveMessage({ type: "tabs", tabs: Array.isArray(data.tabs) ? data.tabs : [] });
+      if (message) this.send(viewer, message);
+    } catch { /* The strip refreshes on the next upstream tabs push. */ }
   }
 
   private async input(viewer: Viewer, message: ObjectValue): Promise<void> {
@@ -575,10 +610,18 @@ export class BrowserLive {
       await this.runtime.withHumanAction(viewer.session, viewer.id, async () => {
         if (!this.current(viewer)) throw new BrowserLiveError("This browser view closed.", 409);
         if (action.type === "input") await this.input(viewer, action.message);
-        else if (action.type === "command") await this.command(viewer, action.args);
+        else if (action.type === "command") {
+          await this.command(viewer, action.args);
+          if (action.args[0] === "tab") await this.pushTabs(viewer);
+        }
       });
       return { ok: true };
-    } catch (error) { throw error instanceof BrowserLiveError || error instanceof BrowserRefusedError ? error : new BrowserLiveError("Browser control changed. Take control again to continue.", 409); }
+    } catch (error) {
+      // A refused tab select/close names a dead id: refresh the strip so
+      // the retry the refusal asks for lands on a live one.
+      if (error instanceof BrowserRefusedError && action.type === "command" && action.args[0] === "tab") await this.pushTabs(viewer);
+      throw error instanceof BrowserLiveError || error instanceof BrowserRefusedError ? error : new BrowserLiveError("Browser control changed. Take control again to continue.", 409);
+    }
     finally { viewer.pendingActions -= 1; this.control(viewer.session); }
   }
 

@@ -27,12 +27,14 @@ except Exception:
     sys.exit(1)' "$CDP"
 }
 
+# Session management (close --all, session ..., quit, exit) must never touch
+# the shared sidecar Chrome. Match the subcommand only: `tab close` is a
+# page command, and matching any arg detached every tab close from the
+# sidecar, so close failed "not found" for tabs tab list just showed.
 session_mgmt=0
-for arg in "$@"; do
-  case "$arg" in
-    close|session|quit|exit) session_mgmt=1; break ;;
-  esac
-done
+case "${1:-}" in
+  close|session|quit|exit) session_mgmt=1 ;;
+esac
 
 if [[ "$session_mgmt" -eq 0 ]]; then
   # Wait for the sidecar (cold boot races the first browse); fall back to
