@@ -95,15 +95,43 @@ export async function mountPreview(
   const previewUrl = new URL(route, base).href;
   const warmed = Date.now();
   console.log("warming the isolated preview (a cold optimizer can take minutes)…");
-  for (const url of [previewUrl, new URL(entry, base).href]) {
+  const warm = async (url: string) => {
     const response = await fetch(url, { signal: AbortSignal.timeout(300_000) });
     if (!response.ok) {
       await ui.close();
       throw new Error(`preview warmup fetched ${url}: ${response.status}`);
     }
     await response.arrayBuffer();
+  };
+  const entryUrl = new URL(entry, base).href;
+  await warm(previewUrl);
+  await warm(entryUrl);
+  // The entry alone is not the page: the browser fetches every module before
+  // load, and on a slow filesystem (a Windows bind mount reads ~100x slower
+  // than native) the tailwind compile plus the graph costs tens of seconds —
+  // past any page timeout. Walk the transformed graph and warm each module
+  // so the browser arrives to cache hits. Prebundled deps are already
+  // on-disk and fast; skip them.
+  const key = (url: string) => new URL(url, base).pathname;
+  const seen = new Set([key(previewUrl), key(entryUrl)]);
+  const queue = [entryUrl];
+  let warmedModules = 0;
+  // @fs workspaces outside the served root (a docs app route leaks in via a
+  // lazy edge) are never part of page load; the browser 500s past them the
+  // same way, so warming them would fail a healthy page.
+  const skippable = (url: string) => url.startsWith("/node_modules/.vite/") || url.startsWith("/@fs/") || url.includes("[[");
+  while (queue.length > 0 && warmedModules < 1000) {
+    const node = await ui.moduleGraph.getModuleByUrl(key(queue.shift()!));
+    for (const imported of node?.importedModules ?? []) {
+      if (seen.has(key(imported.url)) || skippable(imported.url)) continue;
+      seen.add(key(imported.url));
+      const url = new URL(imported.url, base).href;
+      queue.push(url);
+      await warm(url);
+      warmedModules++;
+    }
   }
-  console.log(`isolated preview servable after ${((Date.now() - warmed) / 1000).toFixed(1)}s`);
+  console.log(`isolated preview servable after ${((Date.now() - warmed) / 1000).toFixed(1)}s (${warmedModules} graph modules warmed)`);
   return {
     previewUrl,
     close: () => ui.close(),
