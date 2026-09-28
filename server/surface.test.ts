@@ -118,6 +118,24 @@ describe("surfacePrompt", () => {
     expect(text).not.toMatch(/happens on the cloud computer/);
   });
 
+  it("keeps a native-tools engine's shell live on a browser-only turn", () => {
+    const text = surfacePrompt({ computer: null, browser: true }, { nativeTools: true });
+    expect(text).toMatch(/happens in the built-in browser tab/);
+    expect(text).not.toMatch(/no desktop, file or shell computer/);
+    expect(text).toContain("native shell, file and workspace tools are also available");
+    expect(text).toMatch(/Browser tab of the Computer panel/);
+  });
+
+  it("keeps native tools available when nothing is mounted", () => {
+    const text = surfacePrompt({ computer: null, browser: false }, { nativeTools: true });
+    expect(text).toContain("No computer or built-in browser tools are mounted");
+    expect(text).toContain("native shell, file and workspace tools are still available");
+    const selectable = surfacePrompt({ computer: null, browser: false }, { nativeTools: true, canSelect: true });
+    expect(selectable).toContain("native shell, file and workspace tools are available");
+    expect(selectable).toContain("use select_computer with no arguments");
+    expect(surfacePrompt({ computer: null, browser: false }, { nativeTools: true, note: " NOTE." })).toContain(" NOTE.");
+  });
+
   it("explains unavailable tools, and carries the pin line and the note", () => {
     expect(surfacePrompt({ computer: null, browser: false })).toContain("No computer or built-in browser tools are mounted");
     expect(surfacePrompt({ computer: "cloud", browser: false }, { pinned: "cloud" }))

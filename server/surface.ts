@@ -133,10 +133,14 @@ const SURFACE_AUTHORITY =
 
 /** The one paragraph that says where this turn's work happens. Assembled
  * from what was actually mounted, never from the setting, so the model is
- * only ever told about tools it can call. */
+ * only ever told about tools it can call. `nativeTools` is for engines
+ * that bring their own shell, files and workspace outside OpenMausBot
+ * mounts (Muse): without it the browser-only and nothing-mounted branches
+ * tell the model it has no shell it in fact has, and the obedient model
+ * stops using tools that work. */
 export function surfacePrompt(
   mounted: MountedSurfaces,
-  opts: { pinned?: Surface | null; note?: string; canSelect?: boolean } = {},
+  opts: { pinned?: Surface | null; note?: string; canSelect?: boolean; nativeTools?: boolean } = {},
 ): string {
   const computer = mounted.computer ? surfaceLabel(mounted.computer) : null;
   let text = "";
@@ -147,14 +151,20 @@ export function surfacePrompt(
     text =
       ` Everything you do on screen happens on ${computer}, web pages included, through its own browser; there is no separate built-in browser this turn. If you need the user to sign in, tell them it is on ${computer}.`;
   } else if (mounted.browser) {
-    text =
-      " Everything you do on screen happens in the built-in browser tab; there is no desktop, file or shell computer this turn. If you need the user to sign in, tell them it is in the Browser tab of the Computer panel.";
+    text = opts.nativeTools
+      ? " Everything you do on screen happens in the built-in browser tab; there is no desktop computer this turn. Your native shell, file and workspace tools are also available — use them directly for code, files and commands. If you need the user to sign in, tell them it is in the Browser tab of the Computer panel."
+      : " Everything you do on screen happens in the built-in browser tab; there is no desktop, file or shell computer this turn. If you need the user to sign in, tell them it is in the Browser tab of the Computer panel.";
+  } else if (opts.nativeTools && (opts.note || opts.canSelect)) {
+    // Nothing mounted but the engine is not disarmed: select_computer and
+    // the notes below still apply, and the native tools stay usable.
+    text = " Your native shell, file and workspace tools are available — use them directly for code, files and commands.";
   }
   if (text) text += RESTATE_SENTENCE + (opts.canSelect
     ? SURFACE_AUTHORITY.replace("explain the mismatch and ask the user to change the conversation's computer selector", "inspect connected choices with select_computer and select the requested available place; on a pending result end this turn so OpenMausBot can reconnect the correct tools and continue the original request")
     : SURFACE_AUTHORITY);
   else if (!opts.note && !opts.canSelect) {
     text = " No computer or built-in browser tools are mounted this turn. You cannot open apps, click, or inspect a screen through OpenMausBot. If asked for screen work, explain this and ask the user to choose and connect a computer in the Computer panel; do not claim to have opened or checked it.";
+    if (opts.nativeTools) text += " Your native shell, file and workspace tools are still available — use them directly for code, files and commands.";
   }
   if (opts.pinned) {
     text += ` This conversation is pinned to ${surfaceLabel(opts.pinned)}; changing places requires ${opts.canSelect ? "select_computer or " : ""}the conversation's computer selector, not a different tool name.`;
