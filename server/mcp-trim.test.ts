@@ -96,6 +96,23 @@ describe("trimResultText", () => {
     expect([...body].every((ch) => ch === "🍵")).toBe(true);
   });
 
+  it("cuts plain text on a line boundary so a snapshot never ends mid-ref", () => {
+    const lines = Array.from({ length: 500 }, (_, i) => `- @e${i} button "Action ${i}"`);
+    const out = trimResultText({ text: lines.join("\n"), budget: 4_000 });
+    expect(out.trimmed).toBe(true);
+    const body = out.text.slice(0, out.text.indexOf("\n\n[OpenMausBot"));
+    expect(body.length).toBeLessThan(4_000);
+    const kept = body.split("\n");
+    expect(kept.length).toBeGreaterThan(1);
+    expect(kept.every((line, i) => line === lines[i])).toBe(true);
+  });
+
+  it("keeps the plain cut when one huge line leaves no boundary worth keeping", () => {
+    const out = trimResultText({ text: "y".repeat(50_000), budget: 4_000 });
+    const body = out.text.slice(0, out.text.indexOf("\n\n[OpenMausBot"));
+    expect(body.length).toBeGreaterThan(2_000);
+  });
+
   it("honours a caller's budget and a floor below it", () => {
     const text = JSON.stringify({ products: Array.from({ length: 200 }, (_, i) => product(i)) });
     expect(trimResultText({ text, budget: 20_000 }).text.length).toBeLessThan(20_000);

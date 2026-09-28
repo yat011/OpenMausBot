@@ -12,6 +12,12 @@ const button = "rounded-md p-1.5 text-ink-secondary hover:bg-inset hover:text-in
 const RECONNECT_DELAYS = [1_000, 2_000, 4_000, 8_000, 15_000];
 const RECONNECT_MESSAGE = "Connection interrupted. Reconnecting the browser view…";
 
+/** A halted input queue drops every keystroke and click while the stream
+ * stays connected, so its banner needs the same way out as a disconnect. */
+export function shouldOfferBrowserReconnect(connected: boolean, inputHalted: boolean): boolean {
+  return !connected || inputHalted;
+}
+
 /** Closing a panel releases its lease. A new connection never silently
  * restores permission to type, and never replays old browser frames. */
 export function LiveBrowser({ bot }: { bot: Bot }) {
@@ -219,7 +225,7 @@ export function LiveBrowser({ bot }: { bot: Bot }) {
         </div>
       </details>
     </form>
-    {error && <div role={reconnecting ? "status" : "alert"} className={`flex items-center justify-between gap-2 border-b border-hairline/30 px-3 py-2 text-[12px] ${reconnecting ? "text-ink-secondary" : "text-danger"}`}><span>{error}</span>{!connected && <button className="shrink-0 underline" onClick={reconnect}>Reconnect</button>}</div>}
+    {error && <div role={reconnecting ? "status" : "alert"} className={`flex items-center justify-between gap-2 border-b border-hairline/30 px-3 py-2 text-[12px] ${reconnecting ? "text-ink-secondary" : "text-danger"}`}><span>{error}</span>{shouldOfferBrowserReconnect(connected, inputQueue.current?.stopped() ?? false) && <button className="shrink-0 underline" onClick={reconnect}>Reconnect</button>}</div>}
     <div className="min-h-0 flex-1 overflow-hidden bg-inset/40">
       {frame ? <BrowserViewport frame={frame} {...viewport} driving={driving} input={input}
         onReturnToToolbar={() => addressInput.current?.focus()}

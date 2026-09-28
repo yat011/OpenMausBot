@@ -86,11 +86,16 @@ function arrayFields(value: unknown): Array<{ key: string; items: readonly unkno
 }
 
 /** Cut on a character boundary, never mid-surrogate-pair — half an emoji is
- * an invalid string that some providers reject outright. */
+ * an invalid string that some providers reject outright. A snapshot is one
+ * ref per line, so the cut also retreats to the last newline: a dangling
+ * half-ref reads as a real target and gets clicked. The retreat is skipped
+ * when it would throw away more than half the room (a single huge line). */
 function cutAt(text: string, chars: number): string {
   const cut = text.slice(0, Math.max(0, chars));
   const last = cut.charCodeAt(cut.length - 1);
-  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+  const safe = last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+  const newline = safe.lastIndexOf("\n");
+  return newline > 0 && newline * 2 >= safe.length ? safe.slice(0, newline) : safe;
 }
 
 function marker(input: {

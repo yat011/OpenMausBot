@@ -46,6 +46,7 @@ class BrowserClient {
   private maxPending: number;
   private onClose: () => void;
   private onRequestTimeout: () => void;
+  private latchHandshakeUncertain: boolean;
 
   constructor(
     spec: BrowserSpawnSpec,
@@ -54,12 +55,14 @@ class BrowserClient {
     maxPending: number,
     onClose: () => void,
     onRequestTimeout: () => void,
+    latchHandshakeUncertain = true,
   ) {
     this.requestTimeoutMs = requestTimeoutMs;
     this.idleMs = idleMs;
     this.maxPending = maxPending;
     this.onClose = onClose;
     this.onRequestTimeout = onRequestTimeout;
+    this.latchHandshakeUncertain = latchHandshakeUncertain;
     this.child = spawnCli(spec.command, spec.args, {
       env: browserRuntimeEnv(spec.env), stdio: ["pipe", "pipe", "pipe"], shell: false,
     });
@@ -71,7 +74,7 @@ class BrowserClient {
     this.ready = this.rpc("initialize", {
       protocolVersion: "2024-11-05", capabilities: {},
       clientInfo: { name: "openmausbot-browser", version: "1" },
-    }, Math.max(this.requestTimeoutMs, HANDSHAKE_TIMEOUT_MS)).then((result) => {
+    }, Math.max(this.requestTimeoutMs, HANDSHAKE_TIMEOUT_MS), this.latchHandshakeUncertain).then((result) => {
       if (!result || typeof result !== "object" || !("protocolVersion" in result)) {
         throw new TransportError("Browser engine returned an invalid handshake.");
       }
@@ -123,7 +126,7 @@ class BrowserClient {
     });
   }
 
-  rpc(method: string, params: unknown, timeoutMs: number = this.requestTimeoutMs): Promise<unknown> {
+  rpc(method: string, params: unknown, timeoutMs: number = this.requestTimeoutMs, latchUncertainOnTimeout = true): Promise<unknown> {
     if (this.stopped) return Promise.reject(new TransportError("Browser connection closed."));
     if (this.pending.size >= this.maxPending) return Promise.reject(new Error("Too many pending browser requests. Try again when the current action finishes."));
     const id = this.nextId++;
@@ -134,8 +137,10 @@ class BrowserClient {
       const timer = setTimeout(() => {
         // Seal the gate synchronously with the timer, before stop() teardown:
         // the rejection can surface through the ready handshake, which sits
-        // outside agentRpc's uncertainty classifier.
-        this.onRequestTimeout();
+        // outside agentRpc's uncertainty classifier. A read-only tools/list
+        // never accepts a browser action, so its timeouts kill only the
+        // transport and must not wedge the gate into recovery.
+        if (latchUncertainOnTimeout) this.onRequestTimeout();
         void this.stop(new TransportError("Browser request timed out; restart the browser before taking control."));
       }, timeoutMs);
       timer.unref();
@@ -251,6 +256,10 @@ export function isCompleteBrowserClose(params: unknown): boolean {
 export class BrowserRuntime {
   private gates = new Map<string, Gate>();
   private clients = new Map<string, { key: string; client: BrowserClient }>();
+  // tools/list is static per engine: one slimmed snapshot per session. Served
+  // while uncertain so the close-all recovery tool stays discoverable; close()
+  // (engine replaced) clears it, restart() (spawn identity kept) does not.
+  private toolListCache = new Map<string, unknown>();
   private options: { requestTimeoutMs: number; takeoverTimeoutMs: number; idleMs: number; maxPending: number; resultBudget: number; holdIdleMs: number };
 
   constructor(options: Partial<BrowserRuntime["options"]> = {}) {
@@ -375,8 +384,17 @@ export class BrowserRuntime {
     // must refuse the closing window itself or its client outlives restart().
     if (method !== "tools/call" && this.gate(session).closing) throw new Error("The browser is closing. Try again shortly.");
     // Uncertainty survives client replacement and never self-resolves: refuse
-    // every new browser request until an explicit restart clears it.
-    if (this.gate(session).uncertain) throw new Error("A browser action was interrupted. Restart this browser before continuing.");
+    // every new browser request until an explicit restart clears it. The
+    // catalog is the exception: drivers re-discover it just before a recovery
+    // close, so serve the last slimmed snapshot instead of hiding the recovery
+    // tool itself behind the refusal.
+    if (this.gate(session).uncertain) {
+      if (method === "tools/list") {
+        const cached = this.toolListCache.get(session);
+        if (cached !== undefined) return cached;
+      }
+      throw new Error("A browser action was interrupted. Restart this browser before continuing.");
+    }
     const invoke = async () => {
       const key = JSON.stringify([spec.command, spec.args, Object.entries(spec.env).sort(([a], [b]) => a.localeCompare(b))]);
       let entry = this.clients.get(session);
@@ -387,7 +405,7 @@ export class BrowserRuntime {
         }, () => {
           const gate = this.gate(session);
           if (!gate.closing) gate.uncertain = true;
-        });
+        }, method === "tools/call");
         entry = { key, client };
         this.clients.set(session, entry);
       }
@@ -398,9 +416,13 @@ export class BrowserRuntime {
         // The model sees slimmed schemas and text-only, bounded results; the
         // launch/session parameters OMB owns never reach the engine from a call.
         const request = method === "tools/call" ? stripHarnessOwnedArguments(params) : params;
-        let result = await entry.client.rpc(method, request);
+        let result = await entry.client.rpc(method, request, this.options.requestTimeoutMs, method === "tools/call");
         beforeDispatch?.(); // A turn revoked while the tool ran receives no result.
-        if (method === "tools/list") return slimBrowserToolList(result);
+        if (method === "tools/list") {
+          const slimmed = slimBrowserToolList(result);
+          this.toolListCache.set(session, slimmed);
+          return slimmed;
+        }
         const toolName = request && typeof request === "object" && typeof (request as { name?: unknown }).name === "string" ? (request as { name: string }).name : undefined;
         if (toolName === "agent_browser_open" && result && typeof result === "object" &&
             (result as { isError?: boolean }).isError !== true) {
@@ -471,7 +493,23 @@ export class BrowserRuntime {
       };
       const check = () => {
         if (gate.owner !== owner || gate.releasing || gate.closing) finish(new Error("Browser control request was cancelled."));
-        else if (gate.uncertain) finish(new Error("A browser action may still be running. Restart this browser before taking control."));
+        // Drain first, then report uncertainty: a timed-out tool RPC leaves
+        // its in-flight action pending, and failing fast here would wedge the
+        // 409 "may still be running" path even though the action usually lands.
+        else if (gate.agents === 0 && gate.uncertain) {
+          // A refused take must not leave a hold behind: ready stayed false
+          // so nobody controls the browser, and an uncertain latch is never
+          // reaped, so a retained owner would wedge every viewer on "paused
+          // for human control" with no holder left to restart. Uncertainty
+          // still bars agents and control until recovery. (No changed()
+          // notify here: check() is itself a watcher; finish() unsubscribes.)
+          if (gate.owner === owner) {
+            gate.owner = null;
+            gate.heldSince = null;
+            gate.lastActivityAt = null;
+          }
+          finish(new Error("A browser action may still be running. Restart this browser before taking control."));
+        }
         else if (gate.agents === 0) finish();
       };
       const timer = setTimeout(() => finish(new Error("Browser action is still finishing. Control remains paused; retry taking control or hand it back.")), this.options.takeoverTimeoutMs);
@@ -577,6 +615,9 @@ export class BrowserRuntime {
     await this.clients.get(session)?.client.stop();
     gate.closing = false;
     this.changed(gate);
+    // The catalog names tools on a replaced engine; drop the slimmed snapshot
+    // so the next discovery lists the new engine instead of a stale copy.
+    this.toolListCache.delete(session);
     if (!gate.owner && !gate.agents && !gate.humans) this.gates.delete(session);
   }
 

@@ -103,6 +103,27 @@ describe("browser takeover gate", () => {
     await expect(value.withAgentAction("s", async () => "recovered")).resolves.toBe("recovered");
   });
 
+  it("leaves no hold behind when uncertainty refuses a take", async () => {
+    const value = runtime();
+    await value.take("s", "owner");
+    await expect(value.withHumanAction("s", "owner", async () => { throw new Error("navigation timed out"); })).rejects.toThrow(/timed out/);
+    value.release("s", "owner");
+    await expect(value.take("s", "owner")).rejects.toThrow(/may still be running/);
+    // Nobody controls the browser, so no owner may linger: an uncertain
+    // latch is never reaped, and a retained owner would wedge every viewer
+    // on "paused for human control" with no holder to hand back or restart.
+    expect(value.heldBy("s")).toBeNull();
+    expect(value.canControl("s", "owner")).toBe(false);
+    expect(value.status("s")).toMatchObject({ state: "uncertain", heldByPerson: false });
+    expect(value.describeStatus("s")).toContain("agent_browser_close all=true");
+    // Agents get recovery guidance, not a phantom-holder refusal, and any
+    // viewer can run the restart that clears the latch.
+    await expect(value.withAgentAction("s", async () => "snapshot")).rejects.toThrow(/Restart/);
+    await expect(value.withAgentAction("s", async () => "snapshot")).rejects.not.toThrow(/paused/);
+    await value.restart("s", "new-viewer", async () => {});
+    await expect(value.withAgentAction("s", async () => "recovered")).resolves.toBe("recovered");
+  });
+
   it("requires recovery for abandoned pressed input, but ignores stale or unrelated owners", async () => {
     const value = runtime();
     await value.take("s", "owner");
@@ -275,6 +296,45 @@ describe("server-owned browser MCP runtime", () => {
     }
   });
 
+  it("still serves the cached tool catalog while uncertain, so recovery stays discoverable", async () => {
+    // The catalog is static per engine; drivers re-discover it just before a
+    // recovery close. Hiding it behind the uncertainty refusal would also hide
+    // the close-all recovery tool and wedge the driver in an empty-tools stall.
+    const value = runtime({ requestTimeoutMs: 60 });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const catalog = await value.agentRpc("s", spec(), "tools/list", {});
+      const pending = value.agentRpc("s", spec(), "tools/call", { name: "hang" });
+      const observed = expect(pending).rejects.toThrow(/timed out/);
+      await vi.advanceTimersByTimeAsync(60);
+      await observed;
+      await expect(value.agentRpc("s", spec(), "tools/call", { name: "echo" })).rejects.toThrow(/Restart/);
+      await expect(value.agentRpc("s", spec(), "tools/list", {})).resolves.toEqual(catalog);
+    } finally {
+      // Process-tree cleanup polls real child exits with timers of its own.
+      vi.useRealTimers();
+      await value.closeAll();
+    }
+  });
+
+  it("drains in-flight agent work before reporting uncertainty on takeover", async () => {
+    // A timed-out tool RPC leaves its action in flight; takeover waits out the
+    // drain window before concluding the action may still be running.
+    const value = runtime();
+    const action = deferred();
+    const pending = value.withAgentAction("s", () => action.promise);
+    const observed = expect(pending).rejects.toThrow(/paused/);
+    const taking = value.take("s", "owner");
+    let settled = false;
+    void taking.then(() => { settled = true; }, () => { settled = true; });
+    value.abandonHumanInput("s", "owner");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    action.resolve();
+    await observed;
+    await expect(taking).rejects.toThrow(/may still be running/);
+  });
+
   it("surfaces an engine-reported JSON-RPC timeout instead of retrying it", async () => {
     // Only a TransportError timeout may be retried: its timer already killed
     // that child, so the next attempt starts a fresh transport. This engine
@@ -351,8 +411,11 @@ describe("server-owned browser MCP runtime", () => {
   it("refuses agent Chrome restart while a person holds the panel, and keeps the gate if native close fails", async () => {
     const value = runtime({ requestTimeoutMs: 250 });
     const recover = vi.fn(async () => {});
-    await expect(value.agentRpc("s", spec(), "tools/call", { name: "hang" })).rejects.toThrow(/Browser/);
-    await expect(value.take("s", "owner")).rejects.toThrow(/may still be running/);
+    // A seated hold: a refused take leaves no owner behind (see "leaves no
+    // hold behind when uncertainty refuses a take"), so the panel hold this
+    // test refuses against must come from a take that succeeded.
+    await value.take("s", "owner");
+    await expect(value.withHumanAction("s", "owner", async () => { throw new Error("navigation timed out"); })).rejects.toThrow(/timed out/);
     await expect(value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_close", arguments: { all: true } }, undefined, recover)).rejects.toThrow(/paused/);
     expect(recover).not.toHaveBeenCalled();
     value.release("s", "owner");

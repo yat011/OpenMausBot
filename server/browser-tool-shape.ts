@@ -37,7 +37,7 @@ export const BROWSER_STATUS_TOOL_DEFINITION = {
 } as const;
 
 const BROWSER_NARROWING_HINT =
-  " For a snapshot, pass selector or depth, or set compact; for one value such as a price, use agent_browser_get_text or agent_browser_find instead of reading the whole page.";
+  " For a snapshot, pass selector or depth, or set compact; for one value such as a price, use agent_browser_get_text or agent_browser_find instead of reading the whole page. Refs stop at the cut: narrow and re-snapshot rather than clicking past it.";
 
 type Tool = { inputSchema?: { properties?: Record<string, unknown>; required?: unknown } & Record<string, unknown> } & Record<string, unknown>;
 

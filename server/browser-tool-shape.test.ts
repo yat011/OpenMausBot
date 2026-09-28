@@ -65,6 +65,7 @@ describe("browser tool shaping", () => {
     expect(shaped.content[0].text.length).toBeLessThan(DEFAULT_BROWSER_RESULT_BUDGET + 600);
     expect(shaped.content[0].text).toContain("trimmed this tool result");
     expect(shaped.content[0].text).toContain("agent_browser_get_text");
+    expect(shaped.content[0].text).toContain("narrow and re-snapshot rather than clicking past it");
     const custom = shapeBrowserToolResult({ content: [{ type: "text", text }] }, { budget: 1_000 }) as { content: Array<{ text: string }> };
     expect(custom.content[0].text.length).toBeLessThan(1_600);
   });

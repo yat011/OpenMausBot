@@ -9,7 +9,8 @@ const fixture = vi.hoisted(() => ({
   setters: [] as Array<ReturnType<typeof vi.fn>>,
   control: { held: false, controlling: false, owned: false },
   frame: null as { seq: number; data: string; viewerId: string; generation: number } | null,
-  queues: [] as Array<{ enqueue: ReturnType<typeof vi.fn>; clear: ReturnType<typeof vi.fn>; drain: ReturnType<typeof vi.fn> }>,
+  queues: [] as Array<{ enqueue: ReturnType<typeof vi.fn>; clear: ReturnType<typeof vi.fn>; drain: ReturnType<typeof vi.fn>; stopped: ReturnType<typeof vi.fn> }>,
+  halts: [] as Array<(cause: unknown) => void>,
 }));
 vi.mock("react", async (importOriginal) => {
   const react = await importOriginal<typeof import("react")>();
@@ -24,11 +25,11 @@ vi.mock("react", async (importOriginal) => {
 });
 vi.mock("@/state/store", () => ({ api: vi.fn().mockResolvedValue({}), useStore: () => ({ state: { config: { browserProfiles: [] } } }) }));
 vi.mock("./BrowserProfilesManager", () => ({ BrowserProfilesManager: () => null }));
-vi.mock("@/lib/browser-input-queue", () => ({ createBrowserInputQueue: () => {
-  const queue = { enqueue: vi.fn(), clear: vi.fn(), drain: vi.fn().mockResolvedValue(undefined) };
-  fixture.queues.push(queue); return queue;
+vi.mock("@/lib/browser-input-queue", () => ({ createBrowserInputQueue: (_send: unknown, onHalt: (cause: unknown) => void) => {
+  const queue = { enqueue: vi.fn(), clear: vi.fn(), drain: vi.fn().mockResolvedValue(undefined), stopped: vi.fn(() => false) };
+  fixture.queues.push(queue); fixture.halts.push(onHalt); return queue;
 } }));
-import { LiveBrowser } from "./BrowserPanel";
+import { LiveBrowser, shouldOfferBrowserReconnect } from "./BrowserPanel";
 import { BrowserViewport } from "./BrowserViewport";
 import { BrowserProfilesManager } from "./BrowserProfilesManager";
 import { api } from "@/state/store";
@@ -79,7 +80,7 @@ const deferred = () => {
 };
 const settle = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
 beforeEach(() => {
-  fixture.effects = []; fixture.refs = []; fixture.queues = []; fixture.setters = [];
+  fixture.effects = []; fixture.refs = []; fixture.queues = []; fixture.setters = []; fixture.halts = [];
   fixture.control = { held: false, controlling: false, owned: false };
   fixture.frame = null;
   FixtureEventSource.instances = [];
@@ -351,6 +352,26 @@ describe("live browser connection lifecycle", () => {
     expect(api).not.toHaveBeenCalled();
     expect(fixture.setters[7]).not.toHaveBeenCalled();
     secondCleanup?.();
+  });
+});
+
+describe("halted input recovery", () => {
+  it.each([
+    { connected: false, halted: false, expected: true },
+    { connected: false, halted: true, expected: true },
+    { connected: true, halted: false, expected: false },
+    { connected: true, halted: true, expected: true },
+  ])("offers reconnect when connected=$connected and input halted=$halted", ({ connected, halted, expected }) => {
+    expect(shouldOfferBrowserReconnect(connected, halted)).toBe(expected);
+  });
+
+  it("surfaces a halted queue as an error so its banner offers reconnect", () => {
+    render();
+    const cleanup = fixture.effects[2]!();
+    FixtureEventSource.instances[0]!.emit("ready", { viewerId: "current-viewer" });
+    fixture.halts[0]!(new Error("Input could not be confirmed"));
+    expect(fixture.setters[7]).toHaveBeenLastCalledWith("Input could not be confirmed");
+    cleanup?.();
   });
 });
 
