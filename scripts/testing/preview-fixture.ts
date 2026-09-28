@@ -89,8 +89,23 @@ export async function mountPreview(
     await ui.close();
     throw new Error("the preview server did not report a local URL");
   }
+  // A cold (or config-changed) optimizer holds the entry for ~2 minutes while
+  // it re-bundles; no browser timeout may cover that. Warm the exact bytes
+  // the browser will fetch so the returned URL is servable on arrival.
+  const previewUrl = new URL(route, base).href;
+  const warmed = Date.now();
+  console.log("warming the isolated preview (a cold optimizer can take minutes)…");
+  for (const url of [previewUrl, new URL(entry, base).href]) {
+    const response = await fetch(url, { signal: AbortSignal.timeout(300_000) });
+    if (!response.ok) {
+      await ui.close();
+      throw new Error(`preview warmup fetched ${url}: ${response.status}`);
+    }
+    await response.arrayBuffer();
+  }
+  console.log(`isolated preview servable after ${((Date.now() - warmed) / 1000).toFixed(1)}s`);
   return {
-    previewUrl: new URL(route, base).href,
+    previewUrl,
     close: () => ui.close(),
   };
 }

@@ -83,6 +83,10 @@ commands, and watch-only control. The interruption is injected; Chrome and the
 replacement server stream are real. Narrow/desktop overflow is checked and a
 preview screenshot is retained beside the fixture log.
 
+On a cold Vite optimizer cache the preview mount warms the entry (about two
+minutes) before the browser starts, so browser timeouts only ever cover a
+servable page; warm runs reach the browser in about a second.
+
 The runtime regression also models a browser descendant that must outlive its
 MCP parent, including an MCP parent that ignores EOF. Run those tests on Windows
 as well: native macOS acceptance alone does not prove Windows process behavior.
